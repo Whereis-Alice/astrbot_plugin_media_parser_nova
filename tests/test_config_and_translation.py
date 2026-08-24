@@ -40,6 +40,10 @@ class ConfigAndTranslationTests(unittest.TestCase):
             ConfigManager._parse_card_skin("哔哩哔哩风格"),
             CARD_SKIN_BILIBILI,
         )
+        self.assertEqual(
+            ConfigManager._parse_card_skin("B站动态"),
+            CARD_SKIN_BILIBILI,
+        )
         self.assertEqual(ConfigManager._parse_card_skin("未知皮肤"), CARD_SKIN_NOVA)
 
     def test_card_and_platform_hot_comment_options_are_parsed(self):
@@ -54,6 +58,7 @@ class ConfigAndTranslationTests(unittest.TestCase):
                     },
                     "card_render": {
                         "include_hot_comments": True,
+                        "hot_comment_max_chars": 240,
                     },
                 }
             }
@@ -64,6 +69,17 @@ class ConfigAndTranslationTests(unittest.TestCase):
         self.assertTrue(config.message.hot_comments.twitter)
         self.assertFalse(config.message.hot_comments.xiaoheihe)
         self.assertTrue(config.message.card_render.include_hot_comments)
+        self.assertEqual(config.message.card_render.hot_comment_max_chars, 240)
+        self.assertEqual(
+            ConfigManager(
+                {
+                    "message": {
+                        "card_render": {"hot_comment_max_chars": 9999}
+                    }
+                }
+            ).message.card_render.hot_comment_max_chars,
+            600,
+        )
 
     def test_translation_output_mode_is_normalized(self):
         card_only = ConfigManager(

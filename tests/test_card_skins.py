@@ -294,6 +294,180 @@ class CardSkinRenderTests(unittest.TestCase):
             with Image.open(two_image_path) as two_image, Image.open(one_image_path) as one_image:
                 self.assertGreater(two_image.height, one_image.height + 120)
 
+    def test_advanced_skins_give_the_second_image_substantial_space(self):
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            author=Author(name="SwagKirb", description="@Swag_K1RBY"),
+            title=None,
+            text="两张图片都应当是主要内容。",
+            url="https://x.com/i/status/2091687989021667511",
+            extra={"content_type": "图文"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_path = root / "first.png"
+            second_path = root / "second.png"
+            Image.new("RGB", (900, 1100), (242, 126, 164)).save(first_path)
+            Image.new("RGB", (1100, 900), (37, 83, 211)).save(second_path)
+
+            for skin in ("editorial", "signal", "poster", "neon", "bilibili"):
+                renderer = ShareCardRenderer(
+                    cache_dir=root,
+                    skin=skin,
+                    width=800,
+                    watermark="Alice解析",
+                )
+                active_path: list[Path | None] = [None]
+                second_areas: list[int] = []
+                original_open = renderer._open_image
+                original_cover = renderer._cover_fit
+                original_contain = renderer._contain_fit
+
+                def tracking_open(path):
+                    active_path[0] = Path(path)
+                    return original_open(path)
+
+                def tracking_cover(image, width, height):
+                    if active_path[0] == second_path:
+                        second_areas.append(width * height)
+                    return original_cover(image, width, height)
+
+                def tracking_contain(image, width, height, background):
+                    if active_path[0] == second_path:
+                        second_areas.append(width * height)
+                    return original_contain(image, width, height, background)
+
+                renderer._open_image = tracking_open
+                renderer._cover_fit = tracking_cover
+                renderer._contain_fit = tracking_contain
+                renderer._render_sync(
+                    result,
+                    {"avatar": None, "hero": None, "grid": [first_path, second_path]},
+                    root / f"large-second-{skin}.png",
+                )
+
+                self.assertTrue(second_areas, skin)
+                self.assertGreaterEqual(max(second_areas), 60_000, skin)
+
+    def test_many_images_render_on_all_advanced_skins_and_immersive(self):
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            author=Author(name="Gallery User", description="@gallery"),
+            title=None,
+            text="多图布局回归测试。",
+            url="https://x.com/i/status/2091687989021667511",
+            extra={"content_type": "图文"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index in range(6):
+                path = root / f"gallery-{index}.png"
+                Image.new(
+                    "RGB",
+                    (720 + index * 30, 620 + index * 40),
+                    (40 + index * 25, 90 + index * 15, 180 - index * 18),
+                ).save(path)
+                paths.append(path)
+
+            renderers = [
+                (skin, ShareCardRenderer(root, skin=skin, width=520))
+                for skin in ("editorial", "signal", "poster", "neon", "bilibili")
+            ]
+            renderers.append(
+                (
+                    "immersive",
+                    ShareCardRenderer(root, layout="immersive", width=520),
+                )
+            )
+            for name, renderer in renderers:
+                path = root / f"many-{name}.png"
+                renderer._render_sync(
+                    result,
+                    {"avatar": None, "hero": None, "grid": paths},
+                    path,
+                )
+                with Image.open(path) as image:
+                    self.assertEqual(image.width, 520, name)
+                    self.assertGreater(image.height, 600, name)
+                    self.assertLess(image.height, 5000, name)
+                    self.assertIsNotNone(image.convert("RGB").getbbox(), name)
+
+    def test_bilibili_skin_has_no_fixed_style_watermark(self):
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            author=Author(name="SwagKirb", description="@Swag_K1RBY"),
+            title=None,
+            text="正文先于媒体展示。",
+            url="https://x.com/i/status/2091687989021667511",
+            extra={"content_type": "图文"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.png"
+            Image.new("RGB", (900, 900), (242, 126, 164)).save(image_path)
+            renderer = ShareCardRenderer(root, skin="bilibili", width=720)
+            drawn_text: list[str] = []
+            original_draw_text = renderer._draw_text
+
+            def capture_draw_text(draw, xy, text, size, fill, bold=False):
+                drawn_text.append(str(text))
+                return original_draw_text(draw, xy, text, size, fill, bold)
+
+            renderer._draw_text = capture_draw_text
+            renderer._render_sync(
+                result,
+                {"avatar": None, "hero": None, "grid": [image_path]},
+                root / "bilibili-clean-header.png",
+            )
+
+            self.assertIn("图文", drawn_text)
+            self.assertNotIn("哔哩哔哩风格", drawn_text)
+            self.assertNotIn("B站动态", drawn_text)
+
+    def test_card_comment_limit_is_applied_before_complete_wrapping(self):
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            extra={
+                "hot_comments": [
+                    {
+                        "username": "Reader",
+                        "message": "很长的评论内容" * 40,
+                    }
+                ]
+            },
+        )
+        renderer = ShareCardRenderer(
+            cache_dir=Path("."),
+            width=520,
+            hot_comment_max_chars=60,
+        )
+
+        comment = renderer._normalized_card_comments(result)[0]["message"]
+        lines = renderer._wrap(comment, renderer._font(17), 300)
+
+        self.assertEqual(len(comment), 60)
+        self.assertTrue(comment.endswith("…"))
+        self.assertEqual("".join(lines), comment)
+
+    def test_wrap_keeps_short_ascii_words_intact(self):
+        renderer = ShareCardRenderer(cache_dir=Path("."), width=520)
+        font = renderer._font(20)
+        prefix = "为什么 "
+        max_width = renderer._text_width(prefix + "H", font)
+
+        lines = renderer._wrap(prefix + "HAL 在下一部作品", font, max_width)
+
+        self.assertNotEqual(lines[0][-1:], "H")
+        self.assertTrue(any(line.startswith("HAL") for line in lines))
+
+        long_url = "https://example.com/" + "a" * 120
+        url_lines = renderer._wrap(long_url, font, max_width)
+        self.assertEqual("".join(url_lines), long_url)
+
     def test_advanced_skin_theme_and_layout_do_not_change_poster_archive(self):
         result = ParseResult(
             platform=Platform(name="twitter", display_name="推特"),

@@ -25,6 +25,7 @@ async def render_card_rika(
     cover_full_size: bool = False,
     show_play_button: bool = False,
     watermark: str = "Nova解析",
+    hot_comment_max_chars: int = 180,
     cache_key: Optional[str] = None,
 ) -> Optional[Path]:
     """用 rika 渲染器渲染卡片，成功返回 PNG 路径，失败返回 None。"""
@@ -51,6 +52,7 @@ async def render_card_rika(
             cover_full_size=cover_full_size,
             show_play_button=show_play_button,
             watermark=watermark,
+            hot_comment_max_chars=hot_comment_max_chars,
         )
         url_key = str(metadata.get("url") or "")
         parts = [url_key]
@@ -59,12 +61,26 @@ async def render_card_rika(
             parts.append("a:" + _a)
         _covers = metadata.get("video_cover_urls") or []
         if _covers:
-            _c = _covers[0]
-            parts.append("c:" + str(_c[0] if isinstance(_c, list) else _c))
+            parts.append(
+                "covers:"
+                + json.dumps(
+                    _covers,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
         _images = metadata.get("image_urls") or []
         if _images:
-            _i = _images[0]
-            parts.append("i:" + str(_i[0] if isinstance(_i, list) else _i))
+            parts.append(
+                "images:"
+                + json.dumps(
+                    _images,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
         parts.append(
             "meta:"
             + json.dumps(

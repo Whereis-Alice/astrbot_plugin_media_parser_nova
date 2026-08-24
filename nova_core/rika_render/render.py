@@ -97,7 +97,7 @@ _STAT_LABELS = {
 
 
 # 卡片样式版本：视觉样式变化时 +1，使已缓存的旧卡片失效并重新渲染
-_CARD_STYLE_VERSION = "17"
+_CARD_STYLE_VERSION = "18"
 
 
 def strip_emoji(text: str | None) -> str:
@@ -462,6 +462,7 @@ class ShareCardRenderer:
         cover_full_size: bool = False,
         show_play_button: bool = False,
         watermark: str = DEFAULT_WATERMARK_TAG,
+        hot_comment_max_chars: int = 180,
     ):
         self.cache_dir = cache_dir
         self.enabled = enabled and Image is not None
@@ -478,6 +479,7 @@ class ShareCardRenderer:
             "霓虹": "neon",
             "哔哩哔哩风格": "bilibili",
             "哔哩哔哩": "bilibili",
+            "B站动态": "bilibili",
             "B站风格": "bilibili",
         }
         skin = skin_aliases.get(str(skin or "").strip(), str(skin or "").strip().lower())
@@ -486,6 +488,11 @@ class ShareCardRenderer:
         self.show_play_button = bool(show_play_button)
         self.cover_full_size = cover_full_size
         self.watermark = (str(watermark or "").strip() or DEFAULT_WATERMARK_TAG)[:32]
+        try:
+            comment_limit = int(hot_comment_max_chars)
+        except (TypeError, ValueError):
+            comment_limit = 180
+        self.hot_comment_max_chars = max(60, min(600, comment_limit))
         self._regular_font: str | None = None
         self._bold_font: str | None = None
         self._font_cache: dict[tuple[int, bool], Any] = {}
@@ -529,20 +536,41 @@ class ShareCardRenderer:
         return math.ceil(self._measure.textlength(text, font=font))
 
     def _wrap(self, text: str, font: Any, max_width: int) -> list[str]:
-        """按字符宽度换行，兼容中日韩文本。"""
+        """按实际宽度换行；CJK 可逐字折行，短 ASCII 词尽量保持完整。"""
         lines: list[str] = []
         for raw in text.split("\n"):
             if not raw:
                 lines.append("")
                 continue
             current = ""
-            for ch in raw:
-                if self._text_width(current + ch, font) <= max_width:
-                    current += ch
-                else:
-                    lines.append(current)
-                    current = ch
-            lines.append(current)
+            tokens = re.findall(r"[\x21-\x7e]+|[ \t]+|.", raw)
+            for token in tokens:
+                if token.isspace():
+                    if current and not current.endswith(" "):
+                        candidate = current + " "
+                        if self._text_width(candidate, font) <= max_width:
+                            current = candidate
+                    continue
+
+                if self._text_width(current + token, font) <= max_width:
+                    current += token
+                    continue
+
+                if current:
+                    lines.append(current.rstrip())
+                    current = ""
+
+                if self._text_width(token, font) <= max_width:
+                    current = token
+                    continue
+
+                for ch in token:
+                    if current and self._text_width(current + ch, font) > max_width:
+                        lines.append(current.rstrip())
+                        current = ch
+                    else:
+                        current += ch
+            lines.append(current.rstrip())
         return lines
 
     def _fit_lines(
@@ -558,6 +586,14 @@ class ShareCardRenderer:
             last = last[:-1]
         result.append(last + ellipsis)
         return result
+
+    @staticmethod
+    def _limit_text(text: str, max_chars: int) -> str:
+        """按字符数限制文本，并让后续排版完整显示限制后的内容。"""
+        value = str(text or "").strip()
+        if len(value) <= max_chars:
+            return value
+        return value[: max(1, max_chars - 1)].rstrip() + "…"
 
     def _line_height(self, font: Any) -> int:
         ascent, descent = font.getmetrics()
@@ -834,7 +870,7 @@ class ShareCardRenderer:
         theme_key = self.theme_name if self.skin_name == "nova" else "skin-fixed"
         layout_key = self.layout_name if self.skin_name == "nova" else "skin-independent"
         digest = hashlib.md5(
-            f"{_CARD_STYLE_VERSION}|{self.skin_name}|{theme_key}|{self.width}|{layout_key}|{self.cover_full_size}|{self.show_play_button}|{self.watermark}|{payload}|{warnings_str}".encode("utf-8")
+            f"{_CARD_STYLE_VERSION}|{self.skin_name}|{theme_key}|{self.width}|{layout_key}|{self.cover_full_size}|{self.show_play_button}|{self.watermark}|{self.hot_comment_max_chars}|{payload}|{warnings_str}".encode("utf-8")
         ).hexdigest()[:16]
         return self.cache_dir / f"card_{digest}.png"
 
@@ -985,8 +1021,7 @@ class ShareCardRenderer:
         font = self._font(_L.F_PLATFORM, bold=True)
         return 18 + 12 + 8 + self._text_width(text, font) + 18
 
-    @staticmethod
-    def _normalized_card_comments(result: ParseResult) -> list[dict[str, Any]]:
+    def _normalized_card_comments(self, result: ParseResult) -> list[dict[str, Any]]:
         comments = result.extra.get("hot_comments")
         if not isinstance(comments, list):
             return []
@@ -994,7 +1029,10 @@ class ShareCardRenderer:
         for item in comments[:5]:
             if not isinstance(item, dict):
                 continue
-            message = strip_emoji(str(item.get("message") or ""))
+            message = self._limit_text(
+                strip_emoji(str(item.get("message") or "")),
+                self.hot_comment_max_chars,
+            )
             if not message:
                 continue
             normalized.append(
@@ -1029,10 +1067,13 @@ class ShareCardRenderer:
         body_size = 19 if self.width >= 680 else 17
         author_size = 17 if self.width >= 680 else 15
         body_font = self._font(body_size)
+        bili_comment_layout = self.skin_name == "bilibili"
+        comment_avatar_size = 42 if bili_comment_layout else 0
+        text_offset = comment_avatar_size + 14 if bili_comment_layout else 0
+        text_w = max(120, inner_w - text_offset)
         prepared = []
-        panel_h = 72
         for item in comments:
-            lines = self._fit_lines(item["message"], body_font, inner_w, 3)
+            lines = self._wrap(item["message"], body_font, text_w)
             user_label = item["username"]
             uid = item["uid"]
             if uid and uid not in user_label:
@@ -1040,16 +1081,22 @@ class ShareCardRenderer:
             user_lines = self._fit_lines(
                 user_label,
                 self._font(author_size, bold=True),
-                max(80, inner_w - 170),
+                max(80, text_w - 170),
                 2,
             )
-            prepared.append((item, lines, user_lines))
-            panel_h += author_size + 12
-            if len(user_lines) > 1:
-                panel_h += 17
-            panel_h += len(lines) * (body_size + 9) + 9
-            panel_h += 17
-        panel_h += 18
+            content_h = (
+                len(user_lines) * (author_size + 6)
+                + 7
+                + len(lines) * (body_size + 9)
+            )
+            item_h = max(comment_avatar_size, content_h)
+            prepared.append((item, lines, user_lines, item_h))
+        panel_h = (
+            72
+            + sum(item_h for _, _, _, item_h in prepared)
+            + max(0, len(prepared) - 1) * 17
+            + 18
+        )
 
         if self.skin_name == "editorial":
             bg_top = bg_bottom = (247, 242, 233)
@@ -1090,7 +1137,7 @@ class ShareCardRenderer:
             ink = (36, 38, 43)
             muted = (117, 120, 128)
             divider = (225, 228, 232)
-            header = "热门评论 · PUBLIC REPLIES"
+            header = "热门评论"
             radius = 8
         else:
             theme = _THEMES[self.theme_name]
@@ -1162,27 +1209,48 @@ class ShareCardRenderer:
             panel.alpha_composite(neon_layer)
             draw = ImageDraw.Draw(panel)
         elif self.skin_name == "bilibili":
-            draw.rectangle((0, 0, self.width, 8), fill=(*accent_rgb, 255))
-            draw.rectangle(
-                (round(self.width * 0.64), 0, self.width, 8),
-                fill=(0, 174, 236, 255),
-            )
-            draw.rounded_rectangle(
-                (pad, 18, pad + 94, 48),
-                radius=5,
-                fill=(251, 114, 153, 26),
-            )
+            draw.rectangle((0, 0, self.width, 4), fill=(*accent_rgb, 255))
 
         draw.line((pad, 28, pad + 70, 28), fill=(*accent_rgb, 255), width=4)
         self._draw_text(draw, (pad, 38), header, 15, ink, bold=True)
         y = 72
-        for index, (item, lines, user_lines) in enumerate(prepared, start=1):
+        for index, (item, lines, user_lines, item_h) in enumerate(prepared, start=1):
+            item_top = y
+            text_x = pad + text_offset
+            if bili_comment_layout:
+                initial = (item["username"][:1] or "?").upper()
+                draw.ellipse(
+                    (
+                        pad,
+                        item_top,
+                        pad + comment_avatar_size,
+                        item_top + comment_avatar_size,
+                    ),
+                    fill=_mix((255, 255, 255), accent_rgb, 0.18),
+                    outline=(*accent_rgb, 150),
+                    width=1,
+                )
+                initial_font = self._font(17, bold=True)
+                initial_w = self._text_width(initial, initial_font)
+                self._draw_text(
+                    draw,
+                    (
+                        pad + (comment_avatar_size - initial_w) // 2,
+                        item_top + 10,
+                    ),
+                    initial,
+                    17,
+                    accent_rgb,
+                    bold=True,
+                )
+            author_y = item_top
+            first_user_line = user_lines[0] if user_lines else "未知用户"
             self._draw_text(
                 draw,
-                (pad, y),
-                user_lines[0] if user_lines else "未知用户",
+                (text_x, author_y),
+                first_user_line,
                 author_size,
-                ink,
+                accent_rgb if bili_comment_layout else ink,
                 bold=True,
             )
             meta_parts = []
@@ -1199,22 +1267,32 @@ class ShareCardRenderer:
             meta_text = self._ellipsize(meta_text, meta_font, 160)
             self._draw_text(
                 draw,
-                (self.width - pad - self._text_width(meta_text, meta_font), y + 2),
+                (
+                    self.width - pad - self._text_width(meta_text, meta_font),
+                    item_top + 2,
+                ),
                 meta_text,
                 13,
                 muted,
             )
-            y += author_size + 12
-            if len(user_lines) > 1:
-                self._draw_text(draw, (pad, y - 7), user_lines[1], 13, muted)
-                y += 17
+            author_y += author_size + 6
+            for extra_line in user_lines[1:]:
+                self._draw_text(draw, (text_x, author_y), extra_line, 13, muted)
+                author_y += author_size + 6
+            body_y = author_y + 7
             for line in lines:
-                self._draw_text(draw, (pad, y), line, body_size, muted)
-                y += body_size + 9
-            y += 9
+                self._draw_text(
+                    draw,
+                    (text_x, body_y),
+                    line,
+                    body_size,
+                    ink if bili_comment_layout else muted,
+                )
+                body_y += body_size + 9
+            y = item_top + item_h
             if index < len(prepared):
                 draw.line(
-                    (pad, y, self.width - pad, y),
+                    (text_x, y + 8, self.width - pad, y + 8),
                     fill=(*divider, 90),
                     width=1,
                 )
@@ -1369,7 +1447,36 @@ class ShareCardRenderer:
         )
         footer_h = 96 + len(editorial_url_lines) * editorial_url_line_h
         stat_count = min(len(d["stats"]), 6)
-        thumb_count = min(len(d["grid"]), 3)
+        gallery_paths = d["grid"][:6]
+        gallery_count = len(gallery_paths)
+        gallery_gap = 10
+        if gallery_count == 1:
+            gallery_cols = 1
+            gallery_cell_w = inner_w
+            gallery_cell_h = min(260, max(190, round(inner_w * 0.32)))
+        elif gallery_count == 2:
+            gallery_cols = 2
+            gallery_cell_w = max(1, (inner_w - gallery_gap) // 2)
+            gallery_cell_h = min(240, max(170, round(gallery_cell_w * 0.7)))
+        elif gallery_count:
+            gallery_cols = 3
+            gallery_cell_w = max(1, (inner_w - gallery_gap * 2) // 3)
+            gallery_cell_h = min(190, gallery_cell_w)
+        else:
+            gallery_cols = 0
+            gallery_cell_w = 0
+            gallery_cell_h = 0
+        gallery_rows = (
+            math.ceil(gallery_count / gallery_cols) if gallery_cols else 0
+        )
+        gallery_h = (
+            58
+            + gallery_rows * gallery_cell_h
+            + max(0, gallery_rows - 1) * gallery_gap
+            + 18
+            if gallery_count
+            else 0
+        )
         media_h = max(440, min(680, round(left_w * 1.34)))
         title_line_h = title_size + 12
         right_h = 56 + len(title_lines) * title_line_h
@@ -1379,10 +1486,8 @@ class ShareCardRenderer:
             right_h += 26 + len(desc_lines) * 34
         if stat_count:
             right_h += 26 + ((stat_count + 1) // 2) * 34
-        if thumb_count:
-            right_h += 106 + (20 if len(d["grid"]) > 3 else 0)
         body_h = max(media_h, right_h + 8)
-        card_h = body_y + body_h + footer_h
+        card_h = body_y + body_h + gallery_h + footer_h
         total_h = card_h + 18
 
         canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
@@ -1531,27 +1636,79 @@ class ShareCardRenderer:
                 self._draw_text(card_draw, (sx, sy + 16), value_text, 18, ink, bold=True)
             y += ((len(stats) + 1) // 2) * 34 + 14
 
-        if d["grid"]:
-            thumb_y = y + 4
-            thumb_gap = 8
-            thumb_w = max(1, (right_w - thumb_gap * 2) // 3)
-            for idx, path in enumerate(d["grid"][:3]):
+        if gallery_count:
+            gallery_y = body_y + body_h + 20
+            card_draw.line(
+                (pad, gallery_y, self.width - pad, gallery_y),
+                fill=(*ink, 55),
+                width=1,
+            )
+            self._draw_text(
+                card_draw,
+                (pad, gallery_y + 14),
+                "CONTACT SHEET / 补充画面",
+                13,
+                muted,
+                bold=True,
+            )
+            cells_y = gallery_y + 40
+            for idx, path in enumerate(gallery_paths):
+                row, col = divmod(idx, gallery_cols)
+                cell_x = pad + col * (gallery_cell_w + gallery_gap)
+                cell_y = cells_y + row * (gallery_cell_h + gallery_gap)
+                card_draw.rectangle(
+                    (
+                        cell_x,
+                        cell_y,
+                        cell_x + gallery_cell_w,
+                        cell_y + gallery_cell_h,
+                    ),
+                    fill=paper_deep,
+                    outline=(*soft, 120),
+                    width=1,
+                )
                 try:
-                    thumb = self._cover_fit(self._open_image(path), thumb_w, 82)
-                    thumb = self._rounded_image(thumb, 3)
-                    card.alpha_composite(thumb, (rx + idx * (thumb_w + thumb_gap), thumb_y))
-                except Exception:
-                    card_draw.rectangle(
-                        (rx + idx * (thumb_w + thumb_gap), thumb_y,
-                         rx + idx * (thumb_w + thumb_gap) + thumb_w, thumb_y + 82),
-                        outline=(*soft, 120), width=1,
+                    source = self._open_image(path)
+                    if gallery_count <= 2:
+                        thumb = self._contain_fit(
+                            source,
+                            gallery_cell_w - 8,
+                            gallery_cell_h - 8,
+                            paper_deep,
+                        )
+                    else:
+                        thumb = self._cover_fit(
+                            source,
+                            gallery_cell_w - 8,
+                            gallery_cell_h - 8,
+                        )
+                    card.alpha_composite(
+                        thumb.convert("RGBA"),
+                        (cell_x + 4, cell_y + 4),
                     )
-            card_draw = ImageDraw.Draw(card)
-            if len(d["grid"]) > 3:
-                self._draw_text(card_draw, (rx, thumb_y + 88), f"+{len(d['grid']) - 3} 张图片", 14, muted)
+                except Exception:
+                    pass
+                card_draw = ImageDraw.Draw(card)
+                self._draw_text(
+                    card_draw,
+                    (cell_x + 10, cell_y + 9),
+                    f"{idx + 2:02d}",
+                    12,
+                    (255, 255, 255),
+                    bold=True,
+                )
+            if len(d["grid"]) > gallery_count:
+                self._draw_text(
+                    card_draw,
+                    (self.width - pad - 74, gallery_y + 14),
+                    f"+{len(d['grid']) - gallery_count}",
+                    13,
+                    accent,
+                    bold=True,
+                )
 
         # 独立页脚：编辑号、原链和可配置署名。
-        footer_y = body_y + body_h + 26
+        footer_y = body_y + body_h + gallery_h + 26
         card_draw.line((pad, footer_y, self.width - pad, footer_y), fill=(*ink, 70), width=1)
         wm_font = self._font(16, bold=True)
         wm_text = self.watermark
@@ -1681,12 +1838,31 @@ class ShareCardRenderer:
             else []
         )
         title_line_h = title_size + 12
-        grid_count = min(len(d["grid"]), 4)
-        two_image_post = not d["is_video_hero"] and grid_count == 1
-        secondary_media_h = (
-            max(170, min(280, round(inner_w * 0.32)))
-            if two_image_post
-            else 68
+        secondary_paths = d["grid"][:4]
+        secondary_count = len(secondary_paths)
+        multi_image_post = not d["is_video_hero"] and len(d["media"]) > 1
+        secondary_gap = 12
+        if secondary_count == 1:
+            secondary_cols = 1
+            secondary_cell_w = inner_w
+            secondary_cell_h = max(180, min(290, round(inner_w * 0.34)))
+        elif secondary_count:
+            secondary_cols = 2
+            secondary_cell_w = max(1, (inner_w - secondary_gap) // 2)
+            secondary_cell_h = max(
+                150,
+                min(230, round(secondary_cell_w * 0.68)),
+            )
+        else:
+            secondary_cols = 0
+            secondary_cell_w = 0
+            secondary_cell_h = 0
+        secondary_rows = (
+            math.ceil(secondary_count / secondary_cols) if secondary_cols else 0
+        )
+        secondary_gallery_h = (
+            secondary_rows * secondary_cell_h
+            + max(0, secondary_rows - 1) * secondary_gap
         )
         signal_url_lines, signal_url_size, signal_url_line_h = self._url_layout(
             result,
@@ -1699,8 +1875,8 @@ class ShareCardRenderer:
         lower_h = 34 + len(title_lines) * title_line_h + (len(desc_lines) * 31 + 18 if desc_lines else 0)
         if d["stats"]:
             lower_h += 62
-        if grid_count:
-            lower_h += secondary_media_h + (26 if two_image_post else 20)
+        if secondary_count:
+            lower_h += secondary_gallery_h + 26
         card_h = max(
             560,
             top_y + hero_h + lower_h + signal_footer_h + 36,
@@ -1794,7 +1970,7 @@ class ShareCardRenderer:
         try:
             if hero:
                 source_image = self._open_image(hero)
-                if two_image_post:
+                if multi_image_post:
                     hero_img = self._contain_fit(
                         source_image,
                         hero_w,
@@ -1964,57 +2140,74 @@ class ShareCardRenderer:
                 self._draw_text(draw, (pad, y), line, 15, ink, bold=True)
                 y += 24
             y += 5
-        if two_image_post:
+        if secondary_count:
             media_y = y + 4
-            try:
-                secondary = self._contain_fit(
-                    self._open_image(d["grid"][0]),
-                    inner_w,
-                    secondary_media_h,
-                    panel,
-                ).convert("RGBA")
-                secondary.alpha_composite(
-                    Image.new("RGBA", secondary.size, (*cyan, 10))
-                )
-                card.alpha_composite(secondary, (pad, media_y))
-            except Exception:
-                draw.rectangle(
-                    (pad, media_y, self.width - pad, media_y + secondary_media_h),
-                    fill=(*panel, 230),
-                )
-            draw = ImageDraw.Draw(card)
-            draw.rectangle(
-                (pad, media_y, self.width - pad - 1, media_y + secondary_media_h - 1),
-                outline=(*cyan, 190),
-                width=2,
-            )
-            self._draw_text(
-                draw,
-                (pad + 14, media_y + 12),
-                "MEDIA WINDOW 02",
-                12,
-                (255, 255, 255, 230),
-                bold=True,
-            )
-            draw.line(
-                (pad + 14, media_y + 33, pad + 116, media_y + 33),
-                fill=(*accent_rgb, 220),
-                width=2,
-            )
-            y = media_y + secondary_media_h + 10
-        elif d["grid"]:
-            thumb_w = max(1, (inner_w - gap * 3) // 4)
-            thumb_y = y + 3
-            for idx, path in enumerate(d["grid"][:4]):
-                x = pad + idx * (thumb_w + gap)
+            for idx, path in enumerate(secondary_paths):
+                row, col = divmod(idx, secondary_cols)
+                x = pad + col * (secondary_cell_w + secondary_gap)
+                yy = media_y + row * (secondary_cell_h + secondary_gap)
                 try:
-                    thumb = self._cover_fit(self._open_image(path), thumb_w, 68).convert("RGBA")
-                    card.alpha_composite(thumb, (x, thumb_y))
+                    secondary = self._contain_fit(
+                        self._open_image(path),
+                        secondary_cell_w,
+                        secondary_cell_h,
+                        panel,
+                    ).convert("RGBA")
+                    secondary.alpha_composite(
+                        Image.new("RGBA", secondary.size, (*cyan, 10))
+                    )
+                    card.alpha_composite(secondary, (x, yy))
                 except Exception:
-                    draw.rectangle((x, thumb_y, x + thumb_w, thumb_y + 68), outline=(*dim, 180), width=1)
+                    draw.rectangle(
+                        (
+                            x,
+                            yy,
+                            x + secondary_cell_w,
+                            yy + secondary_cell_h,
+                        ),
+                        fill=(*panel, 230),
+                    )
                 draw = ImageDraw.Draw(card)
-                draw.rectangle((x, thumb_y, x + thumb_w - 1, thumb_y + 67), outline=(*dim, 160), width=1)
-            y = thumb_y + 76
+                draw.rectangle(
+                    (
+                        x,
+                        yy,
+                        x + secondary_cell_w - 1,
+                        yy + secondary_cell_h - 1,
+                    ),
+                    outline=(*cyan, 190),
+                    width=2,
+                )
+                window_label = f"MEDIA WINDOW {idx + 2:02d}"
+                self._draw_text(
+                    draw,
+                    (x + 12, yy + 10),
+                    window_label,
+                    11,
+                    (255, 255, 255, 230),
+                    bold=True,
+                )
+                draw.line(
+                    (x + 12, yy + 30, x + min(112, secondary_cell_w - 12), yy + 30),
+                    fill=(*accent_rgb, 220),
+                    width=2,
+                )
+                if idx == secondary_count - 1 and len(d["grid"]) > secondary_count:
+                    over_text = f"+{len(d['grid']) - secondary_count}"
+                    over_font = self._font(28, bold=True)
+                    over_w = self._text_width(over_text, over_font)
+                    self._draw_text(
+                        draw,
+                        (
+                            x + (secondary_cell_w - over_w) // 2,
+                            yy + secondary_cell_h // 2 - 18,
+                        ),
+                        over_text,
+                        28,
+                        ink,
+                        bold=True,
+                    )
+            y = media_y + secondary_gallery_h + 10
 
         # 独立终端页脚。
         footer_y = card_h - signal_footer_h
@@ -2313,6 +2506,32 @@ class ShareCardRenderer:
         print_w = self.width - print_x - pad
         print_y = 122
         hero_h = max(280, min(500, round(print_w * 0.66)))
+        gallery_paths = d["grid"][:4]
+        gallery_count = len(gallery_paths)
+        gallery_gap = 10
+        if gallery_count == 1:
+            gallery_cols = 1
+            gallery_cell_w = print_w - 24
+            gallery_cell_h = min(230, max(170, round(print_w * 0.3)))
+        elif gallery_count:
+            gallery_cols = 2
+            gallery_cell_w = max(1, (print_w - 24 - gallery_gap) // 2)
+            gallery_cell_h = min(190, max(140, round(gallery_cell_w * 0.72)))
+        else:
+            gallery_cols = 0
+            gallery_cell_w = 0
+            gallery_cell_h = 0
+        gallery_rows = (
+            math.ceil(gallery_count / gallery_cols) if gallery_cols else 0
+        )
+        gallery_h = (
+            52
+            + gallery_rows * gallery_cell_h
+            + max(0, gallery_rows - 1) * gallery_gap
+            + 14
+            if gallery_count
+            else 0
+        )
 
         headline_text, body_text, has_real_title = self._advanced_copy(d)
         if has_real_title:
@@ -2384,7 +2603,7 @@ class ShareCardRenderer:
             target_lines=6,
         )
         source_h = 88 + len(url_lines) * url_line_h
-        content_y = print_y + hero_h + 28
+        content_y = print_y + hero_h + 28 + gallery_h
         source_y = content_y + content_h + 22
         card_h = source_y + source_h + 20
         total_h = card_h + 18
@@ -2466,7 +2685,16 @@ class ShareCardRenderer:
         image_h = image_box[3] - image_box[1]
         try:
             if d["hero"]:
-                hero_img = self._cover_fit(self._open_image(d["hero"]), image_w, image_h)
+                source_image = self._open_image(d["hero"])
+                if gallery_count and not d["is_video_hero"]:
+                    hero_img = self._contain_fit(
+                        source_image,
+                        image_w,
+                        image_h,
+                        board_deep,
+                    )
+                else:
+                    hero_img = self._cover_fit(source_image, image_w, image_h)
             else:
                 hero_img = self._fallback_cover(
                     image_w,
@@ -2501,24 +2729,76 @@ class ShareCardRenderer:
         ):
             draw.line((x, y, x + dx, y + dy), fill=(*paper_soft, 180), width=1)
 
-        if d["grid"]:
-            thumb_size = 46
-            thumb_y = print_y + hero_h - thumb_size - 22
-            for idx, path in enumerate(d["grid"][:3]):
-                thumb_x = print_x + print_w - 18 - (idx + 1) * thumb_size - idx * 7
-                try:
-                    thumb = self._cover_fit(self._open_image(path), thumb_size, thumb_size)
-                    card.alpha_composite(thumb.convert("RGBA"), (thumb_x, thumb_y))
-                except Exception:
-                    draw.rectangle(
-                        (thumb_x, thumb_y, thumb_x + thumb_size, thumb_y + thumb_size),
-                        fill=paper_soft,
-                    )
-                draw = ImageDraw.Draw(card)
+        if gallery_count:
+            sheet_y = print_y + hero_h + 24
+            draw.rectangle(
+                (print_x, sheet_y, print_x + print_w, sheet_y + gallery_h - 10),
+                fill=paper,
+                outline=paper_soft,
+                width=1,
+            )
+            self._draw_text(
+                draw,
+                (print_x + 14, sheet_y + 12),
+                "CONTACT SHEET",
+                12,
+                archive_red,
+                bold=True,
+            )
+            self._draw_text(
+                draw,
+                (print_x + print_w - 92, sheet_y + 12),
+                f"{gallery_count:02d} FILES",
+                11,
+                muted,
+                bold=True,
+            )
+            cells_y = sheet_y + 38
+            for idx, path in enumerate(gallery_paths):
+                row, col = divmod(idx, gallery_cols)
+                cell_x = print_x + 12 + col * (gallery_cell_w + gallery_gap)
+                cell_y = cells_y + row * (gallery_cell_h + gallery_gap)
                 draw.rectangle(
-                    (thumb_x, thumb_y, thumb_x + thumb_size, thumb_y + thumb_size),
-                    outline=paper,
-                    width=3,
+                    (
+                        cell_x,
+                        cell_y,
+                        cell_x + gallery_cell_w,
+                        cell_y + gallery_cell_h,
+                    ),
+                    fill=paper_soft,
+                    outline=(*muted, 100),
+                    width=1,
+                )
+                try:
+                    contact = self._contain_fit(
+                        self._open_image(path),
+                        gallery_cell_w - 8,
+                        gallery_cell_h - 8,
+                        paper_soft,
+                    )
+                    card.alpha_composite(
+                        contact.convert("RGBA"),
+                        (cell_x + 4, cell_y + 4),
+                    )
+                except Exception:
+                    pass
+                draw = ImageDraw.Draw(card)
+                self._draw_text(
+                    draw,
+                    (cell_x + 9, cell_y + 8),
+                    f"{idx + 2:02d}",
+                    11,
+                    archive_red,
+                    bold=True,
+                )
+            if len(d["grid"]) > gallery_count:
+                self._draw_text(
+                    draw,
+                    (print_x + print_w - 62, sheet_y + gallery_h - 28),
+                    f"+{len(d['grid']) - gallery_count}",
+                    12,
+                    archive_red,
+                    bold=True,
                 )
 
         stamp_w = min(186, max(130, print_w // 2))
@@ -2732,6 +3012,32 @@ class ShareCardRenderer:
         stat_cols = 3 if self.width >= 680 else 2
         stat_rows = math.ceil(len(stats) / stat_cols) if stats else 0
         stats_h = stat_rows * 56 + (18 if stats else 0)
+        gallery_paths = d["grid"][:4]
+        gallery_count = len(gallery_paths)
+        gallery_gap = 12
+        if gallery_count == 1:
+            gallery_cols = 1
+            gallery_cell_w = inner_w
+            gallery_cell_h = max(190, min(280, round(inner_w * 0.32)))
+        elif gallery_count:
+            gallery_cols = 2
+            gallery_cell_w = max(1, (inner_w - gallery_gap) // 2)
+            gallery_cell_h = max(
+                150,
+                min(220, round(gallery_cell_w * 0.66)),
+            )
+        else:
+            gallery_cols = 0
+            gallery_cell_w = 0
+            gallery_cell_h = 0
+        gallery_rows = (
+            math.ceil(gallery_count / gallery_cols) if gallery_cols else 0
+        )
+        gallery_visual_h = (
+            gallery_rows * gallery_cell_h
+            + max(0, gallery_rows - 1) * gallery_gap
+        )
+        gallery_section_h = gallery_visual_h + 48 if gallery_count else 0
         url_lines, url_size, url_line_h = self._url_layout(
             result,
             inner_w,
@@ -2746,7 +3052,7 @@ class ShareCardRenderer:
             + stats_h
         )
         footer_h = 78 + len(url_lines) * url_line_h
-        card_h = top_y + media_h + 20 + lower_h + footer_h
+        card_h = top_y + media_h + 20 + gallery_section_h + lower_h + footer_h
         total_h = card_h + 18
 
         canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
@@ -2861,7 +3167,20 @@ class ShareCardRenderer:
         hero = d["hero"]
         try:
             if hero:
-                hero_img = self._cover_fit(self._open_image(hero), media_w, media_h).convert("RGBA")
+                source_image = self._open_image(hero)
+                if gallery_count and not d["is_video_hero"]:
+                    hero_img = self._contain_fit(
+                        source_image,
+                        media_w,
+                        media_h,
+                        panel,
+                    ).convert("RGBA")
+                else:
+                    hero_img = self._cover_fit(
+                        source_image,
+                        media_w,
+                        media_h,
+                    ).convert("RGBA")
             else:
                 hero_img = self._fallback_cover(
                     media_w,
@@ -2903,8 +3222,84 @@ class ShareCardRenderer:
         )
         self._draw_text(draw, (media_x + 18, top_y + media_h - 48), "VISUAL 01", 12, ink, bold=True)
 
+        if gallery_count:
+            gallery_y = top_y + media_h + 20
+            self._draw_text(
+                draw,
+                (pad, gallery_y),
+                "SECONDARY VISUALS",
+                11,
+                yellow,
+                bold=True,
+            )
+            cells_y = gallery_y + 28
+            for idx, path in enumerate(gallery_paths):
+                row, col = divmod(idx, gallery_cols)
+                cell_x = pad + col * (gallery_cell_w + gallery_gap)
+                cell_y = cells_y + row * (gallery_cell_h + gallery_gap)
+                try:
+                    visual = self._contain_fit(
+                        self._open_image(path),
+                        gallery_cell_w,
+                        gallery_cell_h,
+                        panel,
+                    ).convert("RGBA")
+                    card.alpha_composite(visual, (cell_x, cell_y))
+                except Exception:
+                    draw.rectangle(
+                        (
+                            cell_x,
+                            cell_y,
+                            cell_x + gallery_cell_w,
+                            cell_y + gallery_cell_h,
+                        ),
+                        fill=panel,
+                    )
+                cell_color = magenta if idx % 2 == 0 else cyan
+                frame = Image.new("RGBA", card.size, (0, 0, 0, 0))
+                frame_draw = ImageDraw.Draw(frame)
+                frame_draw.rectangle(
+                    (
+                        cell_x,
+                        cell_y,
+                        cell_x + gallery_cell_w - 1,
+                        cell_y + gallery_cell_h - 1,
+                    ),
+                    outline=(*cell_color, 210),
+                    width=5,
+                )
+                card.alpha_composite(frame.filter(ImageFilter.GaussianBlur(5)))
+                draw = ImageDraw.Draw(card)
+                draw.rectangle(
+                    (
+                        cell_x,
+                        cell_y,
+                        cell_x + gallery_cell_w - 1,
+                        cell_y + gallery_cell_h - 1,
+                    ),
+                    outline=(*cell_color, 235),
+                    width=2,
+                )
+                self._draw_text(
+                    draw,
+                    (cell_x + 12, cell_y + 10),
+                    f"VISUAL {idx + 2:02d}",
+                    11,
+                    ink,
+                    bold=True,
+                )
+            if len(d["grid"]) > gallery_count:
+                self._draw_text(
+                    draw,
+                    (self.width - pad - 62, gallery_y),
+                    f"+{len(d['grid']) - gallery_count}",
+                    11,
+                    magenta,
+                    bold=True,
+                )
+
         # 标题与正文采用横向光带，不复用终端或海报结构。
-        lower_y = top_y + media_h + 20
+        lower_y = top_y + media_h + 20 + gallery_section_h
         draw.rectangle((pad, lower_y, self.width - pad, lower_y + 5), fill=(*cyan, 220))
         draw.rectangle((pad, lower_y, pad + inner_w // 3, lower_y + 5), fill=(*magenta, 255))
         y = lower_y + 25
@@ -2973,88 +3368,190 @@ class ShareCardRenderer:
         images: dict[str, Any],
         out_path: Path,
     ) -> Path:
-        """哔哩哔哩风格：作者动态头、宽媒体窗和互动栏组成的独立浅色布局。"""
+        """哔哩哔哩动态流：作者、正文、媒体、互动和评论按阅读顺序展开。"""
         d = self._prep(result, images)
         pink = (251, 114, 153)
         cyan = (0, 174, 236)
-        bg = (244, 245, 247)
         paper = (255, 255, 255)
+        media_bg = (246, 247, 249)
         ink = (36, 38, 43)
         muted = (117, 120, 128)
-        divider = (225, 228, 232)
-        pad = 24 if self.width >= 680 else 18
+        divider = (229, 231, 235)
+        pad = 28 if self.width >= 680 else 20
         inner_w = self.width - pad * 2
+        gap = 10
 
-        avatar_size = 66 if self.width >= 680 else 58
-        author_text_w = max(120, inner_w - avatar_size - 150)
-        name_size = 21 if self.width >= 680 else 18
+        avatar_size = 64 if self.width >= 680 else 56
+        name_size = 22 if self.width >= 680 else 19
+        author_text_w = max(140, inner_w - avatar_size - 24)
         name_lines = (
-            self._wrap(
+            self._fit_lines(
                 d["name"],
                 self._font(name_size, bold=True),
                 author_text_w,
+                2,
             )
             if d["author"]
             else []
         )
         author_desc_lines = (
-            self._wrap(
+            self._fit_lines(
                 d["author_desc"],
                 self._font(13),
                 author_text_w,
+                2,
             )
             if d["author_desc"]
             else []
         )
         author_text_h = (
-            len(name_lines) * (name_size + 5) + len(author_desc_lines) * 17
+            len(name_lines) * (name_size + 5)
+            + len(author_desc_lines) * 17
+            + 24
         )
-        header_h = max(104, 36 + max(avatar_size, author_text_h) + 20)
-        hero_h = max(250, round(inner_w * 9 / 16))
-        if d["hero"] and self.cover_full_size:
-            hero_h = self._hero_aspect_height(d["hero"], inner_w, hero_h)
+        header_h = 24 + max(avatar_size, author_text_h) + 20
+
         headline_text, body_text, has_real_title = self._advanced_copy(d)
-        if has_real_title:
-            title_size = 32 if self.width >= 680 else 27
-        else:
-            title_size = 24 if self.width >= 680 else 22
+        title_size = 30 if self.width >= 680 else 26
+        body_size = 23 if self.width >= 680 else 20
         title_lines = (
             self._fit_lines(
                 headline_text,
                 self._font(title_size, bold=True),
                 inner_w,
-                4 if has_real_title else 6,
+                3,
             )
-            if headline_text
+            if has_real_title and headline_text
             else []
         )
-        desc_size = 19 if self.width >= 680 else 17
-        desc_lines = (
-            self._fit_lines(body_text, self._font(desc_size), inner_w, 6)
-            if body_text
+        dynamic_text = body_text if has_real_title else headline_text
+        dynamic_lines = (
+            self._fit_lines(
+                dynamic_text,
+                self._font(body_size),
+                inner_w,
+                8,
+            )
+            if dynamic_text
             else []
         )
+        copy_h = 10
+        if title_lines:
+            copy_h += len(title_lines) * (title_size + 10) + 8
+        if dynamic_lines:
+            copy_h += len(dynamic_lines) * (body_size + 11) + 18
+
+        media = list(d["media"])
+        shown_media = media[:9]
+        over_count = max(0, len(media) - len(shown_media))
+        gallery_boxes: list[tuple[Path, int, int, int, int, bool]] = []
+        gallery_h = 0
+        if shown_media:
+            if d["is_video_hero"]:
+                primary_h = max(250, min(460, round(inner_w * 9 / 16)))
+                gallery_boxes.append(
+                    (shown_media[0], 0, 0, inner_w, primary_h, False)
+                )
+                extras = shown_media[1:]
+                if extras:
+                    cols = min(3, len(extras))
+                    cell_w = max(1, (inner_w - gap * (cols - 1)) // cols)
+                    rows = math.ceil(len(extras) / cols)
+                    cell_h = cell_w
+                    extra_y = primary_h + gap
+                    for idx, path in enumerate(extras):
+                        row, col = divmod(idx, cols)
+                        gallery_boxes.append(
+                            (
+                                path,
+                                col * (cell_w + gap),
+                                extra_y + row * (cell_h + gap),
+                                cell_w,
+                                cell_h,
+                                False,
+                            )
+                        )
+                    gallery_h = extra_y + rows * cell_h + (rows - 1) * gap
+                else:
+                    gallery_h = primary_h
+            elif len(shown_media) == 1:
+                single_h = max(300, min(540, round(inner_w * 0.66)))
+                if self.cover_full_size:
+                    single_h = max(
+                        260,
+                        min(
+                            720,
+                            self._hero_aspect_height(
+                                shown_media[0],
+                                inner_w,
+                                single_h,
+                            ),
+                        ),
+                    )
+                gallery_boxes.append(
+                    (shown_media[0], 0, 0, inner_w, single_h, True)
+                )
+                gallery_h = single_h
+            elif len(shown_media) == 2:
+                cell_w = max(1, (inner_w - gap) // 2)
+                cell_h = max(260, min(390, round(cell_w * 1.02)))
+                for idx, path in enumerate(shown_media):
+                    gallery_boxes.append(
+                        (path, idx * (cell_w + gap), 0, cell_w, cell_h, True)
+                    )
+                gallery_h = cell_h
+            else:
+                cols = 3
+                cell_w = max(1, (inner_w - gap * 2) // cols)
+                cell_h = cell_w
+                rows = math.ceil(len(shown_media) / cols)
+                for idx, path in enumerate(shown_media):
+                    row, col = divmod(idx, cols)
+                    gallery_boxes.append(
+                        (
+                            path,
+                            col * (cell_w + gap),
+                            row * (cell_h + gap),
+                            cell_w,
+                            cell_h,
+                            False,
+                        )
+                    )
+                gallery_h = rows * cell_h + (rows - 1) * gap
+
         stats = d["stats"][:6]
-        stats_h = 62 if stats else 0
-        grid_count = min(4, len(d["grid"]))
-        grid_h = 74 if grid_count else 0
+        stat_font = self._font(15)
+        stat_rows: list[list[str]] = []
+        current_row: list[str] = []
+        current_width = 0
+        for label, value in stats:
+            segment = f"{label} {value or '—'}"
+            segment_w = self._text_width(segment, stat_font) + 28
+            if current_row and current_width + segment_w > inner_w:
+                stat_rows.append(current_row)
+                current_row = []
+                current_width = 0
+            current_row.append(segment)
+            current_width += segment_w
+        if current_row:
+            stat_rows.append(current_row)
+        interaction_h = 20 + max(1, len(stat_rows)) * 28
+
         url_lines, url_size, url_line_h = self._url_layout(
             result,
-            inner_w - 28,
+            inner_w,
             initial_size=14,
             min_size=11,
             target_lines=6,
         )
-        body_h = (
-            28
-            + len(title_lines) * (title_size + 9)
-            + (18 + len(desc_lines) * (desc_size + 10) if desc_lines else 0)
-            + stats_h
-            + grid_h
-            + 24
+        source_h = 60 + len(url_lines) * url_line_h
+        card_h = (
+            header_h
+            + copy_h
+            + (gallery_h + 22 if gallery_h else 0)
+            + interaction_h
+            + source_h
         )
-        source_h = 72 + len(url_lines) * url_line_h
-        card_h = header_h + hero_h + body_h + source_h
         total_h = card_h + 16
 
         canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
@@ -3062,152 +3559,176 @@ class ShareCardRenderer:
         ImageDraw.Draw(shadow).rounded_rectangle(
             (8, 8, self.width - 8, card_h + 2),
             radius=8,
-            fill=(28, 38, 52, 55),
+            fill=(28, 38, 52, 42),
         )
         canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(12)))
-        card = Image.new("RGBA", (self.width, card_h), (*bg, 255))
+        card = Image.new("RGBA", (self.width, card_h), (*paper, 255))
         draw = ImageDraw.Draw(card)
-        draw.rectangle((0, 0, self.width, 6), fill=(*pink, 255))
-        draw.rectangle((round(self.width * 0.62), 0, self.width, 6), fill=(*cyan, 255))
+        draw.rectangle((0, 0, self.width, 5), fill=(*pink, 255))
 
-        # 动态作者头。
         header_y = 24
         if d["author"]:
-            self._avatar_block(card, draw, pad, header_y, avatar_size, images, d, pink)
+            self._avatar_block(
+                card,
+                draw,
+                pad,
+                header_y,
+                avatar_size,
+                images,
+                d,
+                pink,
+            )
             draw = ImageDraw.Draw(card)
             text_x = pad + avatar_size + 16
-            text_y = header_y + 2
+            text_y = header_y
             for line in name_lines:
-                self._draw_text(draw, (text_x, text_y), line, name_size, ink, bold=True)
+                self._draw_text(
+                    draw,
+                    (text_x, text_y),
+                    line,
+                    name_size,
+                    pink,
+                    bold=True,
+                )
                 text_y += name_size + 5
             for line in author_desc_lines:
                 self._draw_text(draw, (text_x, text_y), line, 13, muted)
                 text_y += 17
-        self._draw_text(draw, (self.width - pad - 104, 24), "哔哩哔哩风格", 14, pink, bold=True)
-        platform_label = f"{d['platform_text']} · {d['content_type']}"
-        platform_font = self._font(12, bold=True)
+            meta_y = max(text_y + 2, header_y + avatar_size - 20)
+        else:
+            text_x = pad
+            meta_y = header_y + 8
+
+        chip_font = self._font(12, bold=True)
+        chip_text = d["content_type"]
+        chip_w = self._text_width(chip_text, chip_font) + 22
+        draw.rounded_rectangle(
+            (text_x, meta_y, text_x + chip_w, meta_y + 24),
+            radius=4,
+            fill=(*pink, 255),
+        )
         self._draw_text(
             draw,
-            (self.width - pad - self._text_width(platform_label, platform_font), 51),
-            platform_label,
+            (text_x + 11, meta_y + 5),
+            chip_text,
+            12,
+            (255, 255, 255),
+            bold=True,
+        )
+        platform_x = text_x + chip_w + 12
+        self._draw_text(
+            draw,
+            (platform_x, meta_y + 5),
+            d["platform_text"],
             12,
             cyan,
             bold=True,
         )
         if d["ts"]:
             ts_font = self._font(12)
+            ts_w = self._text_width(d["ts"], ts_font)
             self._draw_text(
                 draw,
-                (self.width - pad - self._text_width(d["ts"], ts_font), 73),
+                (self.width - pad - ts_w, meta_y + 5),
                 d["ts"],
                 12,
                 muted,
             )
 
-        # 宽媒体窗。
-        hero_y = header_h
-        draw.rectangle((pad - 1, hero_y - 1, self.width - pad + 1, hero_y + hero_h + 1), fill=divider)
-        try:
-            if d["hero"]:
-                hero_img = self._cover_fit(self._open_image(d["hero"]), inner_w, hero_h)
-            else:
-                hero_img = self._fallback_cover(
-                    inner_w,
-                    hero_h,
-                    _THEMES["light"],
-                    pink,
-                    0,
-                )
-            hero_img = self._rounded_image(hero_img, 5)
-            card.alpha_composite(hero_img, (pad, hero_y))
-        except Exception:
-            card.alpha_composite(
-                self._fallback_cover(inner_w, hero_h, _THEMES["light"], pink, 5),
-                (pad, hero_y),
-            )
-        draw = ImageDraw.Draw(card)
-        chip_text = d["content_type"]
-        chip_font = self._font(13, bold=True)
-        chip_w = self._text_width(chip_text, chip_font) + 26
-        draw.rounded_rectangle(
-            (pad + 14, hero_y + 14, pad + 14 + chip_w, hero_y + 44),
-            radius=4,
-            fill=(*pink, 235),
-        )
-        self._draw_text(draw, (pad + 27, hero_y + 21), chip_text, 13, (255, 255, 255), bold=True)
-        if d["is_video_hero"] and self.show_play_button:
-            cx, cy = self.width // 2, hero_y + hero_h // 2
-            draw.ellipse((cx - 34, cy - 34, cx + 34, cy + 34), fill=(0, 0, 0, 120))
-            draw.polygon(((cx - 8, cy - 15), (cx - 8, cy + 15), (cx + 17, cy)), fill=(255, 255, 255))
-
-        # 正文与互动栏。
-        y = hero_y + hero_h + 24
+        y = header_h
         for line in title_lines:
             self._draw_text(draw, (pad, y), line, title_size, ink, bold=True)
-            y += title_size + 9
-        if desc_lines:
+            y += title_size + 10
+        if title_lines:
             y += 8
-            for line in desc_lines:
-                self._draw_text(draw, (pad, y), line, desc_size, muted)
-                y += desc_size + 10
-        if stats:
-            y += 16
+        for line in dynamic_lines:
+            self._draw_text(draw, (pad, y), line, body_size, ink)
+            y += body_size + 11
+        if dynamic_lines:
+            y += 18
+
+        gallery_y = y
+        for index, (path, bx, by, bw, bh, contain) in enumerate(gallery_boxes):
+            x = pad + bx
+            yy = gallery_y + by
+            try:
+                source = self._open_image(path)
+                if contain:
+                    media_img = self._contain_fit(source, bw, bh, media_bg)
+                else:
+                    media_img = self._cover_fit(source, bw, bh)
+                media_img = self._rounded_image(media_img, 6)
+                card.alpha_composite(media_img, (x, yy))
+            except Exception:
+                draw.rounded_rectangle(
+                    (x, yy, x + bw, yy + bh),
+                    radius=6,
+                    fill=media_bg,
+                    outline=divider,
+                    width=1,
+                )
+            draw = ImageDraw.Draw(card)
             draw.rounded_rectangle(
-                (pad, y, self.width - pad, y + 50),
-                radius=5,
-                fill=paper,
+                (x, yy, x + bw - 1, yy + bh - 1),
+                radius=6,
                 outline=divider,
                 width=1,
             )
-            cell_w = inner_w / len(stats)
-            for idx, (label, value) in enumerate(stats):
-                sx = round(pad + idx * cell_w)
-                if idx:
-                    draw.line((sx, y + 10, sx, y + 40), fill=divider, width=1)
-                center_x = round(sx + cell_w / 2)
-                value_text = value or "—"
-                value_font = self._font(15, bold=True)
+            if index == len(gallery_boxes) - 1 and over_count:
+                overlay = Image.new("RGBA", (bw, bh), (0, 0, 0, 118))
+                overlay = self._rounded_image(overlay, 6)
+                card.alpha_composite(overlay, (x, yy))
+                plus_text = f"+{over_count}"
+                plus_font = self._font(34, bold=True)
+                plus_w = self._text_width(plus_text, plus_font)
                 self._draw_text(
-                    draw,
-                    (center_x - self._text_width(value_text, value_font) // 2, y + 7),
-                    value_text,
-                    15,
-                    pink if idx % 2 == 0 else cyan,
+                    ImageDraw.Draw(card),
+                    (x + (bw - plus_w) // 2, yy + bh // 2 - 20),
+                    plus_text,
+                    34,
+                    (255, 255, 255),
                     bold=True,
                 )
-                label_font = self._font(10)
-                self._draw_text(
-                    draw,
-                    (center_x - self._text_width(label, label_font) // 2, y + 29),
-                    label,
-                    10,
-                    muted,
-                )
-            y += 62
-        if grid_count:
-            thumb_gap = 8
-            thumb_w = max(1, (inner_w - thumb_gap * (grid_count - 1)) // grid_count)
-            for idx, path in enumerate(d["grid"][:grid_count]):
-                tx = pad + idx * (thumb_w + thumb_gap)
-                try:
-                    thumb = self._cover_fit(self._open_image(path), thumb_w, 62)
-                    thumb = self._rounded_image(thumb, 4)
-                    card.alpha_composite(thumb, (tx, y))
-                except Exception:
-                    draw.rounded_rectangle((tx, y, tx + thumb_w, y + 62), radius=4, fill=paper, outline=divider)
-            y += 74
+        if d["is_video_hero"] and gallery_boxes and self.show_play_button:
+            _, bx, by, bw, bh, _ = gallery_boxes[0]
+            cx = pad + bx + bw // 2
+            cy = gallery_y + by + bh // 2
+            draw.ellipse(
+                (cx - 34, cy - 34, cx + 34, cy + 34),
+                fill=(0, 0, 0, 118),
+            )
+            draw.polygon(
+                ((cx - 8, cy - 15), (cx - 8, cy + 15), (cx + 17, cy)),
+                fill=(255, 255, 255),
+            )
+        if gallery_h:
+            y = gallery_y + gallery_h + 22
 
-        # 来源条保留完整 URL。
+        draw.line((pad, y, self.width - pad, y), fill=divider, width=1)
+        y += 18
+        if stat_rows:
+            for row_index, row in enumerate(stat_rows):
+                x = pad
+                for segment_index, segment in enumerate(row):
+                    color = pink if row_index == 0 and segment_index == 0 else muted
+                    self._draw_text(draw, (x, y), segment, 15, color, bold=color == pink)
+                    x += self._text_width(segment, stat_font) + 28
+                y += 28
+        else:
+            self._draw_text(
+                draw,
+                (pad, y),
+                f"来自 {d['platform_text']} 的公开动态",
+                14,
+                muted,
+            )
+            y += 28
+        y += 2
+
         source_y = card_h - source_h
-        draw.rectangle((0, source_y, self.width, card_h), fill=paper)
         draw.line((pad, source_y, self.width - pad, source_y), fill=divider, width=1)
-        draw.rounded_rectangle(
-            (pad, source_y + 16, pad + 74, source_y + 40),
-            radius=4,
-            fill=(*cyan, 24),
-        )
-        self._draw_text(draw, (pad + 13, source_y + 21), "原始链接", 11, cyan, bold=True)
-        url_y = source_y + 49
+        self._draw_text(draw, (pad, source_y + 15), "原始链接", 12, pink, bold=True)
+        url_y = source_y + 36
         for line in url_lines:
             self._draw_text(draw, (pad, url_y), line, url_size, muted)
             url_y += url_line_h
@@ -3221,8 +3742,14 @@ class ShareCardRenderer:
             pink,
             bold=True,
         )
-        draw.ellipse((pad, card_h - 23, pad + 8, card_h - 15), fill=(*pink, 255))
-        draw.ellipse((pad + 12, card_h - 23, pad + 20, card_h - 15), fill=(*cyan, 255))
+        draw.ellipse(
+            (pad, card_h - 22, pad + 7, card_h - 15),
+            fill=(*pink, 255),
+        )
+        draw.ellipse(
+            (pad + 11, card_h - 22, pad + 18, card_h - 15),
+            fill=(*cyan, 255),
+        )
 
         mask = Image.new("L", (self.width, card_h), 0)
         ImageDraw.Draw(mask).rounded_rectangle(
@@ -3831,10 +4358,21 @@ class ShareCardRenderer:
         stats = parse_stats_line(result.extra.get("stats_line"))
         if dur := result.extra.get("duration"):
             stats.insert(0, ("时长：", fmt_duration(dur)))
+        media = []
+        seen_media: set[str] = set()
+        for path in (hero, *grid):
+            if not path:
+                continue
+            key = str(path)
+            if key in seen_media:
+                continue
+            seen_media.add(key)
+            media.append(path)
         return {
             "is_video_hero": images.get("hero") is not None,
             "hero": hero,
             "grid": grid,
+            "media": media,
             "platform_text": result.platform.display_name,
             "content_type": result.content_type or "动态",
             "ts": format_timestamp(result.timestamp),
@@ -4324,6 +4862,7 @@ class ShareCardRenderer:
         accent_rgb = _hex_to_rgb(accent)
         pad = _L.PAD
         inner_w = self.width - pad * 2
+        gap = _L.GRID_GAP
         d = self._prep(result, images)
 
         title_font = self._font(_L.F_TITLE, bold=True)
@@ -4337,6 +4876,7 @@ class ShareCardRenderer:
         title_lh = _L.F_TITLE_LINE_H
         title_block_h = len(title_lines) * title_lh if title_lines else 0
         warnings_h = self._warning_block_height(d["warnings"], inner_w)
+        grid_h = self._grid_metrics(len(d["grid"]), inner_w, gap)[0]
         footer_h = self._footer_metrics(result, inner_w)[0]
 
         # 封面（上部整宽）
@@ -4356,6 +4896,8 @@ class ShareCardRenderer:
             stack += 36
         if warnings_h:
             stack += warnings_h + 16
+        if grid_h:
+            stack += grid_h + 20
         stack += footer_h
         card_h = hero_h + stack
 
@@ -4449,6 +4991,15 @@ class ShareCardRenderer:
         if d["warnings"]:
             y = self._draw_warning_block(canvas, draw, theme, d["warnings"], y, inner_w)
             draw = ImageDraw.Draw(canvas)
+        y = self._draw_grid_block(
+            canvas,
+            draw,
+            theme,
+            d["grid"],
+            y,
+            inner_w,
+            gap,
+        )
         self._footer_block(canvas, draw, theme, accent, accent_rgb, result, y, inner_w)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)

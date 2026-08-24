@@ -329,6 +329,7 @@ class CardRenderConfig:
     show_play_button: bool = False
     watermark: str = DEFAULT_CARD_WATERMARK
     include_hot_comments: bool = False
+    hot_comment_max_chars: int = 180
 
     def include_text_in_card(self) -> bool:
         """文本是否并入卡片图所在的那条消息。"""
@@ -750,6 +751,9 @@ class ConfigManager:
                     card_render.get("include_hot_comments", False),
                     False,
                     "message.card_render.include_hot_comments",
+                ),
+                hot_comment_max_chars=self._parse_card_hot_comment_max_chars(
+                    card_render.get("hot_comment_max_chars", 180)
                 ),
             ),
         )
@@ -1246,6 +1250,13 @@ class ConfigManager:
             return 800
 
     @staticmethod
+    def _parse_card_hot_comment_max_chars(value) -> int:
+        try:
+            return max(60, min(600, int(value)))
+        except (TypeError, ValueError):
+            return 180
+
+    @staticmethod
     def _parse_card_theme(value) -> str:
         theme = str(value or "").strip().lower()
         if theme in ("light", "浅色", "浅"):
@@ -1282,6 +1293,7 @@ class ConfigManager:
             "bilibili",
             "哔哩哔哩",
             "哔哩哔哩风格",
+            "b站动态",
             "b站风格",
             "b站卡片",
         ):
