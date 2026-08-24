@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 from astrbot.api.message_components import Image, Nodes, Plain, Reply
 
+from nova_core.message_adapter.node_builder import build_all_nodes
 from nova_core.message_adapter.sender import MessageSender
 
 
@@ -116,6 +117,49 @@ class MessageDeliveryTests(unittest.TestCase):
         self.assertIsInstance(outer_chain[0], Nodes)
         forward_content = outer_chain[0].nodes[0].content
         self.assertEqual(forward_content, [self.card, self.summary])
+
+    def test_partial_delivery_failure_is_logged_without_chat_notice(self):
+        event = SimpleNamespace(send=AsyncMock())
+
+        asyncio.run(
+            self.sender._finish_best_effort_delivery(
+                event,
+                label="解析结果",
+                expected=2,
+                succeeded=1,
+                errors=[RuntimeError("video send failed")],
+            )
+        )
+
+        event.send.assert_not_awaited()
+
+    def test_hot_comments_can_be_hidden_from_plain_text_only(self):
+        result = build_all_nodes(
+            [
+                {
+                    "url": "https://example.com/post/1",
+                    "title": "解析标题",
+                    "desc": "解析正文",
+                    "hot_comments": [{"username": "Alice", "message": "热评正文"}],
+                    "_enable_text_metadata": True,
+                    "_enable_rich_media": False,
+                    "_enable_hot_comments_text": False,
+                }
+            ],
+            50,
+            50,
+            True,
+            True,
+        )
+
+        plain_text = "\n".join(
+            node.text
+            for node in result.all_link_nodes[0]
+            if isinstance(node, Plain)
+        )
+        self.assertIn("解析标题", plain_text)
+        self.assertIn("解析正文", plain_text)
+        self.assertNotIn("热评正文", plain_text)
 
 
 if __name__ == "__main__":

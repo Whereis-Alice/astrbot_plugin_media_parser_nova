@@ -41,6 +41,7 @@ class ConfigAndTranslationTests(unittest.TestCase):
                 "message": {
                     "hot_comments": {
                         "count": 4,
+                        "show_in_text": False,
                         "twitter": True,
                         "xiaoheihe": False,
                     },
@@ -52,6 +53,7 @@ class ConfigAndTranslationTests(unittest.TestCase):
         )
 
         self.assertEqual(config.message.hot_comments.count, 4)
+        self.assertFalse(config.message.hot_comments.show_in_text)
         self.assertTrue(config.message.hot_comments.twitter)
         self.assertFalse(config.message.hot_comments.xiaoheihe)
         self.assertTrue(config.message.card_render.include_hot_comments)

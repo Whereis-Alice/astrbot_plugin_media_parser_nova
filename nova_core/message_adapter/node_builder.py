@@ -451,6 +451,11 @@ def _build_node_parts_for_link(
         "_enable_rich_media",
         enable_rich_media,
     )
+    effective_hot_comments_text = _resolve_output_flag(
+        metadata,
+        "_enable_hot_comments_text",
+        True,
+    )
 
     media_nodes = build_media_nodes(
         metadata,
@@ -464,7 +469,7 @@ def _build_node_parts_for_link(
     )
     hot_comments_node = build_hot_comments_node(
         metadata,
-        effective_text_metadata,
+        effective_text_metadata and effective_hot_comments_text,
     )
     text_nodes = _split_plain_node(text_node)
     hot_comments_nodes = _split_plain_node(hot_comments_node)

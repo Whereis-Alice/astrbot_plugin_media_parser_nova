@@ -301,6 +301,7 @@ class TextMetadataConfig:
 @dataclass
 class HotCommentConfig:
     count: int = 0
+    show_in_text: bool = True
     bilibili: bool = True
     weibo: bool = True
     xiaohongshu: bool = True
@@ -681,6 +682,11 @@ class ConfigManager:
             ),
             hot_comments=HotCommentConfig(
                 count=hot_count,
+                show_in_text=self._parse_bool(
+                    hot_comments.get("show_in_text", True),
+                    True,
+                    "message.hot_comments.show_in_text",
+                ),
                 bilibili=self._parse_bool(
                     hot_comments.get("bilibili", True),
                     True,

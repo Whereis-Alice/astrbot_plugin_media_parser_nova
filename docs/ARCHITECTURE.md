@@ -277,8 +277,8 @@ video_count .. video_count + image_count   图片
 `node_builder.py` 负责将 metadata 转成节点：
 
 - 文本元数据节点按 `_text_metadata_fields` 展示标题、作者、发布时间、原始链接和简介/正文；访问状态、视频大小、跳过原因和解析错误始终保留。简介/正文放在最后，并用分隔符与前面的元数据分开。
-- 热评节点和翻译节点是独立文本节点，不混入文本元数据节点。热评不进入翻译流程。
-- 翻译结果来自后台大模型任务，按链接独立请求，每条请求最多包含标题和简介/正文；无需翻译时不会生成翻译节点。
+- 热评节点是独立文本节点，不混入基础文本元数据；`_enable_hot_comments_text=false` 时只跳过热评文本，不影响卡片评论。
+- 翻译结果来自后台大模型任务，标题、简介/正文和热评按链接合并请求，再按译文应用范围写入卡片或普通文本展示副本。
 - 富媒体节点只消费 `video_modes/image_modes`：`local` 用 Token URL 或本地文件，`direct` 用剥离前缀后的 URL，`skip` 不构建节点。
 - 内部先尝试构建富媒体节点，再构建文本节点，这样节点构建失败时可把原因回填到 metadata，文本节点可展示。
 - `build_all_nodes()` 返回 `BuildAllNodesResult(all_link_nodes, link_metadata, temp_files, video_files)`。
@@ -638,5 +638,5 @@ metadata.proxy_url > ConfigManager.proxy.address
 - Pixiv Ajax 返回 HTML 时会在 HTTP 状态抛错前识别 Cloudflare 防护页，避免把拦截页当作 JSON 处理。
 - 下载阶段：单个候选失败会尝试下一个候选；媒体项全部失败写入 skip reason；本条 metadata 全部媒体失败时清理对应缓存子目录。
 - 大小限制：普通视频下载前预检，DASH/M3U8/强制缓存视频下载后再兜底检查，超限会删除文件并置为 `skip`。
-- 发送阶段：独立节点采用 best-effort，部分失败会给用户明确提示；预期节点全部发送失败时抛出聚合错误，不再记录虚假的“发送完成”。主发送异常始终进入 finally 清理。
+- 发送阶段：独立节点采用 best-effort；部分失败只记录后台日志，不再向 QQ 会话追加提示。预期节点全部发送失败时抛出聚合错误，不再记录虚假的“发送完成”。主发送异常始终进入 finally 清理。
 - 外部子进程：DASH/M3U8/图片转换涉及 ffmpeg，TikTok 涉及系统 curl；超时或取消路径会终止并回收子进程。

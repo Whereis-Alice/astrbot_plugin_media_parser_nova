@@ -82,14 +82,11 @@ class MessageSender:
             raise MessageDeliveryError(
                 f"{label}全部发送失败（{len(errors)}项）"
             ) from errors[0]
-        try:
-            await event.send(
-                event.plain_result(
-                    f"{label}有 {len(errors)} 项发送失败，其余内容已发送。"
-                )
-            )
-        except Exception as exc:
-            logger.warning(f"发送部分失败提示失败: {exc}")
+        error_preview = "; ".join(str(error) for error in errors[:3])
+        logger.warning(
+            f"{label}部分发送失败: {len(errors)}/{expected} 项失败，"
+            f"其余内容已发送。错误: {error_preview}"
+        )
 
     @staticmethod
     def collect_rendered_card_paths(
