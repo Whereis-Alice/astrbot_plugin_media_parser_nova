@@ -8,7 +8,7 @@
 - 圆形作者头像、昵称与签名
 - 正文简介、毛玻璃数据统计徽章（时长 / 点赞 / 投币 / 收藏 / 播放等）
 - 图集网格（超过 6 张显示 +N）、转发内容引用卡片
-- 底部链接与「Nova解析」徽标水印
+- 底部链接与可配置署名
 
 所有绘图操作均为 CPU 密集的同步任务，由调用方通过 asyncio.to_thread
 放到后台线程执行，避免阻塞 AstrBot 事件循环。
@@ -44,7 +44,7 @@ try:
 except AttributeError:  # Pillow < 9.1
     _LANCZOS = Image.LANCZOS  # type: ignore[attr-defined]
 
-WATERMARK_TAG = "Nova解析"
+DEFAULT_WATERMARK_TAG = "Nova解析"
 
 
 # ============================ 文本与统计处理 ============================
@@ -99,7 +99,7 @@ _STAT_LABELS = {
 
 
 # 卡片样式版本：视觉样式变化时 +1，使已缓存的旧卡片失效并重新渲染
-_CARD_STYLE_VERSION = "13"
+_CARD_STYLE_VERSION = "14"
 
 
 def strip_emoji(text: str | None) -> str:
@@ -420,8 +420,8 @@ _FONT_DIRS = [
     "/usr/local/share/fonts",
 ]
 
-# 内置兜底背景图：封面/横幅加载失败时使用
-_FALLBACK_BG_PATH = Path(__file__).resolve().parent / "assets" / "fallback_bg.jpg"
+# 内置兜底背景图：原创无文字 Nova 抽象纹理，封面/横幅加载失败时使用。
+_FALLBACK_BG_PATH = Path(__file__).resolve().parent / "assets" / "fallback_nova.png"
 
 
 def _discover_fonts(custom_path: str | None = None) -> tuple[str | None, str | None]:
@@ -466,6 +466,7 @@ def _discover_fonts(custom_path: str | None = None) -> tuple[str | None, str | N
 # 可选卡片布局：standard 标准横幅 / magazine 双栏杂志 /
 # immersive 沉浸全屏 / feed 社交动态流
 LAYOUT_NAMES = ("standard", "magazine", "immersive", "feed")
+SKIN_NAMES = ("nova", "editorial", "signal", "poster")
 
 
 class ShareCardRenderer:
@@ -480,17 +481,29 @@ class ShareCardRenderer:
         theme: str = "dark",
         font_path: str | None = None,
         layout: str = "standard",
+        skin: str = "nova",
         cover_full_size: bool = False,
         show_play_button: bool = False,
+        watermark: str = DEFAULT_WATERMARK_TAG,
     ):
         self.cache_dir = cache_dir
         self.enabled = enabled and Image is not None
         self.width = max(520, min(1080, int(width)))
         self.theme_name = theme if theme in _THEMES else "dark"
         self.layout_name = layout if layout in LAYOUT_NAMES else "standard"
+        skin_aliases = {
+            "Nova 原生": "nova",
+            "原生": "nova",
+            "编辑室": "editorial",
+            "信号终端": "signal",
+            "海报档案": "poster",
+        }
+        skin = skin_aliases.get(str(skin or "").strip(), str(skin or "").strip().lower())
+        self.skin_name = skin if skin in SKIN_NAMES else "nova"
         self.font_path = font_path
         self.show_play_button = bool(show_play_button)
         self.cover_full_size = cover_full_size
+        self.watermark = (str(watermark or "").strip() or DEFAULT_WATERMARK_TAG)[:32]
         self._regular_font: str | None = None
         self._bold_font: str | None = None
         self._font_cache: dict[tuple[int, bool], Any] = {}
@@ -567,6 +580,18 @@ class ShareCardRenderer:
     def _line_height(self, font: Any) -> int:
         ascent, descent = font.getmetrics()
         return ascent + descent
+
+    def _ellipsize(self, text: str, font: Any, max_width: int) -> str:
+        """把单行文本截断到指定宽度，并保留省略号。"""
+        value = str(text or "")
+        if max_width <= 0:
+            return ""
+        if self._text_width(value, font) <= max_width:
+            return value
+        ellipsis = "…"
+        while value and self._text_width(value + ellipsis, font) > max_width:
+            value = value[:-1]
+        return value + ellipsis if value else ""
 
     def _draw_text(
         self,
@@ -769,7 +794,7 @@ class ShareCardRenderer:
             or f"{result.platform.name}|{result.title}|{result.timestamp}|{result.url}"
         )
         digest = hashlib.md5(
-            f"{_CARD_STYLE_VERSION}|{self.theme_name}|{self.width}|{self.layout_name}|{self.cover_full_size}|{self.show_play_button}|{payload}|{warnings_str}".encode("utf-8")
+            f"{_CARD_STYLE_VERSION}|{self.skin_name}|{self.theme_name}|{self.width}|{self.layout_name}|{self.cover_full_size}|{self.show_play_button}|{self.watermark}|{payload}|{warnings_str}".encode("utf-8")
         ).hexdigest()[:16]
         return self.cache_dir / f"card_{digest}.png"
 
@@ -929,6 +954,12 @@ class ShareCardRenderer:
         out_path: Path,
     ) -> Path:
         """按 self.layout_name 分发到具体布局实现。"""
+        if self.skin_name == "editorial":
+            return self._render_editorial(result, images, out_path)
+        if self.skin_name == "signal":
+            return self._render_signal(result, images, out_path)
+        if self.skin_name == "poster":
+            return self._render_poster(result, images, out_path)
         if self.layout_name == "magazine":
             return self._render_magazine(result, images, out_path)
         if self.layout_name == "immersive":
@@ -936,6 +967,629 @@ class ShareCardRenderer:
         if self.layout_name == "feed":
             return self._render_feed(result, images, out_path)
         return self._render_standard(result, images, out_path)
+
+    # ==================== 高级皮肤：编辑室 ====================
+
+    def _render_editorial(
+        self,
+        result: ParseResult,
+        images: dict[str, Any],
+        out_path: Path,
+    ) -> Path:
+        """编辑室：纸张底、非对称双栏和信息编排，独立于 Nova 原生布局。"""
+        d = self._prep(result, images)
+        accent = PLATFORM_COLORS.get(result.platform.name, PLATFORM_COLORS["default"])
+        accent_rgb = _hex_to_rgb(accent)
+        ink = (34, 32, 29)
+        muted = (103, 96, 87)
+        soft = (157, 147, 134)
+        paper = (247, 242, 233)
+        paper_deep = (235, 227, 214)
+
+        pad = 30
+        inner_w = self.width - pad * 2
+        gap = 26
+        left_w = max(220, round(inner_w * 0.42))
+        right_w = max(180, inner_w - left_w - gap)
+        body_y = 96
+
+        title_font = self._font(36, bold=True)
+        title_text = d["title"] or "未命名内容"
+        title_lines = self._fit_lines(title_text, title_font, right_w, 3)
+        desc_lines = self._fit_lines(d["text"], self._font(22), right_w, 5) if d["text"] else []
+        stat_count = min(len(d["stats"]), 6)
+        thumb_count = min(len(d["grid"]), 3)
+        media_h = max(440, min(680, round(left_w * 1.34)))
+        right_h = 56 + len(title_lines) * 48
+        if d["author"]:
+            right_h += 70
+        if desc_lines:
+            right_h += 26 + len(desc_lines) * 34
+        if stat_count:
+            right_h += 26 + ((stat_count + 1) // 2) * 34
+        if thumb_count:
+            right_h += 106 + (20 if len(d["grid"]) > 3 else 0)
+        body_h = max(media_h, right_h + 8)
+        card_h = body_y + body_h + 92
+        total_h = card_h + 18
+
+        canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
+        shadow = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rounded_rectangle(
+            (10, 10, self.width - 10, card_h + 3), radius=8,
+            fill=(42, 34, 25, 70),
+        )
+        canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(12)))
+        card = Image.new("RGBA", (self.width, card_h), (*paper, 255))
+        card_draw = ImageDraw.Draw(card)
+
+        # 纸张纹理和版心标记，避免仅依赖颜色表达皮肤。
+        for yy in range(18, card_h, 28):
+            card_draw.line((pad, yy, self.width - pad, yy), fill=(*paper_deep, 80), width=1)
+        card_draw.line((pad, 22, pad + 78, 22), fill=(*accent_rgb, 255), width=4)
+        card_draw.line((pad, 28, self.width - pad, 28), fill=(*ink, 35), width=1)
+        self._draw_text(
+            card_draw, (pad, 42), "NOVA / EDITORIAL FILE", 15, ink, bold=True
+        )
+        meta_head = f"{d['platform_text']}  /  {d['content_type']}"
+        meta_font = self._font(16, bold=True)
+        self._draw_text(
+            card_draw,
+            (self.width - pad - self._text_width(meta_head, meta_font), 42),
+            meta_head,
+            16,
+            muted,
+            bold=True,
+        )
+
+        # 左栏：封面作为编辑版心，附带编号和索引条。
+        hero = d["hero"]
+        try:
+            if hero:
+                hero_img = self._cover_fit(self._open_image(hero), left_w, body_h)
+                hero_img = self._rounded_image(hero_img, 6)
+            else:
+                hero_img = self._fallback_cover(
+                    left_w, body_h, _THEMES["light"], accent_rgb, 6
+                )
+            card.alpha_composite(hero_img, (pad, body_y))
+        except Exception:
+            card.alpha_composite(
+                self._fallback_cover(left_w, body_h, _THEMES["light"], accent_rgb, 6),
+                (pad, body_y),
+            )
+        card_draw = ImageDraw.Draw(card)
+        card_draw.rectangle(
+            (pad, body_y, pad + left_w - 1, body_y + body_h - 1),
+            outline=(*ink, 110), width=1,
+        )
+        self._draw_text(card_draw, (pad + 18, body_y + 12), "01", 92, (255, 255, 255, 160), bold=True)
+        card_draw.rectangle(
+            (pad + 18, body_y + body_h - 58, pad + 112, body_y + body_h - 48),
+            fill=(*accent_rgb, 245),
+        )
+        left_label = f"{d['platform_text']}  ·  {d['content_type']}"
+        self._draw_text(
+            card_draw, (pad + 18, body_y + body_h - 40), left_label[:30], 16,
+            (255, 255, 255, 235), bold=True,
+        )
+
+        # 右栏：标题、作者、正文和统计采用杂志式垂直节奏。
+        rx = pad + left_w + gap
+        y = body_y
+        card_draw.line((rx, y, rx + 62, y), fill=(*accent_rgb, 255), width=4)
+        y += 16
+        section_label = "FEATURE / 解析内容"
+        self._draw_text(card_draw, (rx, y), section_label, 15, muted, bold=True)
+        y += 30
+        for line in title_lines:
+            self._draw_text(card_draw, (rx, y), line, 36, ink, bold=True)
+            y += 48
+        y += 10
+
+        if d["author"]:
+            avatar_size = 48
+            avatar_path = images.get("avatar")
+            avatar = None
+            if avatar_path:
+                try:
+                    avatar = self._cover_fit(self._open_image(avatar_path), avatar_size, avatar_size)
+                except Exception:
+                    avatar = None
+            if avatar is None:
+                avatar = Image.new("RGBA", (avatar_size, avatar_size), (*accent_rgb, 255))
+                first = (d["name"][:1] or "?").upper()
+                first_font = self._font(22, bold=True)
+                first_draw = ImageDraw.Draw(avatar)
+                first_draw.text(
+                    ((avatar_size - self._text_width(first, first_font)) // 2, 10),
+                    first,
+                    font=first_font,
+                    fill=(255, 255, 255, 255),
+                )
+            card.alpha_composite(avatar.convert("RGBA"), (rx, y))
+            card_draw = ImageDraw.Draw(card)
+            name_font = self._font(22, bold=True)
+            name_text = self._ellipsize(d["name"], name_font, right_w - 62)
+            self._draw_text(card_draw, (rx + 62, y + 2), name_text, 22, ink, bold=True)
+            if d["author_desc"]:
+                desc_font = self._font(16)
+                author_desc = self._ellipsize(
+                    d["author_desc"], desc_font, right_w - 62
+                )
+                self._draw_text(card_draw, (rx + 62, y + 29), author_desc, 16, muted)
+            y += avatar_size + 22
+
+        if desc_lines:
+            card_draw.line((rx, y, rx + right_w, y), fill=(*ink, 35), width=1)
+            y += 14
+            for line in desc_lines:
+                self._draw_text(card_draw, (rx, y), line, 22, muted)
+                y += 34
+            y += 12
+
+        if d["stats"]:
+            stats = d["stats"][:6]
+            card_draw.line((rx, y, rx + right_w, y), fill=(*ink, 35), width=1)
+            y += 12
+            stat_w = max(1, right_w // 2)
+            for idx, (label, value) in enumerate(stats):
+                col = idx % 2
+                row = idx // 2
+                sx = rx + col * stat_w
+                sy = y + row * 34
+                self._draw_text(card_draw, (sx, sy), label.upper(), 14, soft, bold=True)
+                value_text = value or "—"
+                self._draw_text(card_draw, (sx, sy + 16), value_text, 18, ink, bold=True)
+            y += ((len(stats) + 1) // 2) * 34 + 14
+
+        if d["grid"]:
+            thumb_y = y + 4
+            thumb_gap = 8
+            thumb_w = max(1, (right_w - thumb_gap * 2) // 3)
+            for idx, path in enumerate(d["grid"][:3]):
+                try:
+                    thumb = self._cover_fit(self._open_image(path), thumb_w, 82)
+                    thumb = self._rounded_image(thumb, 3)
+                    card.alpha_composite(thumb, (rx + idx * (thumb_w + thumb_gap), thumb_y))
+                except Exception:
+                    card_draw.rectangle(
+                        (rx + idx * (thumb_w + thumb_gap), thumb_y,
+                         rx + idx * (thumb_w + thumb_gap) + thumb_w, thumb_y + 82),
+                        outline=(*soft, 120), width=1,
+                    )
+            card_draw = ImageDraw.Draw(card)
+            if len(d["grid"]) > 3:
+                self._draw_text(card_draw, (rx, thumb_y + 88), f"+{len(d['grid']) - 3} 张图片", 14, muted)
+
+        # 独立页脚：编辑号、原链和可配置署名。
+        footer_y = body_y + body_h + 26
+        card_draw.line((pad, footer_y, self.width - pad, footer_y), fill=(*ink, 70), width=1)
+        url_text = card_footer_url(result)
+        url_font = self._font(16)
+        wm_font = self._font(16, bold=True)
+        wm_text = self.watermark
+        wm_width = self._text_width(wm_text, wm_font)
+        wm_x = self.width - pad - wm_width
+        if url_text:
+            available = max(40, wm_x - pad - 24)
+            url_text = self._ellipsize(url_text, url_font, available)
+            self._draw_text(card_draw, (pad, footer_y + 18), url_text, 16, muted)
+        self._draw_text(card_draw, (wm_x, footer_y + 18), wm_text, 16, accent, bold=True)
+        self._draw_text(
+            card_draw, (pad, footer_y + 47), "A CURATED MEDIA NOTE", 12, soft, bold=True
+        )
+
+        mask = Image.new("L", (self.width, card_h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, self.width - 1, card_h - 1), radius=8, fill=255
+        )
+        flattened = Image.new("RGBA", card.size, (*paper, 255))
+        flattened.alpha_composite(card)
+        card = flattened
+        card.putalpha(mask)
+        canvas.alpha_composite(card, (0, 0))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(out_path, "PNG", optimize=True)
+        return out_path
+
+    # ==================== 高级皮肤：信号终端 ====================
+
+    def _render_signal(
+        self,
+        result: ParseResult,
+        images: dict[str, Any],
+        out_path: Path,
+    ) -> Path:
+        """信号终端：网格背景、状态栏和遥测面板，独立于常规卡片布局。"""
+        d = self._prep(result, images)
+        accent = PLATFORM_COLORS.get(result.platform.name, PLATFORM_COLORS["default"])
+        accent_rgb = _hex_to_rgb(accent)
+        bg = (9, 14, 19)
+        panel = (15, 23, 30)
+        ink = (229, 239, 241)
+        muted = (135, 157, 163)
+        dim = (75, 101, 109)
+        warning = (247, 183, 74)
+        pad = 24
+        inner_w = self.width - pad * 2
+        gap = 18
+        hero_w = max(260, round(inner_w * 0.58))
+        side_w = inner_w - hero_w - gap
+        top_y = 96
+        hero_h = max(340, min(480, round(hero_w * 0.72)))
+        title_font = self._font(34, bold=True)
+        title_lines = self._fit_lines(d["title"] or "UNTITLED SIGNAL", title_font, inner_w, 2)
+        desc_lines = self._fit_lines(d["text"], self._font(21), inner_w, 3) if d["text"] else []
+        grid_count = min(len(d["grid"]), 4)
+        lower_h = 34 + len(title_lines) * 46 + (len(desc_lines) * 31 + 18 if desc_lines else 0)
+        if d["stats"]:
+            lower_h += 62
+        if grid_count:
+            lower_h += 88
+        card_h = max(560, top_y + hero_h + lower_h + 108)
+        total_h = card_h + 16
+
+        canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
+        shadow = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rectangle(
+            (10, 10, self.width - 10, card_h + 2), fill=(0, 0, 0, 125)
+        )
+        canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(13)))
+        card = Image.new("RGBA", (self.width, card_h), (*bg, 255))
+
+        # 终端网格和扫描线是皮肤结构的一部分，而不是主题滤镜。
+        grid_layer = Image.new("RGBA", (self.width, card_h), (0, 0, 0, 0))
+        grid_draw = ImageDraw.Draw(grid_layer)
+        for xx in range(16, self.width, 24):
+            grid_draw.line((xx, 0, xx, card_h), fill=(44, 78, 85, 38), width=1)
+        for yy in range(16, card_h, 24):
+            grid_draw.line((0, yy, self.width, yy), fill=(44, 78, 85, 38), width=1)
+        card.alpha_composite(grid_layer)
+        draw = ImageDraw.Draw(card)
+        draw.rectangle(
+            (0, 0, self.width - 1, card_h - 1),
+            outline=_mix(bg, accent_rgb, 0.55),
+            width=1,
+        )
+
+        # 顶部状态栏。
+        draw.rectangle((0, 0, self.width, 66), fill=panel)
+        for idx, color in enumerate(((239, 95, 88), (242, 185, 74), (94, 201, 112))):
+            cx = 24 + idx * 22
+            draw.ellipse((cx - 5, 28 - 5, cx + 5, 28 + 5), fill=color)
+        self._draw_text(draw, (98, 17), "NOVA // MEDIA SIGNAL", 18, ink, bold=True)
+        self._draw_text(draw, (98, 39), "PARSER LINK ESTABLISHED", 12, dim, bold=True)
+        status = "ONLINE  0x01"
+        status_font = self._font(15, bold=True)
+        self._draw_text(
+            draw, (self.width - pad - self._text_width(status, status_font), 24),
+            status, 15, accent, bold=True,
+        )
+
+        # 媒体视窗。
+        hero = d["hero"]
+        hero_box = (pad, top_y, pad + hero_w, top_y + hero_h)
+        try:
+            if hero:
+                hero_img = self._cover_fit(self._open_image(hero), hero_w, hero_h).convert("RGBA")
+            else:
+                hero_img = self._fallback_cover(
+                    hero_w, hero_h, _THEMES["dark"], accent_rgb, 0
+                )
+            card.alpha_composite(hero_img, (pad, top_y))
+        except Exception:
+            card.alpha_composite(
+                self._fallback_cover(hero_w, hero_h, _THEMES["dark"], accent_rgb, 0),
+                (pad, top_y),
+            )
+        draw = ImageDraw.Draw(card)
+        draw.rectangle(hero_box, outline=(*accent_rgb, 220), width=2)
+        scan_layer = Image.new("RGBA", (hero_w, hero_h), (0, 0, 0, 0))
+        scan_draw = ImageDraw.Draw(scan_layer)
+        for yy in range(8, hero_h, 9):
+            scan_draw.line((2, yy, hero_w - 2, yy), fill=(255, 255, 255, 10), width=1)
+        card.alpha_composite(scan_layer, (pad, top_y))
+        draw = ImageDraw.Draw(card)
+        self._draw_text(draw, (pad + 14, top_y + 14), "VIEWPORT / 01", 13, (255, 255, 255, 230), bold=True)
+        if d["is_video_hero"] and self.show_play_button:
+            cx, cy = pad + hero_w // 2, top_y + hero_h // 2
+            draw.ellipse((cx - 34, cy - 34, cx + 34, cy + 34), outline=(255, 255, 255, 220), width=2)
+            draw.polygon(((cx - 8, cy - 14), (cx - 8, cy + 14), (cx + 15, cy)), fill=(255, 255, 255, 235))
+
+        # 右侧遥测字段。
+        sx = pad + hero_w + gap
+        sy = top_y
+        draw.rectangle(
+            (sx, sy, sx + side_w, sy + hero_h),
+            fill=panel,
+            outline=_mix(panel, dim, 0.7),
+            width=1,
+        )
+        self._draw_text(draw, (sx + 16, sy + 14), "TELEMETRY", 14, accent, bold=True)
+        draw.line((sx + 16, sy + 39, sx + side_w - 16, sy + 39), fill=(*dim, 150), width=1)
+        fields = [
+            ("SOURCE", d["platform_text"]),
+            ("TYPE", d["content_type"]),
+            ("AUTHOR", d["name"] or "UNKNOWN"),
+            ("STAMP", d["ts"] or "N/A"),
+        ]
+        fy = sy + 57
+        for label, value in fields:
+            self._draw_text(draw, (sx + 16, fy), label, 12, dim, bold=True)
+            value_font = self._font(18, bold=True)
+            value_text = self._ellipsize(value, value_font, side_w - 32)
+            self._draw_text(draw, (sx + 16, fy + 17), value_text, 18, ink, bold=True)
+            fy += 50
+        draw.line(
+            (sx + 16, sy + hero_h - 56, sx + side_w - 16, sy + hero_h - 56),
+            fill=_mix(panel, dim, 0.7),
+            width=1,
+        )
+        pulse_y = sy + hero_h - 34
+        draw.line(
+            (sx + 16, pulse_y, sx + side_w - 16, pulse_y),
+            fill=_mix(panel, accent_rgb, 0.35),
+            width=1,
+        )
+        points = []
+        for idx in range(12):
+            px = sx + 18 + idx * max(1, (side_w - 40) // 11)
+            py = pulse_y - (6 if idx % 3 == 0 else (14 if idx % 4 == 0 else 2))
+            points.append((px, py))
+        if len(points) > 1:
+            draw.line(points, fill=(*accent_rgb, 235), width=2)
+
+        # 标题、正文和数据行。
+        y = top_y + hero_h + 28
+        self._draw_text(draw, (pad, y), "TITLE /", 13, accent, bold=True)
+        y += 23
+        for line in title_lines:
+            self._draw_text(draw, (pad, y), line, 34, ink, bold=True)
+            y += 46
+        if desc_lines:
+            y += 3
+            for line in desc_lines:
+                self._draw_text(draw, (pad, y), line, 21, muted)
+                y += 31
+            y += 8
+        if d["stats"]:
+            draw.line((pad, y, self.width - pad, y), fill=(*dim, 150), width=1)
+            y += 12
+            stats_text = "   ".join(
+                f"[{label}] {value or '—'}" for label, value in d["stats"][:6]
+            )
+            stats_font = self._font(15, bold=True)
+            stats_lines = self._fit_lines(stats_text, stats_font, inner_w, 2)
+            for line in stats_lines:
+                self._draw_text(draw, (pad, y), line, 15, ink, bold=True)
+                y += 24
+            y += 5
+        if d["grid"]:
+            thumb_w = max(1, (inner_w - gap * 3) // 4)
+            thumb_y = y + 3
+            for idx, path in enumerate(d["grid"][:4]):
+                x = pad + idx * (thumb_w + gap)
+                try:
+                    thumb = self._cover_fit(self._open_image(path), thumb_w, 68).convert("RGBA")
+                    card.alpha_composite(thumb, (x, thumb_y))
+                except Exception:
+                    draw.rectangle((x, thumb_y, x + thumb_w, thumb_y + 68), outline=(*dim, 180), width=1)
+                draw = ImageDraw.Draw(card)
+                draw.rectangle((x, thumb_y, x + thumb_w - 1, thumb_y + 67), outline=(*dim, 160), width=1)
+            y = thumb_y + 76
+
+        # 独立终端页脚。
+        footer_y = card_h - 72
+        draw.line((pad, footer_y, self.width - pad, footer_y), fill=(*accent_rgb, 150), width=1)
+        wm_font = self._font(15, bold=True)
+        wm_text = self.watermark
+        wm_width = self._text_width(wm_text, wm_font)
+        url_text = card_footer_url(result)
+        if url_text:
+            url_font = self._font(14)
+            url_text = self._ellipsize(
+                f"LINK://{url_text}",
+                url_font,
+                self.width - pad * 2 - wm_width - 24,
+            )
+            self._draw_text(draw, (pad, footer_y + 20), url_text, 14, muted)
+        self._draw_text(draw, (self.width - pad - wm_width, footer_y + 19), wm_text, 15, accent, bold=True)
+        footer_status = "CRC: OK   /   MEDIA READY"
+        self._draw_text(draw, (pad, footer_y + 43), footer_status, 11, dim, bold=True)
+        if d["warnings"]:
+            warning_text = self._fit_lines(strip_emoji(d["warnings"][0]), self._font(13), inner_w, 1)[0]
+            self._draw_text(draw, (pad, footer_y - 22), f"WARN // {warning_text}", 13, warning, bold=True)
+
+        canvas.alpha_composite(card, (0, 0))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(out_path, "PNG", optimize=True)
+        return out_path
+
+    # ==================== 高级皮肤：海报档案 ====================
+
+    def _render_poster(
+        self,
+        result: ParseResult,
+        images: dict[str, Any],
+        out_path: Path,
+    ) -> Path:
+        """海报档案：整幅媒体背景、强标题层级和色块信息带。"""
+        d = self._prep(result, images)
+        accent = PLATFORM_COLORS.get(result.platform.name, PLATFORM_COLORS["default"])
+        accent_rgb = _hex_to_rgb(accent)
+        ink = (8, 12, 18)
+        white = (250, 252, 251)
+        muted = (216, 225, 226)
+        pad = 34
+        inner_w = self.width - pad * 2
+        title_size = 52 if self.width >= 760 else 44
+        title_font = self._font(title_size, bold=True)
+        title_lines = self._fit_lines(d["title"] or "未命名内容", title_font, inner_w, 3)
+        desc_lines = self._fit_lines(d["text"], self._font(21), inner_w, 3) if d["text"] else []
+        bottom_band_h = 126
+        title_h = len(title_lines) * (title_size + 10)
+        desc_h = len(desc_lines) * 31
+        author_h = 50 if d["author"] else 0
+        content_stack_h = (
+            title_h
+            + 24
+            + author_h
+            + (18 if desc_lines else 0)
+            + desc_h
+        )
+        card_h = max(760, 190 + content_stack_h + bottom_band_h + 40)
+        total_h = card_h + 18
+
+        canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
+        shadow = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rounded_rectangle(
+            (9, 9, self.width - 9, card_h + 3), radius=18, fill=(0, 0, 0, 110)
+        )
+        canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(15)))
+        card = Image.new("RGBA", (self.width, card_h), (*ink, 255))
+
+        hero = d["hero"]
+        try:
+            if hero:
+                bg_img = self._cover_fit(self._open_image(hero), self.width, card_h).convert("RGBA")
+            else:
+                bg_img = self._fallback_cover(
+                    self.width, card_h, _THEMES["dark"], accent_rgb, 0
+                )
+            card.alpha_composite(bg_img, (0, 0))
+        except Exception:
+            card.alpha_composite(
+                self._fallback_cover(self.width, card_h, _THEMES["dark"], accent_rgb, 0),
+                (0, 0),
+            )
+
+        # 海报的层次由遮罩、几何色块和排版共同完成。
+        card.alpha_composite(Image.new("RGBA", (self.width, card_h), (ink[0], ink[1], ink[2], 76)))
+        card.alpha_composite(
+            self._scrim(self.width, card_h, start=0.26, max_alpha=215, power=1.35),
+            (0, 0),
+        )
+        poster_overlay = Image.new("RGBA", (self.width, card_h), (0, 0, 0, 0))
+        poster_draw = ImageDraw.Draw(poster_overlay)
+        poster_draw.polygon(
+            ((0, 0), (round(self.width * 0.38), 0), (round(self.width * 0.22), card_h), (0, card_h)),
+            fill=(*accent_rgb, 34),
+        )
+        poster_draw.text(
+            (self.width - 178, 96),
+            "01",
+            font=self._font(156, bold=True),
+            fill=(255, 255, 255, 24),
+            stroke_width=self._bold_stroke(True),
+            stroke_fill=(255, 255, 255, 24),
+        )
+        card.alpha_composite(poster_overlay)
+        draw = ImageDraw.Draw(card)
+        draw.rectangle((0, 0, self.width, 10), fill=(*accent_rgb, 240))
+        draw.rectangle((pad, 78, pad + 88, 84), fill=(*accent_rgb, 255))
+
+        # 顶部档案标识。
+        self._draw_text(draw, (pad, 28), "NOVA ARCHIVE / 01", 16, white, bold=True)
+        top_meta = f"{d['platform_text']}  ·  {d['content_type']}"
+        top_font = self._font(16, bold=True)
+        top_w = self._text_width(top_meta, top_font)
+        self._draw_text(draw, (self.width - pad - top_w, 28), top_meta, 16, white, bold=True)
+        if d["ts"]:
+            self._draw_text(draw, (pad, 98), d["ts"], 14, muted, bold=True)
+
+        band_y = card_h - bottom_band_h
+        content_bottom = band_y - 28
+        desc_y = content_bottom - desc_h
+        author_y = desc_y - (18 if desc_lines else 0) - author_h
+        title_y = max(180, author_y - 24 - title_h)
+        # 轻微阴影保证标题在明亮封面上仍清晰。
+        for idx, line in enumerate(title_lines):
+            ly = title_y + idx * (title_size + 10)
+            self._draw_text(draw, (pad + 2, ly + 3), line, title_size, (0, 0, 0), bold=True)
+            self._draw_text(draw, (pad, ly), line, title_size, white, bold=True)
+
+        if d["author"]:
+            avatar_size = 42
+            avatar_path = images.get("avatar")
+            avatar = None
+            if avatar_path:
+                try:
+                    avatar = self._circle_avatar(self._open_image(avatar_path), avatar_size)
+                except Exception:
+                    avatar = None
+            if avatar is not None:
+                card.alpha_composite(avatar, (pad, author_y))
+            else:
+                draw.ellipse((pad, author_y, pad + avatar_size, author_y + avatar_size), fill=accent_rgb)
+                first = (d["name"][:1] or "?").upper()
+                self._draw_text(draw, (pad + 12, author_y + 8), first, 22, white, bold=True)
+            draw = ImageDraw.Draw(card)
+            name_font = self._font(22, bold=True)
+            name_text = self._ellipsize(d["name"], name_font, inner_w - 56)
+            self._draw_text(draw, (pad + 56, author_y + 2), name_text, 22, white, bold=True)
+            if d["author_desc"]:
+                desc_font = self._font(14)
+                author_desc = self._ellipsize(
+                    d["author_desc"], desc_font, inner_w - 56
+                )
+                self._draw_text(draw, (pad + 56, author_y + 27), author_desc, 14, muted)
+
+        if desc_lines:
+            for line in desc_lines:
+                self._draw_text(draw, (pad, desc_y), line, 21, muted)
+                desc_y += 31
+
+        if d["is_video_hero"] and self.show_play_button:
+            cx = self.width // 2
+            cy = max(150, min(280, title_y - 76))
+            draw.ellipse((cx - 42, cy - 42, cx + 42, cy + 42), outline=white, width=2)
+            draw.polygon(((cx - 10, cy - 19), (cx - 10, cy + 19), (cx + 22, cy)), fill=white)
+
+        # 底部色块信息带，独立承担 URL、统计和水印。
+        draw.rectangle((0, band_y, self.width, card_h), fill=ink)
+        draw.rectangle((0, band_y, 14, card_h), fill=(*accent_rgb, 255))
+        self._draw_text(draw, (pad, band_y + 18), "MEDIA / INDEX", 13, (*accent_rgb, 255), bold=True)
+        if d["stats"]:
+            stats_text = "  ·  ".join(f"{label} {value}" for label, value in d["stats"][:4])
+            stats_text = self._fit_lines(stats_text, self._font(16), inner_w, 1)[0]
+            self._draw_text(draw, (pad, band_y + 42), stats_text, 16, white, bold=True)
+        url_text = card_footer_url(result)
+        if url_text:
+            url_font = self._font(14)
+            max_url_w = max(80, inner_w - 180)
+            url_text = self._ellipsize(url_text, url_font, max_url_w)
+            self._draw_text(draw, (pad, band_y + 78), url_text, 14, muted)
+        wm_font = self._font(17, bold=True)
+        wm_w = self._text_width(self.watermark, wm_font)
+        self._draw_text(draw, (self.width - pad - wm_w, band_y + 82), self.watermark, 17, white, bold=True)
+
+        if d["grid"]:
+            thumb_size = 48
+            start_x = self.width - pad - wm_w - 18 - thumb_size * min(3, len(d["grid"])) - 8 * (min(3, len(d["grid"])) - 1)
+            for idx, path in enumerate(d["grid"][:3]):
+                tx = start_x + idx * (thumb_size + 8)
+                try:
+                    thumb = self._cover_fit(self._open_image(path), thumb_size, thumb_size).convert("RGBA")
+                    card.alpha_composite(thumb, (tx, band_y + 18))
+                except Exception:
+                    draw.rectangle((tx, band_y + 18, tx + thumb_size, band_y + 18 + thumb_size), outline=muted, width=1)
+                draw = ImageDraw.Draw(card)
+                draw.rectangle((tx, band_y + 18, tx + thumb_size - 1, band_y + 18 + thumb_size - 1), outline=muted, width=1)
+
+        if d["warnings"]:
+            warning_text = self._fit_lines(strip_emoji(d["warnings"][0]), self._font(13), inner_w - 20, 1)[0]
+            self._draw_text(draw, (pad, band_y - 24), warning_text, 13, (255, 213, 103), bold=True)
+
+        mask = Image.new("L", (self.width, card_h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, self.width - 1, card_h - 1), radius=18, fill=255
+        )
+        card.putalpha(mask)
+        canvas.alpha_composite(card, (0, 0))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(out_path, "PNG", optimize=True)
+        return out_path
 
     def _render_standard(
         self,
@@ -990,13 +1644,10 @@ class ShareCardRenderer:
         title_font = self._font(_L.F_TITLE, bold=True)
         title = strip_emoji(result.title)
         title_lines: list[str] = []
-        title_size = _L.F_TITLE
         if title:
             title_lines = self._fit_lines(
                 title, title_font, inner_w, 2 if hero else 3
             )
-        title_lh = _L.F_TITLE_LINE_H
-        title_block_h = len(title_lines) * title_lh if title_lines else 0
 
         # 简介
         desc_font = self._font(_L.F_DESC)
@@ -1387,7 +2038,7 @@ class ShareCardRenderer:
             )
             y += quote_h + 20
 
-        # ============ 页脚（链接 + 「Nova解析」徽标水印） ============
+        # ============ 页脚（链接 + 可配置署名） ============
         divider_layer = Image.new("RGBA", (inner_w, 1), (0, 0, 0, 0))
         ImageDraw.Draw(divider_layer).line(
             (0, 0, inner_w - 1, 0),
@@ -1397,7 +2048,7 @@ class ShareCardRenderer:
         canvas.alpha_composite(divider_layer, (pad, y + 12))
         foot_y = y + 28
 
-        wm_text = WATERMARK_TAG
+        wm_text = self.watermark
         wm_font = self._font(_L.F_FOOT, bold=True)
         wm_text_w = self._text_width(wm_text, wm_font)
         wm_lh = self._line_height(wm_font)
@@ -1805,7 +2456,7 @@ class ShareCardRenderer:
     def _footer_block(self, canvas, draw, theme: _Theme, accent: str, accent_rgb,
                       result: ParseResult, y: int, inner_w: int,
                       on_image: bool = False) -> None:
-        """页脚：分隔线 + 左链接 + 右「圆点 Nova解析」水印。"""
+        """页脚：分隔线 + 左链接 + 右侧可配置署名。"""
         pad = _L.PAD
         divider_layer = Image.new("RGBA", (inner_w, 1), (0, 0, 0, 0))
         ImageDraw.Draw(divider_layer).line(
@@ -1817,7 +2468,7 @@ class ShareCardRenderer:
         canvas.alpha_composite(divider_layer, (pad, y + 12))
         foot_y = y + 28
         wm_font = self._font(_L.F_FOOT, bold=True)
-        wm_text_w = self._text_width(WATERMARK_TAG, wm_font)
+        wm_text_w = self._text_width(self.watermark, wm_font)
         wm_group_w = _L.WM_DOT + _L.WM_DOT_GAP + wm_text_w
         wm_x = self.width - pad - wm_group_w
         wm_lh = self._line_height(wm_font)
@@ -1827,7 +2478,7 @@ class ShareCardRenderer:
             fill=(*accent_rgb, 255),
         )
         self._draw_text(draw, (wm_x + _L.WM_DOT + _L.WM_DOT_GAP, foot_y),
-                        WATERMARK_TAG, _L.F_FOOT, accent, bold=True)
+                        self.watermark, _L.F_FOOT, accent, bold=True)
         url_text = card_footer_url(result)
         if url_text:
             url_font = self._font(_L.F_FOOT)
@@ -2043,7 +2694,6 @@ class ShareCardRenderer:
         d = self._prep(result, images)
 
         title_font = self._font(_L.F_TITLE, bold=True)
-        title_size = _L.F_TITLE
         if d["title"]:
             title_lines = self._fit_lines(d["title"], title_font, inner_w, 2)
         else:
@@ -2074,7 +2724,6 @@ class ShareCardRenderer:
             stack += warnings_h + 16
         stack += _L.FOOTER_H
         card_h = hero_h + stack
-        total_h = card_h + 14
 
         canvas, draw = self._base_canvas(theme, accent_rgb, card_h)
 

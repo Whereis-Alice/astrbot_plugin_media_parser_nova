@@ -19,9 +19,11 @@ async def render_card_rika(
     custom_font: str = "",
     theme: str = "dark",
     layout: str = "standard",
+    skin: str = "nova",
     width: int = 800,
     cover_full_size: bool = False,
     show_play_button: bool = False,
+    watermark: str = "Nova解析",
     cache_key: Optional[str] = None,
 ) -> Optional[Path]:
     """用 rika 渲染器渲染卡片，成功返回 PNG 路径，失败返回 None。"""
@@ -43,9 +45,11 @@ async def render_card_rika(
             width=width,
             theme=theme,
             layout=layout,
+            skin=skin,
             font_path=font_path,
             cover_full_size=cover_full_size,
             show_play_button=show_play_button,
+            watermark=watermark,
         )
         url_key = str(metadata.get("url") or "")
         parts = [url_key]

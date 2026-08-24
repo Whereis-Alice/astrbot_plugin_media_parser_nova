@@ -151,7 +151,8 @@
                 },
                 "default": [
                     "视频解析",
-                    "解析视频"
+                    "解析视频",
+                    "媒体解析"
                 ]
             }
         }
@@ -266,7 +267,7 @@
                     "enable": {
                         "description": "启用卡片渲染",
                         "type": "bool",
-                        "hint": "依赖 pillow 与 emoji 库；渲染失败自动回退纯文本",
+                        "hint": "依赖 Pillow；渲染失败自动回退纯文本",
                         "default": false
                     },
                     "mode": {
@@ -308,6 +309,18 @@
                         "hint": "标准 = 顶部全宽横幅；杂志 = 左封面右信息；沉浸式 = 全幅背景；信息流 = 紧凑列表",
                         "default": "标准"
                     },
+                    "skin": {
+                        "description": "高级皮肤",
+                        "type": "string",
+                        "options": [
+                            "Nova 原生",
+                            "编辑室",
+                            "信号终端",
+                            "海报档案"
+                        ],
+                        "hint": "每套皮肤都有独立的画布结构、信息编排和页脚；高级皮肤不只是替换颜色。选择高级皮肤后，主题和布局主要对 Nova 原生皮肤生效。",
+                        "default": "Nova 原生"
+                    },
                     "width": {
                         "description": "卡片宽度",
                         "type": "int",
@@ -325,6 +338,12 @@
                         "type": "bool",
                         "hint": "开启后在视频封面中央显示播放按钮",
                         "default": false
+                    },
+                    "watermark": {
+                        "description": "卡片右下角署名",
+                        "type": "string",
+                        "hint": "留空使用 Nova解析；最多 32 个字符。",
+                        "default": "Nova解析"
                     }
                 }
             },
@@ -470,6 +489,19 @@
                 ],
                 "hint": "仅正文只翻译简介/正文；正文和标题会同时翻译标题和简介/正文；热评不翻译。仅启用翻译后生效。",
                 "default": "正文和标题"
+            },
+            "output_mode": {
+                "description": "翻译输出位置",
+                "type": "string",
+                "condition": {
+                    "enable": true
+                },
+                "options": [
+                    "仅作用于卡片",
+                    "卡片和文本都发送"
+                ],
+                "hint": "仅作用于卡片：译文只写入卡片，普通文本仍保留原文；卡片和文本都发送：卡片显示译文，并额外发送独立译文文本。启用卡片渲染后，前者才有可见卡片效果。",
+                "default": "卡片和文本都发送"
             },
             "target_language": {
                 "description": "目标语言",

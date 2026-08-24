@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import math
@@ -43,6 +44,26 @@ OBVIOUS_SIMPLIFIED_CHARS = set(
 SIMPLIFIED_CHINESE = "简体中文"
 TRADITIONAL_CHINESE = "繁体中文"
 CONTENT_SCOPE_BODY_AND_TITLE = "正文和标题"
+
+
+def build_card_metadata_list(
+    metadata_list: List[Dict[str, Any]],
+    translated_metadata_list: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """复制下载后的 metadata，并把翻译字段合并到卡片专用副本。"""
+    card_metadata_list = copy.deepcopy(metadata_list)
+    for index, card_metadata in enumerate(card_metadata_list):
+        if index >= len(translated_metadata_list):
+            continue
+        translated_metadata = translated_metadata_list[index]
+        translated_fields = translated_metadata.get("_translated_fields")
+        if not isinstance(translated_fields, dict):
+            continue
+        for field in ("title", "desc"):
+            translated = str(translated_fields.get(field) or "").strip()
+            if translated:
+                card_metadata[field] = translated
+    return card_metadata_list
 
 
 class MetadataTranslator:

@@ -64,9 +64,14 @@ astrbot_plugin_media_parser_nova/
     │   ├── sender.py                # 聚合/独立/文件发送
     │   └── archive_builder.py       # 解析结果 ZIP 归档
     ├── translation/
-    │   ├── manager.py               # 元数据翻译与严格 JSON 结果回填
+    │   ├── manager.py               # 元数据翻译、严格 JSON 回填与卡片副本合并
     │   ├── llm_client.py            # 自定义 OpenAI 兼容 / Ollama 调用
     │   └── provider_defs.py         # 翻译相关厂商标签与默认值
+    ├── render/__init__.py            # 卡片渲染统一入口
+    ├── rika_render/
+    │   ├── adapter.py               # MediaMetadata -> ParseResult 适配
+    │   ├── render.py                # Nova 原生布局与独立高级皮肤
+    │   └── assets/fallback_nova.png # 原创无文字兜底封面
     ├── storage/
     │   ├── __init__.py              # 导出清理、标记、文件 Token 注册能力
     │   ├── file_cleaner.py          # 文件与空父目录清理
@@ -351,7 +356,11 @@ ZIP 命令?
   │        -> send_zip_result() -> 源媒体立即清理，ZIP 至少延迟 300 秒清理
   └─ 否 -> media_relay.enable 时 register_files_with_token_service()
            ↓
-         build_all_nodes() + 等待翻译
+         等待翻译 -> build_card_metadata_list()
+           ↓
+         render_cards() -> send_rendered_cards()
+           ↓
+         build_all_nodes()
            ↓
          summarize_node_counts()
            ↓
@@ -360,7 +369,9 @@ ZIP 命令?
            └─ 独立 -> send_individual_results()
                         └─ 可按 message.text_metadata.quote_user_message 引用用户消息
            ↓
-         send_translation_results()
+         translation.output_mode=卡片和文本都发送?
+           ├─ 是 -> send_translation_results()
+           └─ 否 -> 译文只保留在卡片副本
   ↓
 finally 清理本次 temp_files + video_files
   ├─ relay 开启 -> 延迟 media_relay.ttl 秒
@@ -448,7 +459,10 @@ MessageSender
   └─ 独立发送 -> send_individual_results()
   ↓
 translation_task 完成后
-  └─ build_translation_nodes_for_all() -> send_translation_results()
+  ├─ build_card_metadata_list() -> 卡片标题/正文使用译文
+  ├─ 原 metadata 保持原文，继续构建普通文本和媒体节点
+  └─ output_mode=卡片和文本都发送时
+       build_translation_nodes_for_all() -> send_translation_results()
 ```
 
 ### 3.5 清理与终止链
@@ -494,6 +508,7 @@ can_access_full_video/is_preview_only/access_message
 timelength_ms/available_length_ms
 hot_comments
 translation_target_language/_translated_fields
+_card_file_path/_card_include_text/_card_drop_text
 use_image_proxy/use_video_proxy/proxy_url
 error
 ```

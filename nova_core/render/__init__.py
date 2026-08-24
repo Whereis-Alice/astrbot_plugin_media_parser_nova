@@ -17,9 +17,11 @@ async def render_card(
     custom_font: str = "",
     theme: str = "dark",
     layout: str = "standard",
+    skin: str = "nova",
     width: int = 800,
     cover_full_size: bool = False,
     show_play_button: bool = False,
+    watermark: str = "Nova解析",
 ) -> Optional[Path]:
     """渲染卡片并保存到 save_dir，成功返回文件路径，失败返回 None。
 
@@ -34,9 +36,11 @@ async def render_card(
             custom_font=custom_font,
             theme=theme,
             layout=layout,
+            skin=skin,
             width=width,
             cover_full_size=cover_full_size,
             show_play_button=show_play_button,
+            watermark=watermark,
         )
     except Exception as e:
         logger.warning(

@@ -35,8 +35,11 @@ from .nova_core.message_adapter.archive_builder import (
     cleanup_expired_zip_workspaces,
     cleanup_zip_archive,
 )
-from .nova_core.translation import MetadataTranslator
-from .nova_core.config_manager import ConfigManager
+from .nova_core.translation import MetadataTranslator, build_card_metadata_list
+from .nova_core.config_manager import (
+    ConfigManager,
+    TRANSLATION_OUTPUT_CARD_AND_TEXT,
+)
 from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistManager
 
 
@@ -44,7 +47,7 @@ from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistMa
     "astrbot_plugin_media_parser_nova",
     "Nova Media Parser contributors",
     "Nova 流媒体解析 - 聚合解析流媒体平台链接，转换为媒体直链发送",
-    "1.0.0",
+    "1.1.0",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -420,11 +423,17 @@ class MediaParserNovaPlugin(Star):
                     files.append(path_text)
         return files
 
-    async def _render_cards(self, metadata_list) -> None:
-        """按配置将文本元数据渲染为卡片图片，失败时保留原文本输出。"""
+    async def _render_cards(
+        self,
+        metadata_list,
+        card_metadata_list=None,
+    ) -> None:
+        """按配置渲染卡片；卡片副本可携带翻译字段，原元数据保持不变。"""
         card_cfg = self.config_manager.message.card_render
         if not card_cfg.enabled or not card_cfg.save_dir:
             return
+
+        render_list = card_metadata_list or metadata_list
 
         try:
             from .nova_core.render import render_card
@@ -432,7 +441,7 @@ class MediaParserNovaPlugin(Star):
             self.logger.warning(f"卡片渲染模块不可用，已回退纯文本: {e}")
             return
 
-        async def render_one(metadata: Dict[str, Any]) -> None:
+        async def render_one(index: int, metadata: Dict[str, Any]) -> None:
             if (
                 metadata.get('error') or
                 not metadata.get("_enable_text_metadata", True)
@@ -444,18 +453,22 @@ class MediaParserNovaPlugin(Star):
                 custom_font=card_cfg.custom_font,
                 theme=card_cfg.theme,
                 layout=card_cfg.layout,
+                skin=card_cfg.skin,
                 width=card_cfg.width,
                 cover_full_size=card_cfg.cover_full_size,
                 show_play_button=card_cfg.show_play_button,
+                watermark=card_cfg.watermark,
             )
             if path:
-                metadata["_card_file_path"] = str(path)
-                metadata["_card_include_text"] = card_cfg.include_text_in_card()
-                metadata["_card_drop_text"] = card_cfg.drop_text()
+                # 发送器和节点构建器继续读取下载后的原 metadata。
+                target = metadata_list[index]
+                target["_card_file_path"] = str(path)
+                target["_card_include_text"] = card_cfg.include_text_in_card()
+                target["_card_drop_text"] = card_cfg.drop_text()
 
         tasks = [
-            asyncio.create_task(render_one(metadata))
-            for metadata in metadata_list
+            asyncio.create_task(render_one(index, metadata))
+            for index, metadata in enumerate(render_list)
         ]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -589,9 +602,22 @@ class MediaParserNovaPlugin(Star):
                     for metadata in processed_metadata_list
                 )
 
+            # 翻译必须先完成，再把译文合并到卡片专用副本；原文本节点保持原文。
+            translation_nodes = await self._build_translation_nodes_after_task(
+                translation_task,
+                translation_metadata_list,
+            )
+            card_metadata_list = build_card_metadata_list(
+                processed_metadata_list,
+                translation_metadata_list,
+            )
+
             # --- 卡片渲染 -------------------------------------------------
 
-            await self._render_cards(processed_metadata_list)
+            await self._render_cards(
+                processed_metadata_list,
+                card_metadata_list=card_metadata_list,
+            )
             card_files = await self.message_sender.send_rendered_cards(
                 event,
                 processed_metadata_list,
@@ -613,10 +639,8 @@ class MediaParserNovaPlugin(Star):
                 )
                 return
 
-            translation_nodes = await self._build_translation_nodes_after_task(
-                translation_task,
-                translation_metadata_list,
-            )
+            if cfg.translation.output_mode != TRANSLATION_OUTPUT_CARD_AND_TEXT:
+                translation_nodes = []
             aggregatable_nodes = [
                 meta["link_nodes"]
                 for meta in build_result.link_metadata

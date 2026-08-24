@@ -99,6 +99,24 @@ TRANSLATION_CONTENT_SCOPES = {
     "仅正文",
     "正文和标题",
 }
+TRANSLATION_OUTPUT_CARD_ONLY = "仅作用于卡片"
+TRANSLATION_OUTPUT_CARD_AND_TEXT = "卡片和文本都发送"
+TRANSLATION_OUTPUT_MODES = {
+    TRANSLATION_OUTPUT_CARD_ONLY,
+    TRANSLATION_OUTPUT_CARD_AND_TEXT,
+}
+DEFAULT_CARD_WATERMARK = "Nova解析"
+
+CARD_SKIN_NOVA = "nova"
+CARD_SKIN_EDITORIAL = "editorial"
+CARD_SKIN_SIGNAL = "signal"
+CARD_SKIN_POSTER = "poster"
+CARD_SKINS = {
+    CARD_SKIN_NOVA,
+    CARD_SKIN_EDITORIAL,
+    CARD_SKIN_SIGNAL,
+    CARD_SKIN_POSTER,
+}
 
 
 def _is_docker_environment() -> bool:
@@ -144,7 +162,9 @@ def _get_astrbot_plugin_cache_dir() -> str:
 @dataclass
 class TriggerConfig:
     auto_parse: bool = True
-    keywords: List[str] = field(default_factory=lambda: ["视频解析", "解析视频"])
+    keywords: List[str] = field(
+        default_factory=lambda: ["视频解析", "解析视频", "媒体解析"]
+    )
     reply_trigger: bool = False
 
     def has_keyword(self, text: str) -> bool:
@@ -290,9 +310,11 @@ class CardRenderConfig:
     save_dir: str = ""
     theme: str = "dark"
     layout: str = "standard"
+    skin: str = CARD_SKIN_NOVA
     width: int = 800
     cover_full_size: bool = False
     show_play_button: bool = False
+    watermark: str = DEFAULT_CARD_WATERMARK
 
     def include_text_in_card(self) -> bool:
         """文本是否并入卡片图所在的那条消息。"""
@@ -442,6 +464,7 @@ class MediaRelayConfig:
 class TranslationConfig:
     enabled: bool = False
     content_scope: str = "正文和标题"
+    output_mode: str = TRANSLATION_OUTPUT_CARD_AND_TEXT
     target_language: str = "简体中文"
     llm_provider_source: str = "astrbot"
     astrbot_provider_id: str = ""
@@ -504,7 +527,7 @@ class ConfigManager:
                 "trigger.auto_parse",
             ),
             keywords=self._normalize_string_list(
-                trigger_raw.get("keywords", ["视频解析", "解析视频"])
+                trigger_raw.get("keywords", ["视频解析", "解析视频", "媒体解析"])
             ),
             reply_trigger=self._parse_bool(
                 trigger_raw.get("reply_trigger", False),
@@ -674,6 +697,9 @@ class ConfigManager:
                 layout=self._parse_card_layout(
                     card_render.get("layout", "standard")
                 ),
+                skin=self._parse_card_skin(
+                    card_render.get("skin", CARD_SKIN_NOVA)
+                ),
                 width=self._parse_card_width(
                     card_render.get("width", 800)
                 ),
@@ -682,6 +708,9 @@ class ConfigManager:
                 ),
                 show_play_button=bool(
                     card_render.get("show_play_button", False)
+                ),
+                watermark=self._parse_card_watermark(
+                    card_render.get("watermark", DEFAULT_CARD_WATERMARK)
                 ),
             ),
         )
@@ -826,6 +855,11 @@ class ConfigManager:
             ),
             content_scope=self._parse_translation_content_scope(
                 translation_raw.get("content_scope", "正文和标题")
+            ),
+            output_mode=self._parse_translation_output_mode(
+                translation_raw.get(
+                    "output_mode", TRANSLATION_OUTPUT_CARD_AND_TEXT
+                )
             ),
             target_language=self._parse_translation_target_language(
                 translation_raw.get("target_language", "简体中文")
@@ -1185,6 +1219,19 @@ class ConfigManager:
         return "standard"
 
     @staticmethod
+    def _parse_card_skin(value) -> str:
+        skin = str(value or "").strip().lower()
+        if skin in ("editorial", "编辑室", "编辑", "杂志高级"):
+            return CARD_SKIN_EDITORIAL
+        if skin in ("signal", "信号终端", "终端", "数据终端"):
+            return CARD_SKIN_SIGNAL
+        if skin in ("poster", "海报档案", "海报", "档案海报"):
+            return CARD_SKIN_POSTER
+        if skin in ("nova", "nova 原生", "原生", "基础"):
+            return CARD_SKIN_NOVA
+        return CARD_SKIN_NOVA
+
+    @staticmethod
     def _parse_translation_target_language(value) -> str:
         language = str(value or "").strip()
         if language in TRANSLATION_TARGET_LANGUAGES:
@@ -1197,6 +1244,20 @@ class ConfigManager:
         if scope in TRANSLATION_CONTENT_SCOPES:
             return scope
         return "正文和标题"
+
+    @staticmethod
+    def _parse_translation_output_mode(value) -> str:
+        mode = str(value or "").strip()
+        if mode in TRANSLATION_OUTPUT_MODES:
+            return mode
+        return TRANSLATION_OUTPUT_CARD_AND_TEXT
+
+    @staticmethod
+    def _parse_card_watermark(value) -> str:
+        watermark = str(value or "").strip()
+        if not watermark:
+            return DEFAULT_CARD_WATERMARK
+        return watermark[:32]
 
     @staticmethod
     def _parse_positive_int(value, default: int) -> int:
