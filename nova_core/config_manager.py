@@ -117,11 +117,15 @@ CARD_SKIN_NOVA = "nova"
 CARD_SKIN_EDITORIAL = "editorial"
 CARD_SKIN_SIGNAL = "signal"
 CARD_SKIN_POSTER = "poster"
+CARD_SKIN_NEON = "neon"
+CARD_SKIN_BILIBILI = "bilibili"
 CARD_SKINS = {
     CARD_SKIN_NOVA,
     CARD_SKIN_EDITORIAL,
     CARD_SKIN_SIGNAL,
     CARD_SKIN_POSTER,
+    CARD_SKIN_NEON,
+    CARD_SKIN_BILIBILI,
 }
 
 
@@ -1272,6 +1276,16 @@ class ConfigManager:
             return CARD_SKIN_SIGNAL
         if skin in ("poster", "海报档案", "海报", "档案海报"):
             return CARD_SKIN_POSTER
+        if skin in ("neon", "霓虹", "霓虹夜景", "霓虹风格"):
+            return CARD_SKIN_NEON
+        if skin in (
+            "bilibili",
+            "哔哩哔哩",
+            "哔哩哔哩风格",
+            "b站风格",
+            "b站卡片",
+        ):
+            return CARD_SKIN_BILIBILI
         if skin in ("nova", "nova 原生", "原生", "基础"):
             return CARD_SKIN_NOVA
         return CARD_SKIN_NOVA

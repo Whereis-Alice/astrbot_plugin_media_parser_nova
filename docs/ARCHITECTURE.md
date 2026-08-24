@@ -70,7 +70,7 @@ astrbot_plugin_media_parser_nova/
     ├── render/__init__.py            # 卡片渲染统一入口
     ├── rika_render/
     │   ├── adapter.py               # MediaMetadata -> ParseResult 适配
-    │   ├── render.py                # Nova 原生布局与独立高级皮肤
+    │   ├── render.py                # Nova 原生布局与五套独立高级皮肤
     │   └── assets/fallback_nova.png # 原创无文字兜底封面
     ├── storage/
     │   ├── __init__.py              # 导出清理、标记、文件 Token 注册能力

@@ -2,7 +2,9 @@ import unittest
 from types import SimpleNamespace
 
 from nova_core.config_manager import (
+    CARD_SKIN_BILIBILI,
     CARD_SKIN_EDITORIAL,
+    CARD_SKIN_NEON,
     CARD_SKIN_NOVA,
     CARD_SKIN_POSTER,
     CARD_SKIN_SIGNAL,
@@ -33,6 +35,11 @@ class ConfigAndTranslationTests(unittest.TestCase):
         self.assertEqual(config.message.card_render.watermark, "Alice解析")
         self.assertEqual(ConfigManager._parse_card_skin("编辑室"), CARD_SKIN_EDITORIAL)
         self.assertEqual(ConfigManager._parse_card_skin("海报档案"), CARD_SKIN_POSTER)
+        self.assertEqual(ConfigManager._parse_card_skin("霓虹夜景"), CARD_SKIN_NEON)
+        self.assertEqual(
+            ConfigManager._parse_card_skin("哔哩哔哩风格"),
+            CARD_SKIN_BILIBILI,
+        )
         self.assertEqual(ConfigManager._parse_card_skin("未知皮肤"), CARD_SKIN_NOVA)
 
     def test_card_and_platform_hot_comment_options_are_parsed(self):
