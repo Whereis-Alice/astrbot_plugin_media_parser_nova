@@ -3,51 +3,48 @@ import copy
 from typing import Any, Dict, Optional
 
 import aiohttp
-
-from .nova_core.logger import logger
-
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Reply
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
-from .nova_core.parser import ParserManager
-from .nova_core.parser.utils import extract_url_from_card_data
-from .nova_core.downloader import DownloadManager, create_public_only_connector
-from .nova_core.storage import (
-    cleanup_expired_marked_in,
-    cleanup_files,
-    cleanup_marked_in,
-    mark_files_expire_after,
-    ParseRecordManager,
-    register_files_with_token_service,
+from .nova_core.config_manager import (
+    TRANSLATION_APPLY_CARD_AND_TEXT,
+    ConfigManager,
 )
 from .nova_core.constants import Config
-from .nova_core.message_adapter.sender import MessageDeliveryError, MessageSender
-from .nova_core.message_adapter.node_builder import (
-    build_all_nodes,
-    build_translation_nodes_for_all,
-    summarize_node_counts,
-)
+from .nova_core.downloader import DownloadManager, create_public_only_connector
+from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistManager
+from .nova_core.logger import logger
 from .nova_core.message_adapter.archive_builder import (
     ArchiveSizeLimitError,
     build_zip_archive,
     cleanup_expired_zip_workspaces,
     cleanup_zip_archive,
 )
-from .nova_core.translation import MetadataTranslator, build_card_metadata_list
-from .nova_core.config_manager import (
-    ConfigManager,
-    TRANSLATION_OUTPUT_CARD_AND_TEXT,
+from .nova_core.message_adapter.node_builder import (
+    build_all_nodes,
+    summarize_node_counts,
 )
-from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistManager
+from .nova_core.message_adapter.sender import MessageSender
+from .nova_core.parser import ParserManager
+from .nova_core.parser.utils import extract_url_from_card_data
+from .nova_core.storage import (
+    ParseRecordManager,
+    cleanup_expired_marked_in,
+    cleanup_files,
+    cleanup_marked_in,
+    mark_files_expire_after,
+    register_files_with_token_service,
+)
+from .nova_core.translation import MetadataTranslator, build_card_metadata_list
 
 
 @register(
     "astrbot_plugin_media_parser_nova",
-    "Nova Media Parser contributors",
-    "Nova 流媒体解析 - 聚合解析流媒体平台链接，转换为媒体直链发送",
-    "1.1.0",
+    "Whereis-Alice",
+    "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
+    "1.2.0",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -368,21 +365,20 @@ class MediaParserNovaPlugin(Star):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    async def _build_translation_nodes_after_task(
+    async def _wait_for_translation(
         self,
         task,
-        translation_metadata_list,
-    ):
+    ) -> bool:
         if task is None:
-            return []
+            return False
         try:
             await task
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self.logger.warning(f"等待翻译任务失败，跳过翻译节点: {e}")
-            return []
-        return build_translation_nodes_for_all(translation_metadata_list)
+            self.logger.warning(f"等待翻译任务失败，使用原文继续输出: {e}")
+            return False
+        return True
 
     def _metadata_has_output_candidate(self, metadata: Dict[str, Any]) -> bool:
         """判断 metadata 在当前输出策略下是否可能构建出节点。"""
@@ -447,6 +443,9 @@ class MediaParserNovaPlugin(Star):
                 not metadata.get("_enable_text_metadata", True)
             ):
                 return
+            metadata["_card_include_hot_comments"] = (
+                card_cfg.include_hot_comments
+            )
             path = await render_card(
                 metadata,
                 save_dir=card_cfg.save_dir,
@@ -463,8 +462,10 @@ class MediaParserNovaPlugin(Star):
                 # 发送器和节点构建器继续读取下载后的原 metadata。
                 target = metadata_list[index]
                 target["_card_file_path"] = str(path)
-                target["_card_include_text"] = card_cfg.include_text_in_card()
-                target["_card_drop_text"] = card_cfg.drop_text()
+                target["_card_mode"] = card_cfg.mode
+                target["_card_include_hot_comments"] = (
+                    card_cfg.include_hot_comments
+                )
 
         tasks = [
             asyncio.create_task(render_one(index, metadata))
@@ -556,10 +557,7 @@ class MediaParserNovaPlugin(Star):
                 self.logger.debug("富媒体输出已关闭，跳过下载阶段")
 
             if zip_requested:
-                await self._build_translation_nodes_after_task(
-                    translation_task,
-                    translation_metadata_list,
-                )
+                await self._wait_for_translation(translation_task)
                 archive_task = asyncio.create_task(
                     asyncio.to_thread(
                         build_zip_archive,
@@ -602,14 +600,11 @@ class MediaParserNovaPlugin(Star):
                     for metadata in processed_metadata_list
                 )
 
-            # 翻译必须先完成，再把译文合并到卡片专用副本；原文本节点保持原文。
-            translation_nodes = await self._build_translation_nodes_after_task(
-                translation_task,
-                translation_metadata_list,
-            )
+            # 翻译先与下载并行，发送前再按应用范围生成展示副本。
+            translation_ready = await self._wait_for_translation(translation_task)
             card_metadata_list = build_card_metadata_list(
                 processed_metadata_list,
-                translation_metadata_list,
+                translation_metadata_list if translation_ready else [],
             )
 
             # --- 卡片渲染 -------------------------------------------------
@@ -618,13 +613,22 @@ class MediaParserNovaPlugin(Star):
                 processed_metadata_list,
                 card_metadata_list=card_metadata_list,
             )
-            card_files = await self.message_sender.send_rendered_cards(
-                event,
+            card_files = self.message_sender.collect_rendered_card_paths(
                 processed_metadata_list,
             )
 
+            output_metadata_list = processed_metadata_list
+            if (
+                translation_ready
+                and cfg.translation.apply_scope == TRANSLATION_APPLY_CARD_AND_TEXT
+            ):
+                output_metadata_list = build_card_metadata_list(
+                    processed_metadata_list,
+                    translation_metadata_list,
+                )
+
             build_result = build_all_nodes(
-                processed_metadata_list,
+                output_metadata_list,
                 cfg.download.large_video_threshold_mb,
                 cfg.download.max_video_size_mb,
                 True,
@@ -639,14 +643,11 @@ class MediaParserNovaPlugin(Star):
                 )
                 return
 
-            if cfg.translation.output_mode != TRANSLATION_OUTPUT_CARD_AND_TEXT:
-                translation_nodes = []
             aggregatable_nodes = [
                 meta["link_nodes"]
                 for meta in build_result.link_metadata
                 if meta.get("is_normal", True)
             ]
-            aggregatable_nodes.extend(translation_nodes)
             node_counts = summarize_node_counts(aggregatable_nodes)
             should_aggregate_nodes = cfg.message.aggregation.should_aggregate_nodes(
                 **node_counts
@@ -678,22 +679,6 @@ class MediaParserNovaPlugin(Star):
                     quote_message_id=quote_source_message_id,
                 )
 
-            try:
-                await self.message_sender.send_translation_results(
-                    event,
-                    translation_nodes,
-                    should_aggregate_nodes=should_aggregate_nodes,
-                    sender_name=sender_name,
-                    sender_id=sender_id,
-                )
-            except MessageDeliveryError as exc:
-                self.logger.warning(f"媒体已发送，但翻译结果发送失败: {exc}")
-                try:
-                    await event.send(
-                        event.plain_result("媒体解析结果已发送，但翻译结果发送失败。")
-                    )
-                except Exception as notify_error:
-                    self.logger.warning(f"发送翻译失败提示失败: {notify_error}")
             if cfg.admin.debug_mode:
                 self.logger.debug("发送完成")
         except ArchiveSizeLimitError as exc:

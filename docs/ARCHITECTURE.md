@@ -358,7 +358,11 @@ ZIP 命令?
            ↓
          等待翻译 -> build_card_metadata_list()
            ↓
-         render_cards() -> send_rendered_cards()
+         render_cards() -> 把卡片路径写回原 metadata
+           ↓
+         apply_scope=卡片和文本均使用译文?
+           ├─ 是 -> 使用译文展示副本构建普通文本
+           └─ 否 -> 使用原 metadata 构建普通文本
            ↓
          build_all_nodes()
            ↓
@@ -367,11 +371,9 @@ ZIP 命令?
          按 message.packing.mode 与条件阈值选择发送路径
            ├─ 聚合 -> send_aggregated_results()
            └─ 独立 -> send_individual_results()
-                        └─ 可按 message.text_metadata.quote_user_message 引用用户消息
+                         └─ 可按 message.text_metadata.quote_user_message 引用用户消息
            ↓
-         translation.output_mode=卡片和文本都发送?
-           ├─ 是 -> send_translation_results()
-           └─ 否 -> 译文只保留在卡片副本
+         MessageSender._delivery_chains() 按卡片模式统一组装最终消息链
   ↓
 finally 清理本次 temp_files + video_files
   ├─ relay 开启 -> 延迟 media_relay.ttl 秒
@@ -459,10 +461,14 @@ MessageSender
   └─ 独立发送 -> send_individual_results()
   ↓
 translation_task 完成后
-  ├─ build_card_metadata_list() -> 卡片标题/正文使用译文
-  ├─ 原 metadata 保持原文，继续构建普通文本和媒体节点
-  └─ output_mode=卡片和文本都发送时
-       build_translation_nodes_for_all() -> send_translation_results()
+  ├─ build_card_metadata_list() -> 卡片标题、正文和热评使用译文
+  ├─ apply_scope=仅卡片使用译文 -> 普通文本继续使用原 metadata
+  └─ apply_scope=卡片和文本均使用译文 -> 普通文本使用同一译文展示副本
+
+卡片模式由 MessageSender 统一执行：
+  ├─ 卡片+文本同条发送 -> [Image, Plain] 位于同一消息链
+  ├─ 卡片+文本分开发 -> 卡片和普通文本分别发送
+  └─ 仅卡片 -> 卡片与原始链接同链，省略其他普通文本
 ```
 
 ### 3.5 清理与终止链

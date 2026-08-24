@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,20 @@ PLATFORM_DISPLAY_NAMES: Dict[str, str] = {
     "xiaoheihe": "小黑盒",
     "youtube": "YouTube",
 }
+
+_AUTHOR_IDENTIFIER_RE = re.compile(
+    r"^(?P<name>.+?)\s*\((?P<identifier>@[^()]+|uid:[^()]+)\)$",
+    re.I,
+)
+
+
+def _split_author_label(value: str) -> tuple[str, Optional[str]]:
+    """把常见的“昵称(@id)”或“昵称(uid:id)”拆成两行展示。"""
+    text = str(value or "").strip()
+    match = _AUTHOR_IDENTIFIER_RE.match(text)
+    if not match:
+        return text, None
+    return match.group("name").strip(), match.group("identifier").strip()
 
 
 def _parse_timestamp(value: Any) -> Optional[int]:
@@ -133,6 +148,7 @@ def build_parse_result(
     author: Optional[Author] = None
     author_name = str(metadata.get("author") or "").strip()
     if author_name:
+        author_name, author_identifier = _split_author_label(author_name)
         avatar_task = _as_local_path_task(metadata.get("avatar_path"))
         if avatar_task is None:
             avatar_task = _as_download_path_task(
@@ -140,7 +156,11 @@ def build_parse_result(
                 save_path,
                 metadata,
             )
-        author = Author(name=author_name, avatar=avatar_task)
+        author = Author(
+            name=author_name,
+            avatar=avatar_task,
+            description=author_identifier,
+        )
 
     title = str(metadata.get("title") or "").strip() or None
     text = str(metadata.get("desc") or "").strip() or None
@@ -241,6 +261,30 @@ def build_parse_result(
     warnings = metadata.get("limit_warnings") or []
     if warnings:
         extra["limit_warnings"] = list(warnings)
+
+    if metadata.get("_card_include_hot_comments"):
+        hot_comments = metadata.get("hot_comments")
+        if isinstance(hot_comments, list):
+            normalized_comments = []
+            for item in hot_comments[:5]:
+                if not isinstance(item, dict):
+                    continue
+                message = str(item.get("message") or "").strip()
+                if not message:
+                    continue
+                normalized_comments.append(
+                    {
+                        "username": str(
+                            item.get("username") or "未知用户"
+                        ).strip(),
+                        "uid": str(item.get("uid") or "").strip(),
+                        "likes": item.get("likes", 0),
+                        "time": str(item.get("time") or "").strip(),
+                        "message": message,
+                    }
+                )
+            if normalized_comments:
+                extra["hot_comments"] = normalized_comments
 
     return ParseResult(
         platform=platform,

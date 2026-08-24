@@ -1,5 +1,5 @@
 """项目统一类型定义（TypedDict、别名与结构约束）。"""
-from typing import TypedDict, NamedTuple, List, Dict, Optional, Any
+from typing import Any, Dict, List, NamedTuple, Optional, TypedDict
 
 
 class MediaMetadata(TypedDict, total=False):
@@ -91,6 +91,10 @@ class LinkBuildMeta(TypedDict):
     video_files: List[str]
     temp_files: List[str]
     metadata_text_node: Optional[Any]
+    card_node: Optional[Any]
+    card_mode: str
+    display_text_nodes: List[Any]
+    media_nodes: List[Any]
 
 
 class BuildAllNodesResult(NamedTuple):

@@ -1,19 +1,19 @@
 """Twitter/X 解析器实现。"""
 
 import asyncio
+import html as html_lib
 import json
 import re
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
 
-from ...logger import logger
-
-from .base import BaseVideoParser
-from ..utils import build_request_headers
 from ...constants import Config
+from ...logger import logger
+from ..utils import build_request_headers
+from .base import BaseVideoParser
 
 
 class FxTwitterServiceUnavailableError(RuntimeError):
@@ -29,6 +29,17 @@ def json_dumps_compact(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+_LOGGED_OUT_COMMENT_RE = re.compile(
+    r'"@id":"https://x\.com/[^"/]+/status/(?P<id>\d+)",'
+    r'"@type":"Comment",author:\$R\[\d+\]=\{(?P<author>.*?)\},'
+    r'commentCount:\d+,datePublished:"(?P<date>(?:\\.|[^"\\])*)",'
+    r'identifier:"(?P=id)",interactionStatistic:(?P<stats>.*?)\],'
+    r'text:"(?P<text>(?:\\.|[^"\\])*)"\}',
+    re.S,
+)
+_JS_STRING_FIELD_TEMPLATE = r'{field}:"((?:\\.|[^"\\])*)"'
+
+
 class TwitterParser(BaseVideoParser):
     """Twitter/X 解析器实现。"""
 
@@ -38,6 +49,7 @@ class TwitterParser(BaseVideoParser):
         use_image_proxy: bool = False,
         use_video_proxy: bool = False,
         proxy_url: str = None,
+        hot_comment_count: int = 0,
     ):
         """初始化Twitter解析器
 
@@ -52,6 +64,10 @@ class TwitterParser(BaseVideoParser):
         self.use_image_proxy = use_image_proxy
         self.use_video_proxy = use_video_proxy
         self.proxy_url = proxy_url
+        try:
+            self.hot_comment_count = min(20, max(0, int(hot_comment_count)))
+        except (TypeError, ValueError):
+            self.hot_comment_count = 0
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         self.headers = {
             "User-Agent": (
@@ -62,6 +78,107 @@ class TwitterParser(BaseVideoParser):
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate",
         }
+
+    @staticmethod
+    def _decode_js_string(value: Any) -> str:
+        raw = str(value or "")
+        try:
+            decoded = json.loads(f'"{raw}"')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = raw.replace('\\"', '"').replace("\\\\", "\\")
+        return html_lib.unescape(str(decoded or "")).strip()
+
+    @classmethod
+    def _comment_author_field(cls, author_block: str, field: str) -> str:
+        pattern = _JS_STRING_FIELD_TEMPLATE.format(field=re.escape(field))
+        match = re.search(pattern, author_block)
+        return cls._decode_js_string(match.group(1)) if match else ""
+
+    @staticmethod
+    def _format_public_comment_time(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return text
+
+    @classmethod
+    def _parse_logged_out_comments_html(
+        cls,
+        html_text: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """解析 X 公开帖子页 JSON-LD 片段中的精选回复。"""
+        comments: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for match in _LOGGED_OUT_COMMENT_RE.finditer(str(html_text or "")):
+            comment_id = str(match.group("id") or "").strip()
+            if not comment_id or comment_id in seen_ids:
+                continue
+            seen_ids.add(comment_id)
+            author_block = match.group("author") or ""
+            screen_name = cls._comment_author_field(
+                author_block, "alternateName"
+            )
+            display_name = cls._comment_author_field(author_block, "name")
+            user_id = cls._comment_author_field(author_block, "identifier")
+            avatar_url = cls._comment_author_field(author_block, "image")
+            message = cls._decode_js_string(match.group("text"))
+            if not message:
+                continue
+            likes_match = re.search(
+                r'interactionType:"https://schema\.org/LikeAction".*?'
+                r'userInteractionCount:(\d+)',
+                match.group("stats") or "",
+                re.S,
+            )
+            likes = int(likes_match.group(1)) if likes_match else 0
+            username = display_name or screen_name or "未知用户"
+            if screen_name and screen_name.lower() != username.lower():
+                username = f"{username}(@{screen_name})"
+            comments.append(
+                {
+                    "username": username,
+                    "uid": user_id,
+                    "likes": likes,
+                    "time": cls._format_public_comment_time(
+                        cls._decode_js_string(match.group("date"))
+                    ),
+                    "message": message,
+                    "avatar_url": avatar_url,
+                    "comment_id": comment_id,
+                }
+            )
+        comments.sort(key=lambda item: int(item.get("likes", 0) or 0), reverse=True)
+        return comments[: max(0, int(limit))]
+
+    async def _fetch_hot_comments(
+        self,
+        session: aiohttp.ClientSession,
+        tweet_id: str,
+    ) -> List[Dict[str, Any]]:
+        """从无需登录的 X 帖子页获取当前公开可见的精选回复。"""
+        if self.hot_comment_count <= 0:
+            return []
+        proxy = self.proxy_url if self.use_parse_proxy else None
+        async with session.get(
+            f"https://x.com/i/status/{tweet_id}",
+            headers={
+                **self.headers,
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as response:
+            response.raise_for_status()
+            html_text = await response.text(errors="replace")
+        return self._parse_logged_out_comments_html(
+            html_text,
+            self.hot_comment_count,
+        )
 
     def can_parse(self, url: str) -> bool:
         """判断是否可以解析此URL
@@ -624,7 +741,30 @@ class TwitterParser(BaseVideoParser):
             if not tweet_id_match:
                 raise RuntimeError(f"无法解析此URL: {url}")
             tweet_id = tweet_id_match.group(1)
-            media_info = await self._fetch_media_info(session, tweet_id)
+            comments_task = None
+            if self.hot_comment_count > 0 and session is not None:
+                comments_task = asyncio.create_task(
+                    self._fetch_hot_comments(session, tweet_id)
+                )
+            try:
+                media_info = await self._fetch_media_info(session, tweet_id)
+            except (asyncio.CancelledError, Exception):
+                if comments_task is not None:
+                    comments_task.cancel()
+                    await asyncio.gather(comments_task, return_exceptions=True)
+                raise
+
+            hot_comments: List[Dict[str, Any]] = []
+            if comments_task is not None:
+                try:
+                    hot_comments = await comments_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        f"[{self.name}] 获取公开回复失败，已跳过: "
+                        f"tweet_id={tweet_id}, 错误: {exc}"
+                    )
 
             images = media_info.get("images", [])
             videos = media_info.get("videos", [])
@@ -677,6 +817,8 @@ class TwitterParser(BaseVideoParser):
                 if (self.use_image_proxy or self.use_video_proxy)
                 else None,
             }
+            if hot_comments:
+                metadata_base["hot_comments"] = hot_comments
 
             if has_videos and has_images:
                 result_dict = {

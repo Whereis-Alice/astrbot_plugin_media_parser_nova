@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import math
 import re
 import sys
@@ -27,14 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from ..logger import logger
-
-from .data import ParseResult, ImageContent
+from .data import ImageContent, ParseResult
 from .task import PathTask
 from .utils import fmt_duration
 
 try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont
-    from PIL import ImageOps
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 except ImportError:  # pragma: no cover
     Image = ImageDraw = ImageFilter = ImageFont = None
     ImageOps = None
@@ -99,7 +97,7 @@ _STAT_LABELS = {
 
 
 # 卡片样式版本：视觉样式变化时 +1，使已缓存的旧卡片失效并重新渲染
-_CARD_STYLE_VERSION = "14"
+_CARD_STYLE_VERSION = "15"
 
 
 def strip_emoji(text: str | None) -> str:
@@ -945,6 +943,199 @@ class ShareCardRenderer:
         font = self._font(_L.F_PLATFORM, bold=True)
         return 18 + 12 + 8 + self._text_width(text, font) + 18
 
+    @staticmethod
+    def _normalized_card_comments(result: ParseResult) -> list[dict[str, Any]]:
+        comments = result.extra.get("hot_comments")
+        if not isinstance(comments, list):
+            return []
+        normalized = []
+        for item in comments[:5]:
+            if not isinstance(item, dict):
+                continue
+            message = strip_emoji(str(item.get("message") or ""))
+            if not message:
+                continue
+            normalized.append(
+                {
+                    "username": strip_emoji(
+                        str(item.get("username") or "未知用户")
+                    ),
+                    "uid": strip_emoji(str(item.get("uid") or "")),
+                    "likes": item.get("likes", 0),
+                    "time": strip_emoji(str(item.get("time") or "")),
+                    "message": message,
+                }
+            )
+        return normalized
+
+    def _append_hot_comments(
+        self,
+        path: Path,
+        result: ParseResult,
+    ) -> Path:
+        """在已完成的卡片下方追加与当前皮肤匹配的热评版块。"""
+        comments = self._normalized_card_comments(result)
+        if not comments:
+            return path
+
+        base = self._open_image(path).convert("RGBA")
+        accent_rgb = _hex_to_rgb(
+            PLATFORM_COLORS.get(result.platform.name, PLATFORM_COLORS["default"])
+        )
+        pad = 30 if self.width >= 680 else 22
+        inner_w = self.width - pad * 2
+        body_size = 19 if self.width >= 680 else 17
+        author_size = 17 if self.width >= 680 else 15
+        body_font = self._font(body_size)
+        prepared = []
+        panel_h = 72
+        for item in comments:
+            lines = self._fit_lines(item["message"], body_font, inner_w, 3)
+            user_label = item["username"]
+            uid = item["uid"]
+            if uid and uid not in user_label:
+                user_label = f"{user_label}  ·  {uid}"
+            user_lines = self._fit_lines(
+                user_label,
+                self._font(author_size, bold=True),
+                max(80, inner_w - 170),
+                2,
+            )
+            prepared.append((item, lines, user_lines))
+            panel_h += author_size + 12
+            if len(user_lines) > 1:
+                panel_h += 17
+            panel_h += len(lines) * (body_size + 9) + 9
+            panel_h += 17
+        panel_h += 18
+
+        if self.skin_name == "editorial":
+            bg_top = bg_bottom = (247, 242, 233)
+            ink = (34, 32, 29)
+            muted = (103, 96, 87)
+            divider = (154, 143, 128)
+            header = "读者摘录 / HOT COMMENTS"
+            radius = 8
+        elif self.skin_name == "signal":
+            bg_top = (4, 24, 16)
+            bg_bottom = (2, 12, 9)
+            accent_rgb = (72, 255, 157)
+            ink = (218, 255, 234)
+            muted = (116, 199, 153)
+            divider = (58, 161, 105)
+            header = "COMMENT FEED // PUBLIC"
+            radius = 3
+        elif self.skin_name == "poster":
+            bg_top = (21, 22, 27)
+            bg_bottom = (10, 11, 14)
+            ink = (248, 248, 245)
+            muted = (164, 166, 172)
+            divider = (92, 94, 102)
+            header = "AUDIENCE NOTES / 热评"
+            radius = 10
+        else:
+            theme = _THEMES[self.theme_name]
+            bg_top = theme.gradient_top
+            bg_bottom = theme.gradient_bottom
+            ink = theme.text_primary
+            muted = theme.text_secondary
+            divider = theme.divider
+            header = "热门评论"
+            radius = _L.RADIUS
+
+        panel = self._gradient((self.width, panel_h), bg_top, bg_bottom).convert(
+            "RGBA"
+        )
+        draw = ImageDraw.Draw(panel)
+        if self.skin_name == "signal":
+            grid = Image.new("RGBA", panel.size, (0, 0, 0, 0))
+            grid_draw = ImageDraw.Draw(grid)
+            for xx in range(0, self.width, 32):
+                grid_draw.line(
+                    (xx, 0, xx, panel_h),
+                    fill=(72, 255, 157, 24),
+                    width=1,
+                )
+            for yy in range(0, panel_h, 32):
+                grid_draw.line(
+                    (0, yy, self.width, yy),
+                    fill=(72, 255, 157, 24),
+                    width=1,
+                )
+            panel.alpha_composite(grid)
+            draw = ImageDraw.Draw(panel)
+
+        draw.line((pad, 28, pad + 70, 28), fill=(*accent_rgb, 255), width=4)
+        self._draw_text(draw, (pad, 38), header, 15, ink, bold=True)
+        y = 72
+        for index, (item, lines, user_lines) in enumerate(prepared, start=1):
+            self._draw_text(
+                draw,
+                (pad, y),
+                user_lines[0] if user_lines else "未知用户",
+                author_size,
+                ink,
+                bold=True,
+            )
+            meta_parts = []
+            try:
+                likes = int(item["likes"] or 0)
+            except (TypeError, ValueError):
+                likes = 0
+            if likes:
+                meta_parts.append(f"赞 {likes}")
+            if item["time"]:
+                meta_parts.append(item["time"])
+            meta_text = "  ·  ".join(meta_parts) or f"评论 {index:02d}"
+            meta_font = self._font(13)
+            meta_text = self._ellipsize(meta_text, meta_font, 160)
+            self._draw_text(
+                draw,
+                (self.width - pad - self._text_width(meta_text, meta_font), y + 2),
+                meta_text,
+                13,
+                muted,
+            )
+            y += author_size + 12
+            if len(user_lines) > 1:
+                self._draw_text(draw, (pad, y - 7), user_lines[1], 13, muted)
+                y += 17
+            for line in lines:
+                self._draw_text(draw, (pad, y), line, body_size, muted)
+                y += body_size + 9
+            y += 9
+            if index < len(prepared):
+                draw.line(
+                    (pad, y, self.width - pad, y),
+                    fill=(*divider, 90),
+                    width=1,
+                )
+                y += 17
+
+        mask = Image.new("L", panel.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, self.width - 1, panel_h - 1),
+            radius=radius,
+            fill=255,
+        )
+        panel.putalpha(mask)
+        bottom_margin = {
+            "editorial": 18,
+            "signal": 16,
+            "poster": 18,
+        }.get(self.skin_name, 14)
+        visible_h = max(1, base.height - bottom_margin)
+        panel_y = max(0, visible_h - 6)
+        canvas = Image.new(
+            "RGBA",
+            (self.width, panel_y + panel_h + bottom_margin),
+            (0, 0, 0, 0),
+        )
+        canvas.alpha_composite(panel, (0, panel_y))
+        canvas.alpha_composite(base, (0, 0))
+        canvas.save(path, "PNG", optimize=True)
+        return path
+
     # ---------- 同步绘制 ----------
 
     def _render_sync(
@@ -955,18 +1146,20 @@ class ShareCardRenderer:
     ) -> Path:
         """按 self.layout_name 分发到具体布局实现。"""
         if self.skin_name == "editorial":
-            return self._render_editorial(result, images, out_path)
-        if self.skin_name == "signal":
-            return self._render_signal(result, images, out_path)
-        if self.skin_name == "poster":
-            return self._render_poster(result, images, out_path)
-        if self.layout_name == "magazine":
-            return self._render_magazine(result, images, out_path)
-        if self.layout_name == "immersive":
-            return self._render_immersive(result, images, out_path)
-        if self.layout_name == "feed":
-            return self._render_feed(result, images, out_path)
-        return self._render_standard(result, images, out_path)
+            rendered = self._render_editorial(result, images, out_path)
+        elif self.skin_name == "signal":
+            rendered = self._render_signal(result, images, out_path)
+        elif self.skin_name == "poster":
+            rendered = self._render_poster(result, images, out_path)
+        elif self.layout_name == "magazine":
+            rendered = self._render_magazine(result, images, out_path)
+        elif self.layout_name == "immersive":
+            rendered = self._render_immersive(result, images, out_path)
+        elif self.layout_name == "feed":
+            rendered = self._render_feed(result, images, out_path)
+        else:
+            rendered = self._render_standard(result, images, out_path)
+        return self._append_hot_comments(rendered, result)
 
     # ==================== 高级皮肤：编辑室 ====================
 
@@ -993,16 +1186,83 @@ class ShareCardRenderer:
         right_w = max(180, inner_w - left_w - gap)
         body_y = 96
 
-        title_font = self._font(36, bold=True)
         title_text = d["title"] or "未命名内容"
-        title_lines = self._fit_lines(title_text, title_font, right_w, 3)
+        title_size = 36
+        title_lines = self._wrap(
+            title_text,
+            self._font(title_size, bold=True),
+            right_w,
+        )
+        while title_size > 24 and len(title_lines) > 4:
+            title_size -= 2
+            title_lines = self._wrap(
+                title_text,
+                self._font(title_size, bold=True),
+                right_w,
+            )
         desc_lines = self._fit_lines(d["text"], self._font(22), right_w, 5) if d["text"] else []
+        author_name_size = 20
+        author_name_lines: list[str] = []
+        author_desc_size = 14
+        author_desc_lines: list[str] = []
+        if d["author"]:
+            while author_name_size > 14:
+                candidate = self._wrap(
+                    d["name"],
+                    self._font(author_name_size, bold=True),
+                    right_w - 62,
+                )
+                if len(candidate) <= 2:
+                    break
+                author_name_size -= 1
+            author_name_lines = self._fit_lines(
+                d["name"],
+                self._font(author_name_size, bold=True),
+                right_w - 62,
+                3,
+            )
+            if d["author_desc"]:
+                author_desc_lines = self._fit_lines(
+                    d["author_desc"],
+                    self._font(author_desc_size),
+                    right_w - 62,
+                    2,
+                )
+        author_text_h = (
+            len(author_name_lines) * (author_name_size + 6)
+            + len(author_desc_lines) * (author_desc_size + 5)
+        )
+        author_block_h = max(48, author_text_h) + 22 if d["author"] else 0
+        full_url = re.sub(
+            r"^https?://",
+            "",
+            str(result.url or ""),
+            flags=re.I,
+        ).rstrip("/")
+        editorial_url_size = 15
+        editorial_url_lines = []
+        if full_url:
+            editorial_url_lines = self._wrap(
+                full_url,
+                self._font(editorial_url_size),
+                inner_w,
+            )
+            while editorial_url_size > 12 and len(editorial_url_lines) > 4:
+                editorial_url_size -= 1
+                editorial_url_lines = self._wrap(
+                    full_url,
+                    self._font(editorial_url_size),
+                    inner_w,
+                )
+        editorial_url_line_h = editorial_url_size + 6
+        footer_h = 96 + len(editorial_url_lines) * editorial_url_line_h
         stat_count = min(len(d["stats"]), 6)
         thumb_count = min(len(d["grid"]), 3)
         media_h = max(440, min(680, round(left_w * 1.34)))
-        right_h = 56 + len(title_lines) * 48
+        title_line_h = title_size + 12
+        right_h = 56 + len(title_lines) * title_line_h
         if d["author"]:
-            right_h += 70
+            right_h += author_block_h
         if desc_lines:
             right_h += 26 + len(desc_lines) * 34
         if stat_count:
@@ -1010,7 +1270,7 @@ class ShareCardRenderer:
         if thumb_count:
             right_h += 106 + (20 if len(d["grid"]) > 3 else 0)
         body_h = max(media_h, right_h + 8)
-        card_h = body_y + body_h + 92
+        card_h = body_y + body_h + footer_h
         total_h = card_h + 18
 
         canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
@@ -1029,7 +1289,12 @@ class ShareCardRenderer:
         card_draw.line((pad, 22, pad + 78, 22), fill=(*accent_rgb, 255), width=4)
         card_draw.line((pad, 28, self.width - pad, 28), fill=(*ink, 35), width=1)
         self._draw_text(
-            card_draw, (pad, 42), "NOVA / EDITORIAL FILE", 15, ink, bold=True
+            card_draw,
+            (pad, 42),
+            d["ts"] or "MEDIA NOTE",
+            15,
+            ink,
+            bold=True,
         )
         meta_head = f"{d['platform_text']}  /  {d['content_type']}"
         meta_font = self._font(16, bold=True)
@@ -1083,8 +1348,8 @@ class ShareCardRenderer:
         self._draw_text(card_draw, (rx, y), section_label, 15, muted, bold=True)
         y += 30
         for line in title_lines:
-            self._draw_text(card_draw, (rx, y), line, 36, ink, bold=True)
-            y += 48
+            self._draw_text(card_draw, (rx, y), line, title_size, ink, bold=True)
+            y += title_line_h
         y += 10
 
         if d["author"]:
@@ -1109,16 +1374,27 @@ class ShareCardRenderer:
                 )
             card.alpha_composite(avatar.convert("RGBA"), (rx, y))
             card_draw = ImageDraw.Draw(card)
-            name_font = self._font(22, bold=True)
-            name_text = self._ellipsize(d["name"], name_font, right_w - 62)
-            self._draw_text(card_draw, (rx + 62, y + 2), name_text, 22, ink, bold=True)
-            if d["author_desc"]:
-                desc_font = self._font(16)
-                author_desc = self._ellipsize(
-                    d["author_desc"], desc_font, right_w - 62
+            text_y = y
+            for line in author_name_lines:
+                self._draw_text(
+                    card_draw,
+                    (rx + 62, text_y),
+                    line,
+                    author_name_size,
+                    ink,
+                    bold=True,
                 )
-                self._draw_text(card_draw, (rx + 62, y + 29), author_desc, 16, muted)
-            y += avatar_size + 22
+                text_y += author_name_size + 6
+            for line in author_desc_lines:
+                self._draw_text(
+                    card_draw,
+                    (rx + 62, text_y),
+                    line,
+                    author_desc_size,
+                    muted,
+                )
+                text_y += author_desc_size + 5
+            y += author_block_h
 
         if desc_lines:
             card_draw.line((rx, y, rx + right_w, y), fill=(*ink, 35), width=1)
@@ -1165,19 +1441,18 @@ class ShareCardRenderer:
         # 独立页脚：编辑号、原链和可配置署名。
         footer_y = body_y + body_h + 26
         card_draw.line((pad, footer_y, self.width - pad, footer_y), fill=(*ink, 70), width=1)
-        url_text = card_footer_url(result)
-        url_font = self._font(16)
         wm_font = self._font(16, bold=True)
         wm_text = self.watermark
         wm_width = self._text_width(wm_text, wm_font)
         wm_x = self.width - pad - wm_width
-        if url_text:
-            available = max(40, wm_x - pad - 24)
-            url_text = self._ellipsize(url_text, url_font, available)
-            self._draw_text(card_draw, (pad, footer_y + 18), url_text, 16, muted)
-        self._draw_text(card_draw, (wm_x, footer_y + 18), wm_text, 16, accent, bold=True)
+        url_y = footer_y + 16
+        for line in editorial_url_lines:
+            self._draw_text(card_draw, (pad, url_y), line, editorial_url_size, muted)
+            url_y += editorial_url_line_h
+        bottom_y = max(footer_y + 45, url_y + 5)
+        self._draw_text(card_draw, (wm_x, bottom_y), wm_text, 16, accent, bold=True)
         self._draw_text(
-            card_draw, (pad, footer_y + 47), "A CURATED MEDIA NOTE", 12, soft, bold=True
+            card_draw, (pad, bottom_y + 3), "A CURATED MEDIA NOTE", 12, soft, bold=True
         )
 
         mask = Image.new("L", (self.width, card_h), 0)
@@ -1203,31 +1478,108 @@ class ShareCardRenderer:
     ) -> Path:
         """信号终端：网格背景、状态栏和遥测面板，独立于常规卡片布局。"""
         d = self._prep(result, images)
-        accent = PLATFORM_COLORS.get(result.platform.name, PLATFORM_COLORS["default"])
-        accent_rgb = _hex_to_rgb(accent)
-        bg = (9, 14, 19)
-        panel = (15, 23, 30)
-        ink = (229, 239, 241)
-        muted = (135, 157, 163)
-        dim = (75, 101, 109)
-        warning = (247, 183, 74)
+        accent = (72, 255, 157)
+        accent_rgb = accent
+        bg_top = (5, 31, 20)
+        bg_bottom = (2, 11, 8)
+        panel = (6, 35, 22)
+        ink = (221, 255, 235)
+        muted = (127, 204, 160)
+        dim = (63, 139, 100)
+        warning = (255, 210, 98)
         pad = 24
         inner_w = self.width - pad * 2
         gap = 18
         hero_w = max(260, round(inner_w * 0.58))
         side_w = inner_w - hero_w - gap
         top_y = 96
-        hero_h = max(340, min(480, round(hero_w * 0.72)))
+        telemetry_value_w = max(80, side_w - 32)
+        telemetry_value_size = 18 if side_w >= 220 else 16
+        author_value_size = telemetry_value_size
+        author_name_lines = self._wrap(
+            d["name"] or "UNKNOWN",
+            self._font(author_value_size, bold=True),
+            telemetry_value_w,
+        )
+        while author_value_size > 13 and len(author_name_lines) > 4:
+            author_value_size -= 1
+            author_name_lines = self._wrap(
+                d["name"] or "UNKNOWN",
+                self._font(author_value_size, bold=True),
+                telemetry_value_w,
+            )
+        author_desc_size = 12
+        author_desc_lines = (
+            self._wrap(
+                d["author_desc"],
+                self._font(author_desc_size),
+                telemetry_value_w,
+            )
+            if d["author_desc"]
+            else []
+        )
+        simple_fields = [
+            ("SOURCE", d["platform_text"]),
+            ("TYPE", d["content_type"]),
+            ("STAMP", d["ts"] or "N/A"),
+        ]
+        simple_field_lines = [
+            (
+                label,
+                self._wrap(
+                    value,
+                    self._font(telemetry_value_size, bold=True),
+                    telemetry_value_w,
+                ),
+            )
+            for label, value in simple_fields
+        ]
+        telemetry_fields_h = sum(
+            17 + len(lines) * (telemetry_value_size + 5) + 8
+            for _, lines in simple_field_lines
+        )
+        telemetry_fields_h += (
+            17
+            + len(author_name_lines) * (author_value_size + 5)
+            + len(author_desc_lines) * (author_desc_size + 4)
+            + 8
+        )
+        hero_h = max(
+            340,
+            min(480, round(hero_w * 0.72)),
+            57 + telemetry_fields_h + 72,
+        )
         title_font = self._font(34, bold=True)
         title_lines = self._fit_lines(d["title"] or "UNTITLED SIGNAL", title_font, inner_w, 2)
         desc_lines = self._fit_lines(d["text"], self._font(21), inner_w, 3) if d["text"] else []
         grid_count = min(len(d["grid"]), 4)
+        signal_url = re.sub(
+            r"^https?://",
+            "",
+            str(result.url or ""),
+            flags=re.I,
+        ).rstrip("/")
+        signal_url_size = 14 if self.width >= 680 else 13
+        signal_url_lines = (
+            self._wrap(
+                f"LINK://{signal_url}",
+                self._font(signal_url_size),
+                inner_w,
+            )
+            if signal_url
+            else []
+        )
+        signal_url_line_h = signal_url_size + 5
+        signal_footer_h = 58 + len(signal_url_lines) * signal_url_line_h
         lower_h = 34 + len(title_lines) * 46 + (len(desc_lines) * 31 + 18 if desc_lines else 0)
         if d["stats"]:
             lower_h += 62
         if grid_count:
             lower_h += 88
-        card_h = max(560, top_y + hero_h + lower_h + 108)
+        card_h = max(
+            560,
+            top_y + hero_h + lower_h + signal_footer_h + 36,
+        )
         total_h = card_h + 16
 
         canvas = Image.new("RGBA", (self.width, total_h), (0, 0, 0, 0))
@@ -1236,30 +1588,62 @@ class ShareCardRenderer:
             (10, 10, self.width - 10, card_h + 2), fill=(0, 0, 0, 125)
         )
         canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(13)))
-        card = Image.new("RGBA", (self.width, card_h), (*bg, 255))
+        card = self._gradient(
+            (self.width, card_h),
+            bg_top,
+            bg_bottom,
+        ).convert("RGBA")
 
-        # 终端网格和扫描线是皮肤结构的一部分，而不是主题滤镜。
+        # 荧光网格直接铺在渐变底上，半透明面板会保留其穿透感。
         grid_layer = Image.new("RGBA", (self.width, card_h), (0, 0, 0, 0))
         grid_draw = ImageDraw.Draw(grid_layer)
-        for xx in range(16, self.width, 24):
-            grid_draw.line((xx, 0, xx, card_h), fill=(44, 78, 85, 38), width=1)
-        for yy in range(16, card_h, 24):
-            grid_draw.line((0, yy, self.width, yy), fill=(44, 78, 85, 38), width=1)
+        for xx in range(0, self.width, 32):
+            major = xx % 128 == 0
+            grid_draw.line(
+                (xx, 0, xx, card_h),
+                fill=(72, 255, 157, 54 if major else 25),
+                width=1,
+            )
+        for yy in range(0, card_h, 32):
+            major = yy % 128 == 0
+            grid_draw.line(
+                (0, yy, self.width, yy),
+                fill=(72, 255, 157, 54 if major else 25),
+                width=1,
+            )
+        for yy in range(8, card_h, 10):
+            grid_draw.line(
+                (0, yy, self.width, yy),
+                fill=(210, 255, 226, 7),
+                width=1,
+            )
         card.alpha_composite(grid_layer)
         draw = ImageDraw.Draw(card)
         draw.rectangle(
             (0, 0, self.width - 1, card_h - 1),
-            outline=_mix(bg, accent_rgb, 0.55),
-            width=1,
+            outline=(*accent_rgb, 190),
+            width=2,
         )
 
         # 顶部状态栏。
-        draw.rectangle((0, 0, self.width, 66), fill=panel)
-        for idx, color in enumerate(((239, 95, 88), (242, 185, 74), (94, 201, 112))):
-            cx = 24 + idx * 22
-            draw.ellipse((cx - 5, 28 - 5, cx + 5, 28 + 5), fill=color)
-        self._draw_text(draw, (98, 17), "NOVA // MEDIA SIGNAL", 18, ink, bold=True)
-        self._draw_text(draw, (98, 39), "PARSER LINK ESTABLISHED", 12, dim, bold=True)
+        header_layer = Image.new("RGBA", card.size, (0, 0, 0, 0))
+        header_draw = ImageDraw.Draw(header_layer)
+        header_draw.rectangle((0, 0, self.width, 66), fill=(*panel, 188))
+        header_draw.line(
+            (0, 65, self.width, 65),
+            fill=(*accent_rgb, 150),
+            width=1,
+        )
+        card.alpha_composite(header_layer)
+        draw = ImageDraw.Draw(card)
+        for idx, height in enumerate((12, 22, 34, 18)):
+            x = 24 + idx * 13
+            draw.rectangle(
+                (x, 45 - height, x + 5, 45),
+                fill=(*accent_rgb, 125 + idx * 28),
+            )
+        self._draw_text(draw, (92, 14), "SIGNAL // MEDIA LINK", 18, ink, bold=True)
+        self._draw_text(draw, (92, 39), "PUBLIC FEED / CONNECTED", 12, dim, bold=True)
         status = "ONLINE  0x01"
         status_font = self._font(15, bold=True)
         self._draw_text(
@@ -1277,6 +1661,9 @@ class ShareCardRenderer:
                 hero_img = self._fallback_cover(
                     hero_w, hero_h, _THEMES["dark"], accent_rgb, 0
                 )
+            hero_img.alpha_composite(
+                Image.new("RGBA", hero_img.size, (*accent_rgb, 22))
+            )
             card.alpha_composite(hero_img, (pad, top_y))
         except Exception:
             card.alpha_composite(
@@ -1300,27 +1687,65 @@ class ShareCardRenderer:
         # 右侧遥测字段。
         sx = pad + hero_w + gap
         sy = top_y
-        draw.rectangle(
+        telemetry_layer = Image.new("RGBA", card.size, (0, 0, 0, 0))
+        telemetry_draw = ImageDraw.Draw(telemetry_layer)
+        telemetry_draw.rounded_rectangle(
             (sx, sy, sx + side_w, sy + hero_h),
-            fill=panel,
-            outline=_mix(panel, dim, 0.7),
+            radius=4,
+            fill=(*panel, 178),
+            outline=(*accent_rgb, 105),
             width=1,
         )
+        card.alpha_composite(telemetry_layer)
+        draw = ImageDraw.Draw(card)
         self._draw_text(draw, (sx + 16, sy + 14), "TELEMETRY", 14, accent, bold=True)
         draw.line((sx + 16, sy + 39, sx + side_w - 16, sy + 39), fill=(*dim, 150), width=1)
-        fields = [
-            ("SOURCE", d["platform_text"]),
-            ("TYPE", d["content_type"]),
-            ("AUTHOR", d["name"] or "UNKNOWN"),
-            ("STAMP", d["ts"] or "N/A"),
-        ]
         fy = sy + 57
-        for label, value in fields:
+        for label, lines in simple_field_lines[:2]:
             self._draw_text(draw, (sx + 16, fy), label, 12, dim, bold=True)
-            value_font = self._font(18, bold=True)
-            value_text = self._ellipsize(value, value_font, side_w - 32)
-            self._draw_text(draw, (sx + 16, fy + 17), value_text, 18, ink, bold=True)
-            fy += 50
+            fy += 17
+            for line in lines:
+                self._draw_text(
+                    draw,
+                    (sx + 16, fy),
+                    line,
+                    telemetry_value_size,
+                    ink,
+                    bold=True,
+                )
+                fy += telemetry_value_size + 5
+            fy += 8
+
+        self._draw_text(draw, (sx + 16, fy), "AUTHOR", 12, dim, bold=True)
+        fy += 17
+        for line in author_name_lines:
+            self._draw_text(
+                draw,
+                (sx + 16, fy),
+                line,
+                author_value_size,
+                ink,
+                bold=True,
+            )
+            fy += author_value_size + 5
+        for line in author_desc_lines:
+            self._draw_text(draw, (sx + 16, fy), line, author_desc_size, dim)
+            fy += author_desc_size + 4
+        fy += 8
+
+        stamp_label, stamp_lines = simple_field_lines[2]
+        self._draw_text(draw, (sx + 16, fy), stamp_label, 12, dim, bold=True)
+        fy += 17
+        for line in stamp_lines:
+            self._draw_text(
+                draw,
+                (sx + 16, fy),
+                line,
+                telemetry_value_size,
+                ink,
+                bold=True,
+            )
+            fy += telemetry_value_size + 5
         draw.line(
             (sx + 16, sy + hero_h - 56, sx + side_w - 16, sy + hero_h - 56),
             fill=_mix(panel, dim, 0.7),
@@ -1341,6 +1766,23 @@ class ShareCardRenderer:
             draw.line(points, fill=(*accent_rgb, 235), width=2)
 
         # 标题、正文和数据行。
+        lower_top = top_y + hero_h + 16
+        lower_layer = Image.new("RGBA", card.size, (0, 0, 0, 0))
+        lower_draw = ImageDraw.Draw(lower_layer)
+        lower_draw.rounded_rectangle(
+            (
+                pad - 8,
+                lower_top,
+                self.width - pad + 8,
+                card_h - signal_footer_h - 10,
+            ),
+            radius=5,
+            fill=(*panel, 132),
+            outline=(*accent_rgb, 72),
+            width=1,
+        )
+        card.alpha_composite(lower_layer)
+        draw = ImageDraw.Draw(card)
         y = top_y + hero_h + 28
         self._draw_text(draw, (pad, y), "TITLE /", 13, accent, bold=True)
         y += 23
@@ -1380,23 +1822,26 @@ class ShareCardRenderer:
             y = thumb_y + 76
 
         # 独立终端页脚。
-        footer_y = card_h - 72
+        footer_y = card_h - signal_footer_h
         draw.line((pad, footer_y, self.width - pad, footer_y), fill=(*accent_rgb, 150), width=1)
         wm_font = self._font(15, bold=True)
         wm_text = self.watermark
         wm_width = self._text_width(wm_text, wm_font)
-        url_text = card_footer_url(result)
-        if url_text:
-            url_font = self._font(14)
-            url_text = self._ellipsize(
-                f"LINK://{url_text}",
-                url_font,
-                self.width - pad * 2 - wm_width - 24,
-            )
-            self._draw_text(draw, (pad, footer_y + 20), url_text, 14, muted)
-        self._draw_text(draw, (self.width - pad - wm_width, footer_y + 19), wm_text, 15, accent, bold=True)
+        url_y = footer_y + 13
+        for line in signal_url_lines:
+            self._draw_text(draw, (pad, url_y), line, signal_url_size, muted)
+            url_y += signal_url_line_h
+        footer_bottom_y = card_h - 28
+        self._draw_text(
+            draw,
+            (self.width - pad - wm_width, footer_bottom_y),
+            wm_text,
+            15,
+            accent,
+            bold=True,
+        )
         footer_status = "CRC: OK   /   MEDIA READY"
-        self._draw_text(draw, (pad, footer_y + 43), footer_status, 11, dim, bold=True)
+        self._draw_text(draw, (pad, footer_bottom_y + 3), footer_status, 11, dim, bold=True)
         if d["warnings"]:
             warning_text = self._fit_lines(strip_emoji(d["warnings"][0]), self._font(13), inner_w, 1)[0]
             self._draw_text(draw, (pad, footer_y - 22), f"WARN // {warning_text}", 13, warning, bold=True)
@@ -1427,10 +1872,58 @@ class ShareCardRenderer:
         title_font = self._font(title_size, bold=True)
         title_lines = self._fit_lines(d["title"] or "未命名内容", title_font, inner_w, 3)
         desc_lines = self._fit_lines(d["text"], self._font(21), inner_w, 3) if d["text"] else []
-        bottom_band_h = 126
+        author_name_size = 22
+        author_name_lines = (
+            self._wrap(
+                d["name"],
+                self._font(author_name_size, bold=True),
+                inner_w - 56,
+            )
+            if d["author"]
+            else []
+        )
+        while author_name_size > 16 and len(author_name_lines) > 3:
+            author_name_size -= 1
+            author_name_lines = self._wrap(
+                d["name"],
+                self._font(author_name_size, bold=True),
+                inner_w - 56,
+            )
+        author_desc_size = 14
+        author_desc_lines = (
+            self._wrap(
+                d["author_desc"],
+                self._font(author_desc_size),
+                inner_w - 56,
+            )
+            if d["author_desc"]
+            else []
+        )
+        poster_url = re.sub(
+            r"^https?://",
+            "",
+            str(result.url or ""),
+            flags=re.I,
+        ).rstrip("/")
+        poster_url_size = 14 if self.width >= 680 else 13
+        poster_url_lines = (
+            self._wrap(
+                poster_url,
+                self._font(poster_url_size),
+                inner_w,
+            )
+            if poster_url
+            else []
+        )
+        poster_url_line_h = poster_url_size + 5
+        bottom_band_h = 106 + len(poster_url_lines) * poster_url_line_h
         title_h = len(title_lines) * (title_size + 10)
         desc_h = len(desc_lines) * 31
-        author_h = 50 if d["author"] else 0
+        author_text_h = (
+            len(author_name_lines) * (author_name_size + 6)
+            + len(author_desc_lines) * (author_desc_size + 5)
+        )
+        author_h = max(50, author_text_h + 4) if d["author"] else 0
         content_stack_h = (
             title_h
             + 24
@@ -1490,7 +1983,7 @@ class ShareCardRenderer:
         draw.rectangle((pad, 78, pad + 88, 84), fill=(*accent_rgb, 255))
 
         # 顶部档案标识。
-        self._draw_text(draw, (pad, 28), "NOVA ARCHIVE / 01", 16, white, bold=True)
+        self._draw_text(draw, (pad, 28), "MEDIA ARCHIVE / 01", 16, white, bold=True)
         top_meta = f"{d['platform_text']}  ·  {d['content_type']}"
         top_font = self._font(16, bold=True)
         top_w = self._text_width(top_meta, top_font)
@@ -1525,15 +2018,26 @@ class ShareCardRenderer:
                 first = (d["name"][:1] or "?").upper()
                 self._draw_text(draw, (pad + 12, author_y + 8), first, 22, white, bold=True)
             draw = ImageDraw.Draw(card)
-            name_font = self._font(22, bold=True)
-            name_text = self._ellipsize(d["name"], name_font, inner_w - 56)
-            self._draw_text(draw, (pad + 56, author_y + 2), name_text, 22, white, bold=True)
-            if d["author_desc"]:
-                desc_font = self._font(14)
-                author_desc = self._ellipsize(
-                    d["author_desc"], desc_font, inner_w - 56
+            author_text_y = author_y + 2
+            for line in author_name_lines:
+                self._draw_text(
+                    draw,
+                    (pad + 56, author_text_y),
+                    line,
+                    author_name_size,
+                    white,
+                    bold=True,
                 )
-                self._draw_text(draw, (pad + 56, author_y + 27), author_desc, 14, muted)
+                author_text_y += author_name_size + 6
+            for line in author_desc_lines:
+                self._draw_text(
+                    draw,
+                    (pad + 56, author_text_y),
+                    line,
+                    author_desc_size,
+                    muted,
+                )
+                author_text_y += author_desc_size + 5
 
         if desc_lines:
             for line in desc_lines:
@@ -1554,15 +2058,20 @@ class ShareCardRenderer:
             stats_text = "  ·  ".join(f"{label} {value}" for label, value in d["stats"][:4])
             stats_text = self._fit_lines(stats_text, self._font(16), inner_w, 1)[0]
             self._draw_text(draw, (pad, band_y + 42), stats_text, 16, white, bold=True)
-        url_text = card_footer_url(result)
-        if url_text:
-            url_font = self._font(14)
-            max_url_w = max(80, inner_w - 180)
-            url_text = self._ellipsize(url_text, url_font, max_url_w)
-            self._draw_text(draw, (pad, band_y + 78), url_text, 14, muted)
+        url_y = band_y + 72
+        for line in poster_url_lines:
+            self._draw_text(draw, (pad, url_y), line, poster_url_size, muted)
+            url_y += poster_url_line_h
         wm_font = self._font(17, bold=True)
         wm_w = self._text_width(self.watermark, wm_font)
-        self._draw_text(draw, (self.width - pad - wm_w, band_y + 82), self.watermark, 17, white, bold=True)
+        self._draw_text(
+            draw,
+            (self.width - pad - wm_w, card_h - 32),
+            self.watermark,
+            17,
+            white,
+            bold=True,
+        )
 
         if d["grid"]:
             thumb_size = 48
@@ -2216,7 +2725,7 @@ class ShareCardRenderer:
             "text": strip_emoji(result.text),
             "author": author,
             "name": (strip_emoji(author.name) or "未知作者") if author else "",
-            "author_desc": strip_emoji(author.description or "")[:40] if author else "",
+            "author_desc": strip_emoji(author.description or "") if author else "",
             "stats": stats,
             "online_text": strip_emoji(result.extra.get("online") or ""),
             "warnings": result.extra.get("limit_warnings") or [],

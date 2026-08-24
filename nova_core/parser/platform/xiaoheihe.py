@@ -1,25 +1,25 @@
 "nova_core.parser.platform.xiaoheihe 模块。"
 
-import base64
 import asyncio
+import base64
 import gzip
-import html as html_lib
 import hashlib
+import html as html_lib
 import json
 import random
 import re
 import time
 import uuid
-from typing import Optional, Dict, Any, List, Tuple, Iterable
-from urllib.parse import urlparse, parse_qs
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
-from ...logger import logger
-
-from .base import BaseVideoParser
-from ..utils import build_request_headers
 from ...constants import Config
+from ...logger import logger
+from ..utils import build_request_headers
+from .base import BaseVideoParser
 
 try:
     from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
@@ -347,7 +347,11 @@ class XiaoheiheDevice:
                 continue
             out = value
             if rule["is_encrypt"] == 1:
-                cipher = Cipher(TripleDES(rule["key"].encode("utf-8")), ECB())
+                des_key = rule["key"].encode("utf-8")
+                if len(des_key) == 8:
+                    # K1=K2=K3 与旧的单密钥 TripleDES 结果等价，且兼容新版 cryptography。
+                    des_key *= 3
+                cipher = Cipher(TripleDES(des_key), ECB())
                 raw = str(value).encode("utf-8") + b"\x00" * 8
                 out = base64.b64encode(cipher.encryptor().update(raw)).decode("utf-8")
             result[rule["obfuscated_name"]] = out
@@ -453,7 +457,12 @@ class XiaoheiheDevice:
 class XiaoheiheParser(BaseVideoParser):
     "XiaoheiheParser 类。"
 
-    def __init__(self, use_video_proxy: bool = False, proxy_url: str = None):
+    def __init__(
+        self,
+        use_video_proxy: bool = False,
+        proxy_url: str = None,
+        hot_comment_count: int = 0,
+    ):
         """初始化解析器并设置并发限制与默认请求头。
 
         Args:
@@ -463,6 +472,10 @@ class XiaoheiheParser(BaseVideoParser):
         super().__init__("xiaoheihe")
         self.use_video_proxy = use_video_proxy
         self.proxy_url = proxy_url
+        try:
+            self.hot_comment_count = min(20, max(0, int(hot_comment_count)))
+        except (TypeError, ValueError):
+            self.hot_comment_count = 0
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         self._default_headers = {
             "User-Agent": UA,
@@ -1174,17 +1187,93 @@ class XiaoheiheParser(BaseVideoParser):
 
         return desc, video_urls, image_urls
 
+    @staticmethod
+    def _format_comment_time(value: Any) -> str:
+        try:
+            timestamp = int(value or 0)
+        except (TypeError, ValueError):
+            return ""
+        if timestamp <= 0:
+            return ""
+        try:
+            return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            return str(timestamp)
+
+    @classmethod
+    def _normalize_hot_comments(cls, data: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+        """把 link/tree 的楼层结构整理为统一热评字段。"""
+        normalized: List[Dict[str, Any]] = []
+        seen_ids = set()
+        floors = data.get("comments")
+        if not isinstance(floors, list):
+            return normalized
+        for floor in floors:
+            floor_comments = floor.get("comment") if isinstance(floor, dict) else None
+            if not isinstance(floor_comments, list) or not floor_comments:
+                continue
+            item = floor_comments[0]
+            if not isinstance(item, dict):
+                continue
+            comment_id = str(item.get("commentid") or "").strip()
+            if comment_id and comment_id in seen_ids:
+                continue
+            if comment_id:
+                seen_ids.add(comment_id)
+            message = html_lib.unescape(str(item.get("text") or "")).strip()
+            if not message:
+                continue
+            user = item.get("user") if isinstance(item.get("user"), dict) else {}
+            username = str(
+                user.get("username") or user.get("nickname") or "未知用户"
+            ).strip()
+            uid = str(
+                user.get("userid") or item.get("userid") or ""
+            ).strip()
+            try:
+                likes = int(item.get("up", 0) or 0)
+            except (TypeError, ValueError):
+                likes = 0
+            normalized.append(
+                {
+                    "username": username,
+                    "uid": uid,
+                    "likes": likes,
+                    "time": cls._format_comment_time(item.get("create_at")),
+                    "message": message,
+                    "avatar_url": str(
+                        user.get("avatar") or user.get("avartar") or ""
+                    ).strip(),
+                    "comment_id": comment_id,
+                }
+            )
+        normalized.sort(
+            key=lambda item: int(item.get("likes", 0) or 0),
+            reverse=True,
+        )
+        return normalized[: max(0, int(limit))]
+
     async def _parse_bbs_link(
         self, session: aiohttp.ClientSession, url: str, link_id: str
     ) -> Dict[str, Any]:
         """解析小黑盒 BBS/link 分享。"""
+        request_params = {
+            "link_id": str(link_id),
+            "owner_only": "0" if self.hot_comment_count > 0 else "1",
+        }
+        if self.hot_comment_count > 0:
+            request_params.update(
+                {
+                    "is_first": "1",
+                    "page": "1",
+                    "index": "1",
+                    "limit": str(max(20, self.hot_comment_count)),
+                }
+            )
         data = await self._fetch_signed_api(
             session,
             "/bbs/app/link/tree",
-            {
-                "link_id": str(link_id),
-                "owner_only": "1",
-            },
+            request_params,
         )
         link = data.get("link") or {}
         if not isinstance(link, dict):
@@ -1205,8 +1294,8 @@ class XiaoheiheParser(BaseVideoParser):
             author = f"{nickname}(uid:{uid})" if nickname and uid else nickname
 
         desc, video_urls, image_urls = self._extract_bbs_text_and_media(link)
-        if not video_urls and not image_urls:
-            raise RuntimeError("小黑盒BBS帖子未找到媒体")
+        if not video_urls and not image_urls and not desc:
+            raise RuntimeError("小黑盒BBS帖子未找到可展示内容")
 
         referer = "https://www.xiaoheihe.cn/"
         image_headers = build_request_headers(is_video=False, referer=referer)
@@ -1227,6 +1316,13 @@ class XiaoheiheParser(BaseVideoParser):
         }
         if video_urls:
             result["video_force_download"] = True
+        if self.hot_comment_count > 0:
+            hot_comments = self._normalize_hot_comments(
+                data,
+                self.hot_comment_count,
+            )
+            if hot_comments:
+                result["hot_comments"] = hot_comments
         return result
 
     async def parse(

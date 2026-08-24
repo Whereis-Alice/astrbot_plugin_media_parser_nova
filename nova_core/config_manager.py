@@ -5,28 +5,26 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .logger import logger
-
 from .constants import Config
 from .downloader.utils import check_cache_dir_available
+from .logger import logger
 from .parser.platform import (
     BilibiliParser,
     DouyinParser,
-    TikTokParser,
     KuaishouParser,
-    WeiboParser,
-    XiaohongshuParser,
-    XianyuParser,
-    ToutiaoParser,
-    XiaoheiheParser,
-    TwitterParser,
     PixivParser,
+    TikTokParser,
+    ToutiaoParser,
+    TwitterParser,
+    WeiboParser,
+    XianyuParser,
+    XiaoheiheParser,
+    XiaohongshuParser,
 )
 from .translation.provider_defs import (
     LLM_PROVIDER_DEFAULTS,
     LLM_PROVIDER_OPTIONS,
 )
-
 
 BILIBILI_QUALITY_MAP = {
     "不限制": 0,
@@ -99,11 +97,19 @@ TRANSLATION_CONTENT_SCOPES = {
     "仅正文",
     "正文和标题",
 }
-TRANSLATION_OUTPUT_CARD_ONLY = "仅作用于卡片"
-TRANSLATION_OUTPUT_CARD_AND_TEXT = "卡片和文本都发送"
-TRANSLATION_OUTPUT_MODES = {
-    TRANSLATION_OUTPUT_CARD_ONLY,
-    TRANSLATION_OUTPUT_CARD_AND_TEXT,
+TRANSLATION_APPLY_CARD_ONLY = "仅卡片使用译文"
+TRANSLATION_APPLY_CARD_AND_TEXT = "卡片和文本均使用译文"
+TRANSLATION_APPLY_SCOPES = {
+    TRANSLATION_APPLY_CARD_ONLY,
+    TRANSLATION_APPLY_CARD_AND_TEXT,
+}
+# 兼容 v1.1.0 的公开常量和已保存配置值。
+TRANSLATION_OUTPUT_CARD_ONLY = TRANSLATION_APPLY_CARD_ONLY
+TRANSLATION_OUTPUT_CARD_AND_TEXT = TRANSLATION_APPLY_CARD_AND_TEXT
+TRANSLATION_OUTPUT_MODES = TRANSLATION_APPLY_SCOPES
+LEGACY_TRANSLATION_APPLY_SCOPES = {
+    "仅作用于卡片": TRANSLATION_APPLY_CARD_ONLY,
+    "卡片和文本都发送": TRANSLATION_APPLY_CARD_AND_TEXT,
 }
 DEFAULT_CARD_WATERMARK = "Nova解析"
 
@@ -298,6 +304,8 @@ class HotCommentConfig:
     bilibili: bool = True
     weibo: bool = True
     xiaohongshu: bool = True
+    twitter: bool = True
+    xiaoheihe: bool = True
 
 
 @dataclass
@@ -315,6 +323,7 @@ class CardRenderConfig:
     cover_full_size: bool = False
     show_play_button: bool = False
     watermark: str = DEFAULT_CARD_WATERMARK
+    include_hot_comments: bool = False
 
     def include_text_in_card(self) -> bool:
         """文本是否并入卡片图所在的那条消息。"""
@@ -464,7 +473,7 @@ class MediaRelayConfig:
 class TranslationConfig:
     enabled: bool = False
     content_scope: str = "正文和标题"
-    output_mode: str = TRANSLATION_OUTPUT_CARD_AND_TEXT
+    apply_scope: str = TRANSLATION_APPLY_CARD_AND_TEXT
     target_language: str = "简体中文"
     llm_provider_source: str = "astrbot"
     astrbot_provider_id: str = ""
@@ -476,6 +485,11 @@ class TranslationConfig:
     max_completion_tokens: int = 4000
     request_timeout_seconds: int = 60
     max_text_chars_per_request: int = 4000
+
+    @property
+    def output_mode(self) -> str:
+        """兼容 v1.1.0 代码；值语义已改为译文应用范围。"""
+        return self.apply_scope
 
 
 @dataclass
@@ -682,6 +696,16 @@ class ConfigManager:
                     True,
                     "message.hot_comments.xiaohongshu",
                 ),
+                twitter=self._parse_bool(
+                    hot_comments.get("twitter", True),
+                    True,
+                    "message.hot_comments.twitter",
+                ),
+                xiaoheihe=self._parse_bool(
+                    hot_comments.get("xiaoheihe", True),
+                    True,
+                    "message.hot_comments.xiaoheihe",
+                ),
             ),
             card_render=CardRenderConfig(
                 enabled=bool(card_render.get("enable", False)),
@@ -711,6 +735,11 @@ class ConfigManager:
                 ),
                 watermark=self._parse_card_watermark(
                     card_render.get("watermark", DEFAULT_CARD_WATERMARK)
+                ),
+                include_hot_comments=self._parse_bool(
+                    card_render.get("include_hot_comments", False),
+                    False,
+                    "message.card_render.include_hot_comments",
                 ),
             ),
         )
@@ -856,9 +885,9 @@ class ConfigManager:
             content_scope=self._parse_translation_content_scope(
                 translation_raw.get("content_scope", "正文和标题")
             ),
-            output_mode=self._parse_translation_output_mode(
+            apply_scope=self._parse_translation_apply_scope(
                 translation_raw.get(
-                    "output_mode", TRANSLATION_OUTPUT_CARD_AND_TEXT
+                    "output_mode", TRANSLATION_APPLY_CARD_AND_TEXT
                 )
             ),
             target_language=self._parse_translation_target_language(
@@ -1089,6 +1118,14 @@ class ConfigManager:
             self.message.hot_comments.xiaohongshu,
             "xiaohongshu",
         )
+        twitter_hc = self._effective_hot_comment_count(
+            self.message.hot_comments.twitter,
+            "twitter",
+        )
+        xiaoheihe_hc = self._effective_hot_comment_count(
+            self.message.hot_comments.xiaoheihe,
+            "xiaoheihe",
+        )
         proxy_addr = self.proxy.address or None
 
         if self._enable_bilibili:
@@ -1131,6 +1168,7 @@ class ConfigManager:
                 XiaoheiheParser(
                     use_video_proxy=self.proxy.xiaoheihe_use_video_proxy,
                     proxy_url=proxy_addr,
+                    hot_comment_count=xiaoheihe_hc,
                 )
             )
         if self._enable_twitter:
@@ -1140,6 +1178,7 @@ class ConfigManager:
                     use_image_proxy=self.proxy.twitter_use_image_proxy,
                     use_video_proxy=self.proxy.twitter_use_video_proxy,
                     proxy_url=proxy_addr,
+                    hot_comment_count=twitter_hc,
                 )
             )
         if self._enable_pixiv:
@@ -1246,11 +1285,18 @@ class ConfigManager:
         return "正文和标题"
 
     @staticmethod
-    def _parse_translation_output_mode(value) -> str:
+    def _parse_translation_apply_scope(value) -> str:
         mode = str(value or "").strip()
-        if mode in TRANSLATION_OUTPUT_MODES:
+        if mode in TRANSLATION_APPLY_SCOPES:
             return mode
-        return TRANSLATION_OUTPUT_CARD_AND_TEXT
+        if mode in LEGACY_TRANSLATION_APPLY_SCOPES:
+            return LEGACY_TRANSLATION_APPLY_SCOPES[mode]
+        return TRANSLATION_APPLY_CARD_AND_TEXT
+
+    @staticmethod
+    def _parse_translation_output_mode(value) -> str:
+        """v1.1.0 兼容入口；新代码统一使用 apply_scope。"""
+        return ConfigManager._parse_translation_apply_scope(value)
 
     @staticmethod
     def _parse_card_watermark(value) -> str:

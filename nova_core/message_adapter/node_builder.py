@@ -1,17 +1,15 @@
 """消息节点构建器，将解析结果转换为可发送消息节点。"""
 
 import os
-from typing import Dict, Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from ..logger import logger
-
-from astrbot.api.message_components import Plain, Image, Video
+from astrbot.api.message_components import Image, Plain, Video
 
 from ..downloader.utils import strip_media_prefixes
+from ..logger import logger
 from ..message_text import split_message_text
 from ..metadata_visibility import text_metadata_field_enabled
 from ..types import BuildAllNodesResult, LinkBuildMeta
-
 
 TEXT_SECTION_SEPARATOR = "-------------------------------------"
 
@@ -80,15 +78,6 @@ def _mark_media_failure(
         metadata[count_key] = int(metadata.get(count_key, 0) or 0) + 1
     except (TypeError, ValueError):
         metadata[count_key] = 1
-
-
-def _translated_text(metadata: Dict[str, Any], field: str) -> str:
-    translated_fields = metadata.get("_translated_fields")
-    if isinstance(translated_fields, dict):
-        value = str(translated_fields.get(field) or "").strip()
-        if value:
-            return value
-    return ""
 
 
 def build_text_node(
@@ -262,39 +251,6 @@ def build_hot_comments_node(
 
     if len(text_parts) <= 1:
         return None
-    return Plain("\n".join(text_parts))
-
-
-def build_translation_node(
-    metadata: Dict[str, Any], enable_text_metadata: bool = True
-) -> Optional[Plain]:
-    """构建独立翻译节点，翻译内容不混入基础文本元数据。"""
-    if not enable_text_metadata:
-        return None
-
-    title_text = (
-        _translated_text(metadata, "title")
-        if text_metadata_field_enabled(metadata, "title")
-        else ""
-    )
-    desc_text = (
-        _translated_text(metadata, "desc")
-        if text_metadata_field_enabled(metadata, "description")
-        else ""
-    )
-    if not title_text and not desc_text:
-        return None
-
-    language = str(metadata.get("translation_target_language") or "").strip()
-    heading = f"翻译（{language}）" if language else "翻译"
-    text_parts = [heading]
-    if title_text:
-        text_parts.append(f"标题：{title_text}")
-    if desc_text:
-        if len(text_parts) > 1:
-            text_parts.append(TEXT_SECTION_SEPARATOR)
-        text_parts.append("简介/正文：")
-        text_parts.append(desc_text)
     return Plain("\n".join(text_parts))
 
 
@@ -479,7 +435,11 @@ def _build_node_parts_for_link(
     max_video_size_mb: float = 0.0,
     enable_text_metadata: bool = True,
     enable_rich_media: bool = True,
-) -> tuple[List[Union[Plain, Image, Video]], Optional[Plain]]:
+) -> tuple[
+    List[Union[Plain, Image, Video]],
+    Optional[Plain],
+    Dict[str, Any],
+]:
     nodes: List[Union[Plain, Image, Video]] = []
     effective_text_metadata = _resolve_output_flag(
         metadata,
@@ -508,28 +468,42 @@ def _build_node_parts_for_link(
     )
     text_nodes = _split_plain_node(text_node)
     hot_comments_nodes = _split_plain_node(hot_comments_node)
-    card_sent_separately = bool(
-        metadata.get("_card_sent_separately", False)
-    )
-    if card_sent_separately:
-        include_text = metadata.get("_card_include_text", True)
-        drop_text = metadata.get("_card_drop_text", False)
-        if not include_text and not drop_text:
-            nodes.extend(text_nodes)
-        elif drop_text and (
+    display_text_nodes = [*text_nodes, *hot_comments_nodes]
+    card_node: Optional[Image] = None
+    card_path = str(metadata.get("_card_file_path") or "").strip()
+    if card_path and os.path.isfile(card_path):
+        try:
+            card_node = Image.fromFileSystem(card_path)
+        except Exception as exc:
+            logger.warning(f"构建卡片图片节点失败: {card_path}, 错误: {exc}")
+
+    card_mode = str(metadata.get("_card_mode") or "").strip()
+    if card_node is None:
+        # 渲染失败时始终保留普通文本，避免卡片模式吞掉解析信息。
+        card_mode = ""
+        nodes.extend(display_text_nodes)
+    elif card_mode == "仅卡片":
+        display_text_nodes = []
+        if (
             text_metadata_field_enabled(metadata, "original_link")
             and metadata.get("url")
         ):
-            nodes.append(Plain(f"原始链接：{metadata['url']}"))
+            display_text_nodes.append(Plain(f"原始链接：{metadata['url']}"))
+        nodes.append(card_node)
+        nodes.extend(display_text_nodes)
     else:
-        # Rendering or sending the card failed; retain the normal text
-        # fallback instead of silently dropping metadata.
-        nodes.extend(text_nodes)
-    nodes.extend(hot_comments_nodes)
+        nodes.append(card_node)
+        nodes.extend(display_text_nodes)
     nodes.extend(media_nodes)
 
     metadata_text_node = text_nodes[0] if text_nodes else None
-    return nodes, metadata_text_node
+    delivery = {
+        "card_node": card_node,
+        "card_mode": card_mode,
+        "display_text_nodes": display_text_nodes,
+        "media_nodes": media_nodes,
+    }
+    return nodes, metadata_text_node, delivery
 
 
 def is_pure_image_gallery(nodes: List[Union[Plain, Image, Video]]) -> bool:
@@ -623,7 +597,7 @@ def build_all_nodes(
             f"大媒体: {is_large_media}, 使用本地文件: {use_local_files}"
         )
 
-        link_nodes, metadata_text_node = _build_node_parts_for_link(
+        link_nodes, metadata_text_node, delivery = _build_node_parts_for_link(
             metadata,
             use_local_files,
             max_video_size_mb,
@@ -668,6 +642,10 @@ def build_all_nodes(
                     video_files=link_video_files,
                     temp_files=link_temp_files,
                     metadata_text_node=metadata_text_node,
+                    card_node=delivery["card_node"],
+                    card_mode=delivery["card_mode"],
+                    display_text_nodes=delivery["display_text_nodes"],
+                    media_nodes=delivery["media_nodes"],
                 )
             )
         else:
@@ -681,19 +659,3 @@ def build_all_nodes(
     )
 
     return BuildAllNodesResult(all_link_nodes, link_metadata, temp_files, video_files)
-
-
-def build_translation_nodes_for_all(
-    metadata_list: List[Dict[str, Any]], enable_text_metadata: bool = True
-) -> List[List[Plain]]:
-    """按原 metadata 顺序构建翻译节点列表，空翻译保留空列表占位。"""
-    all_translation_nodes: List[List[Plain]] = []
-    for metadata in metadata_list:
-        effective_text_metadata = _resolve_output_flag(
-            metadata,
-            "_enable_text_metadata",
-            enable_text_metadata,
-        )
-        node = build_translation_node(metadata, effective_text_metadata)
-        all_translation_nodes.append(_split_plain_node(node))
-    return all_translation_nodes

@@ -56,6 +56,21 @@ class TwitterParserTests(unittest.TestCase):
 
         self.assertEqual(result["avatar_url"], "")
 
+    def test_logged_out_public_replies_are_normalized_and_sorted(self):
+        html = """
+        {"@id":"https://x.com/low/status/101","@type":"Comment",author:$R[1]={alternateName:"low",name:"Low Reply",identifier:"11",image:"https://cdn.example/low.jpg"},commentCount:0,datePublished:"2026-08-24T01:02:03Z",identifier:"101",interactionStatistic:[{interactionType:"https://schema.org/LikeAction",userInteractionCount:2}],text:"Low &amp; reply"}
+        {"@id":"https://x.com/high/status/102","@type":"Comment",author:$R[2]={alternateName:"high",name:"High Reply",identifier:"22",image:"https://cdn.example/high.jpg"},commentCount:0,datePublished:"2026-08-24T02:03:04Z",identifier:"102",interactionStatistic:[{interactionType:"https://schema.org/LikeAction",userInteractionCount:19}],text:"High reply with \\"quote\\""}
+        """
+
+        comments = TwitterParser._parse_logged_out_comments_html(html, 2)
+
+        self.assertEqual([item["comment_id"] for item in comments], ["102", "101"])
+        self.assertEqual(comments[0]["username"], "High Reply(@high)")
+        self.assertEqual(comments[0]["uid"], "22")
+        self.assertEqual(comments[0]["likes"], 19)
+        self.assertEqual(comments[0]["message"], 'High reply with "quote"')
+        self.assertEqual(comments[1]["message"], "Low & reply")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,6 @@ from ..logger import logger
 from ..metadata_visibility import text_metadata_field_enabled
 from .llm_client import LLMClient
 
-
 TRANSLATION_SYSTEM_PROMPT = """你是严格的翻译引擎，只执行翻译任务。
 
 规则：
@@ -50,7 +49,7 @@ def build_card_metadata_list(
     metadata_list: List[Dict[str, Any]],
     translated_metadata_list: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """复制下载后的 metadata，并把翻译字段合并到卡片专用副本。"""
+    """复制 metadata，并把标题、正文和热评译文合并到展示副本。"""
     card_metadata_list = copy.deepcopy(metadata_list)
     for index, card_metadata in enumerate(card_metadata_list):
         if index >= len(translated_metadata_list):
@@ -58,11 +57,33 @@ def build_card_metadata_list(
         translated_metadata = translated_metadata_list[index]
         translated_fields = translated_metadata.get("_translated_fields")
         if not isinstance(translated_fields, dict):
-            continue
+            translated_fields = {}
         for field in ("title", "desc"):
             translated = str(translated_fields.get(field) or "").strip()
             if translated:
                 card_metadata[field] = translated
+
+        card_comments = card_metadata.get("hot_comments")
+        translated_comments = translated_metadata.get("hot_comments")
+        if isinstance(card_comments, list) and isinstance(translated_comments, list):
+            for comment_index, card_comment in enumerate(card_comments):
+                if (
+                    not isinstance(card_comment, dict)
+                    or comment_index >= len(translated_comments)
+                    or not isinstance(translated_comments[comment_index], dict)
+                ):
+                    continue
+                translated_message = str(
+                    translated_comments[comment_index].get("_translated_message") or ""
+                ).strip()
+                if translated_message:
+                    card_comment["message"] = translated_message
+
+        language = str(
+            translated_metadata.get("translation_target_language") or ""
+        ).strip()
+        if language:
+            card_metadata["translation_target_language"] = language
     return card_metadata_list
 
 
@@ -165,17 +186,51 @@ class MetadataTranslator:
                     metadata.get("desc"),
                     target_language,
                 )
-            if not items:
-                continue
-            total_chars = sum(len(item["text"]) for item in items)
-            if total_chars > max_chars:
+            hot_comments = metadata.get("hot_comments")
+            if isinstance(hot_comments, list):
+                for comment_idx, comment in enumerate(hot_comments):
+                    if not isinstance(comment, dict):
+                        continue
+                    self._append_text_item(
+                        items,
+                        meta_idx,
+                        f"comment:{comment_idx}",
+                        comment.get("message"),
+                        target_language,
+                    )
+            item_groups.extend(
+                self._split_items_by_size(items, max_chars, meta_idx=meta_idx)
+            )
+        return item_groups
+
+    @staticmethod
+    def _split_items_by_size(
+        items: List[Dict[str, str]],
+        max_chars: int,
+        *,
+        meta_idx: int,
+    ) -> List[List[Dict[str, str]]]:
+        """按字符预算分批，避免一条长正文拖累同链接的其他可译字段。"""
+        groups: List[List[Dict[str, str]]] = []
+        current: List[Dict[str, str]] = []
+        current_chars = 0
+        for item in items:
+            text_len = len(item["text"])
+            if text_len > max_chars:
                 logger.debug(
-                    f"跳过过长链接文本翻译: metadata={meta_idx} "
-                    f"chars={total_chars} limit={max_chars}"
+                    f"跳过过长翻译字段: metadata={meta_idx} "
+                    f"id={item['id']} chars={text_len} limit={max_chars}"
                 )
                 continue
-            item_groups.append(items)
-        return item_groups
+            if current and current_chars + text_len > max_chars:
+                groups.append(current)
+                current = []
+                current_chars = 0
+            current.append(item)
+            current_chars += text_len
+        if current:
+            groups.append(current)
+        return groups
 
     @classmethod
     def _append_text_item(
@@ -382,6 +437,23 @@ class MetadataTranslator:
                 translated_fields = metadata.setdefault("_translated_fields", {})
                 if isinstance(translated_fields, dict):
                     translated_fields[field] = translated
+                metadata["translation_target_language"] = language
+                continue
+            if field.startswith("comment:"):
+                _, _, comment_index_text = field.partition(":")
+                try:
+                    comment_index = int(comment_index_text)
+                except (TypeError, ValueError):
+                    continue
+                comments = metadata.get("hot_comments")
+                if (
+                    not isinstance(comments, list)
+                    or comment_index < 0
+                    or comment_index >= len(comments)
+                    or not isinstance(comments[comment_index], dict)
+                ):
+                    continue
+                comments[comment_index]["_translated_message"] = translated
                 metadata["translation_target_language"] = language
                 continue
 

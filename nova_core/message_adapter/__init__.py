@@ -3,14 +3,9 @@
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-
 _EXPORTS = {
     "MessageSender": (".sender", "MessageSender"),
     "build_all_nodes": (".node_builder", "build_all_nodes"),
-    "build_translation_nodes_for_all": (
-        ".node_builder",
-        "build_translation_nodes_for_all",
-    ),
     "is_pure_image_gallery": (".node_builder", "is_pure_image_gallery"),
     "summarize_node_counts": (".node_builder", "summarize_node_counts"),
 }
@@ -18,7 +13,6 @@ _EXPORTS = {
 __all__ = (
     "MessageSender",
     "build_all_nodes",
-    "build_translation_nodes_for_all",
     "is_pure_image_gallery",
     "summarize_node_counts",
 )
@@ -27,8 +21,11 @@ __all__ = (
 if TYPE_CHECKING:
     from .node_builder import (
         build_all_nodes as build_all_nodes,
-        build_translation_nodes_for_all as build_translation_nodes_for_all,
+    )
+    from .node_builder import (
         is_pure_image_gallery as is_pure_image_gallery,
+    )
+    from .node_builder import (
         summarize_node_counts as summarize_node_counts,
     )
     from .sender import MessageSender as MessageSender

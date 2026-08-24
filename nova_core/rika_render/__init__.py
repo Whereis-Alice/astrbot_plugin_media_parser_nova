@@ -1,6 +1,7 @@
 """rika 风格卡片渲染器（移植自 astrbot_plugin_rika_share，MIT）。"""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -64,6 +65,26 @@ async def render_card_rika(
         if _images:
             _i = _images[0]
             parts.append("i:" + str(_i[0] if isinstance(_i, list) else _i))
+        parts.append(
+            "meta:"
+            + json.dumps(
+                {
+                    "title": metadata.get("title"),
+                    "author": metadata.get("author"),
+                    "desc": metadata.get("desc"),
+                    "timestamp": metadata.get("timestamp"),
+                    "language": metadata.get("translation_target_language"),
+                    "comments": (
+                        metadata.get("hot_comments")
+                        if metadata.get("_card_include_hot_comments")
+                        else []
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        )
         key = cache_key or "|".join(parts)
         return await renderer.render(result, cache_key=key)
     except Exception as e:
