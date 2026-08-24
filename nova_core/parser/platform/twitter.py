@@ -269,7 +269,8 @@ class TwitterParser(BaseVideoParser):
         media_urls = {
             'images': [],
             'videos': [],
-            'title': f"{author} 的推文" if author else "Twitter 推文",
+            # 普通推文没有独立标题，作者信息已经由 author 字段展示。
+            'title': "",
             'text': desc,
             'author': self._combine_parenthetical(
                 author,
@@ -543,7 +544,7 @@ class TwitterParser(BaseVideoParser):
         return {
             "images": images,
             "videos": videos,
-            "title": f"{author} 的推文" if author else "Twitter 推文",
+            "title": "",
             "text": desc,
             "author": self._combine_parenthetical(
                 author,
@@ -804,7 +805,7 @@ class TwitterParser(BaseVideoParser):
 
             metadata_base = {
                 "url": url,
-                "title": title or (f"{author} 的推文" if author else "Twitter 推文"),
+                "title": str(title or "").strip(),
                 "author": author,
                 "avatar_url": str(media_info.get("avatar_url") or ""),
                 "desc": text,

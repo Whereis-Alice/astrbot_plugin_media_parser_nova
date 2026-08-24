@@ -288,17 +288,17 @@
                         "default": ""
                     },
                     "theme": {
-                        "description": "卡片主题",
+                        "description": "Nova 原生主题",
                         "type": "string",
                         "options": [
                             "深色",
                             "浅色"
                         ],
-                        "hint": "深色 = 深海军蓝渐变；浅色 = 明亮渐变",
+                        "hint": "仅 Nova 原生皮肤使用：深色 = 深海军蓝渐变，浅色 = 明亮渐变。编辑室、信号终端、海报档案、霓虹夜景和哔哩哔哩风格使用各自固定配色，不受本项影响。",
                         "default": "深色"
                     },
                     "layout": {
-                        "description": "卡片布局",
+                        "description": "Nova 原生布局",
                         "type": "string",
                         "options": [
                             "标准",

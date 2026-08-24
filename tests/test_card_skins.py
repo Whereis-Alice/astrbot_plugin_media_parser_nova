@@ -201,6 +201,150 @@ class CardSkinRenderTests(unittest.TestCase):
                     f"{layout} layout did not draw the complete URL",
                 )
 
+    def test_titleless_social_posts_promote_body_once(self):
+        body = "星星眼很可爱"
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            author=Author(name="SwagKirb", description="@Swag_K1RBY"),
+            title=None,
+            text=body,
+            url="https://x.com/i/status/2091687989021667511",
+            extra={"content_type": "图文"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            avatar_path = root / "avatar.png"
+            hero_path = root / "hero.png"
+            Image.new("RGB", (180, 180), (70, 190, 240)).save(avatar_path)
+            Image.new("RGB", (960, 640), (242, 126, 164)).save(hero_path)
+
+            for skin in ("editorial", "signal", "poster", "neon", "bilibili"):
+                renderer = ShareCardRenderer(
+                    cache_dir=root,
+                    skin=skin,
+                    width=720,
+                    watermark="Alice解析",
+                )
+                drawn_text: list[str] = []
+                original_draw_text = renderer._draw_text
+
+                def capture_draw_text(draw, xy, text, size, fill, bold=False):
+                    drawn_text.append(str(text))
+                    return original_draw_text(draw, xy, text, size, fill, bold)
+
+                renderer._draw_text = capture_draw_text
+                renderer._render_sync(
+                    result,
+                    {"avatar": avatar_path, "hero": None, "grid": [hero_path]},
+                    root / f"titleless-{skin}.png",
+                )
+
+                expected_draw_count = 3 if skin == "neon" else 1
+                self.assertEqual(drawn_text.count(body), expected_draw_count, skin)
+                self.assertFalse(
+                    any("UNTITLED" in text or "未命名" in text for text in drawn_text),
+                    skin,
+                )
+
+    def test_signal_two_image_post_uses_second_media_window(self):
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            author=Author(name="SwagKirb", description="@Swag_K1RBY"),
+            title=None,
+            text="卡比拥有星星眼。",
+            url="https://x.com/i/status/2091687989021667511",
+            extra={"content_type": "图文"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_path = root / "first.png"
+            second_path = root / "second.png"
+            Image.new("RGB", (900, 900), (242, 126, 164)).save(first_path)
+            Image.new("RGB", (1200, 600), (70, 190, 240)).save(second_path)
+            renderer = ShareCardRenderer(
+                cache_dir=root,
+                skin="signal",
+                width=800,
+                watermark="Alice解析",
+            )
+            drawn_text: list[str] = []
+            original_draw_text = renderer._draw_text
+
+            def capture_draw_text(draw, xy, text, size, fill, bold=False):
+                drawn_text.append(str(text))
+                return original_draw_text(draw, xy, text, size, fill, bold)
+
+            renderer._draw_text = capture_draw_text
+            two_image_path = root / "signal-two.png"
+            renderer._render_sync(
+                result,
+                {"avatar": None, "hero": None, "grid": [first_path, second_path]},
+                two_image_path,
+            )
+            one_image_path = root / "signal-one.png"
+            renderer._render_sync(
+                result,
+                {"avatar": None, "hero": None, "grid": [first_path]},
+                one_image_path,
+            )
+
+            self.assertIn("MEDIA WINDOW 02", drawn_text)
+            with Image.open(two_image_path) as two_image, Image.open(one_image_path) as one_image:
+                self.assertGreater(two_image.height, one_image.height + 120)
+
+    def test_advanced_skin_theme_and_layout_do_not_change_poster_archive(self):
+        result = ParseResult(
+            platform=Platform(name="twitter", display_name="推特"),
+            author=Author(name="SwagKirb", description="@Swag_K1RBY"),
+            title="真实标题",
+            text="正文",
+            url="https://x.com/i/status/2091687989021667511",
+            extra={
+                "content_type": "图文",
+                "hot_comments": [
+                    {
+                        "username": "Reader",
+                        "uid": "10001",
+                        "likes": 3,
+                        "time": "2026-08-24 01:00:00",
+                        "message": "主题隔离测试。",
+                    }
+                ],
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hero_path = root / "hero.png"
+            Image.new("RGB", (960, 640), (242, 126, 164)).save(hero_path)
+            dark = ShareCardRenderer(
+                cache_dir=root,
+                skin="poster",
+                theme="dark",
+                layout="standard",
+                width=720,
+            )
+            light = ShareCardRenderer(
+                cache_dir=root,
+                skin="poster",
+                theme="light",
+                layout="magazine",
+                width=720,
+            )
+            dark_path = root / "poster-dark.png"
+            light_path = root / "poster-light.png"
+            images = {"avatar": None, "hero": None, "grid": [hero_path]}
+            dark._render_sync(result, images, dark_path)
+            light._render_sync(result, images, light_path)
+
+            self.assertEqual(dark_path.read_bytes(), light_path.read_bytes())
+            self.assertEqual(
+                dark._output_path("same-card", result),
+                light._output_path("same-card", result),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

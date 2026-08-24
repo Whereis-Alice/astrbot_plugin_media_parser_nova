@@ -46,6 +46,27 @@ class TwitterParserTests(unittest.TestCase):
         self.assertEqual(result["avatar_url"], "https://cdn.example/avatar.jpg")
         self.assertEqual(result["desc"], "hello")
 
+    def test_parse_does_not_generate_redundant_tweet_title(self):
+        parser = TwitterParser()
+        parser._fetch_media_info = AsyncMock(
+            return_value={
+                "images": ["https://cdn.example/one.jpg"],
+                "videos": [],
+                "text": "卡比拥有星星眼。",
+                "title": "",
+                "author": "SwagKirb(@Swag_K1RBY)",
+                "avatar_url": "https://cdn.example/avatar.jpg",
+                "timestamp": "2026-08-24 00:44:12",
+            }
+        )
+
+        result = asyncio.run(
+            parser.parse(None, "https://x.com/Swag_K1RBY/status/2091687989021667511")
+        )
+
+        self.assertEqual(result["title"], "")
+        self.assertEqual(result["author"], "SwagKirb(@Swag_K1RBY)")
+
     def test_parser_manager_adds_avatar_fallback(self):
         manager = ParserManager([])
         parser = SimpleNamespace(name="twitter")

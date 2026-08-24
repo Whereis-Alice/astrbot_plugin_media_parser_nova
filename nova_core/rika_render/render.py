@@ -97,7 +97,7 @@ _STAT_LABELS = {
 
 
 # 卡片样式版本：视觉样式变化时 +1，使已缓存的旧卡片失效并重新渲染
-_CARD_STYLE_VERSION = "16"
+_CARD_STYLE_VERSION = "17"
 
 
 def strip_emoji(text: str | None) -> str:
@@ -684,6 +684,26 @@ class ShareCardRenderer:
         return img.crop((x, y, x + box_w, y + box_h))
 
     @staticmethod
+    def _contain_fit(
+        image: Image.Image,
+        box_w: int,
+        box_h: int,
+        background: tuple[int, int, int],
+    ) -> Image.Image:
+        """等比缩放并完整放入目标区域，空白处使用指定背景填充。"""
+        img = ImageOps.contain(
+            image.convert("RGB"),
+            (box_w, box_h),
+            method=_LANCZOS,
+        )
+        canvas = Image.new("RGB", (box_w, box_h), background)
+        canvas.paste(
+            img,
+            ((box_w - img.width) // 2, (box_h - img.height) // 2),
+        )
+        return canvas
+
+    @staticmethod
     def _rounded_image(image: Image.Image, radius: int) -> Image.Image:
         img = image.convert("RGBA")
         mask = Image.new("L", img.size, 0)
@@ -811,8 +831,10 @@ class ShareCardRenderer:
             cache_key
             or f"{result.platform.name}|{result.title}|{result.timestamp}|{result.url}"
         )
+        theme_key = self.theme_name if self.skin_name == "nova" else "skin-fixed"
+        layout_key = self.layout_name if self.skin_name == "nova" else "skin-independent"
         digest = hashlib.md5(
-            f"{_CARD_STYLE_VERSION}|{self.skin_name}|{self.theme_name}|{self.width}|{self.layout_name}|{self.cover_full_size}|{self.show_play_button}|{self.watermark}|{payload}|{warnings_str}".encode("utf-8")
+            f"{_CARD_STYLE_VERSION}|{self.skin_name}|{theme_key}|{self.width}|{layout_key}|{self.cover_full_size}|{self.show_play_button}|{self.watermark}|{payload}|{warnings_str}".encode("utf-8")
         ).hexdigest()[:16]
         return self.cache_dir / f"card_{digest}.png"
 
@@ -1278,21 +1300,30 @@ class ShareCardRenderer:
         right_w = max(180, inner_w - left_w - gap)
         body_y = 96
 
-        title_text = d["title"] or "未命名内容"
-        title_size = 36
-        title_lines = self._wrap(
-            title_text,
-            self._font(title_size, bold=True),
-            right_w,
-        )
-        while title_size > 24 and len(title_lines) > 4:
-            title_size -= 2
-            title_lines = self._wrap(
-                title_text,
+        headline_text, body_text, has_real_title = self._advanced_copy(d)
+        title_size = 36 if has_real_title else 29
+        title_lines = (
+            self._wrap(
+                headline_text,
                 self._font(title_size, bold=True),
                 right_w,
             )
-        desc_lines = self._fit_lines(d["text"], self._font(22), right_w, 5) if d["text"] else []
+            if headline_text
+            else []
+        )
+        max_title_lines = 4 if has_real_title else 6
+        while title_size > 22 and len(title_lines) > max_title_lines:
+            title_size -= 2
+            title_lines = self._wrap(
+                headline_text,
+                self._font(title_size, bold=True),
+                right_w,
+            )
+        desc_lines = (
+            self._fit_lines(body_text, self._font(22), right_w, 5)
+            if body_text
+            else []
+        )
         author_name_size = 20
         author_name_lines: list[str] = []
         author_desc_size = 14
@@ -1631,10 +1662,32 @@ class ShareCardRenderer:
             min(480, round(hero_w * 0.72)),
             57 + telemetry_fields_h + 68,
         )
-        title_font = self._font(34, bold=True)
-        title_lines = self._fit_lines(d["title"] or "UNTITLED SIGNAL", title_font, inner_w, 2)
-        desc_lines = self._fit_lines(d["text"], self._font(21), inner_w, 3) if d["text"] else []
+        headline_text, body_text, has_real_title = self._advanced_copy(d)
+        title_size = 34 if has_real_title else 28
+        title_font = self._font(title_size, bold=True)
+        title_lines = (
+            self._fit_lines(
+                headline_text,
+                title_font,
+                inner_w,
+                2 if has_real_title else 4,
+            )
+            if headline_text
+            else []
+        )
+        desc_lines = (
+            self._fit_lines(body_text, self._font(21), inner_w, 3)
+            if body_text
+            else []
+        )
+        title_line_h = title_size + 12
         grid_count = min(len(d["grid"]), 4)
+        two_image_post = not d["is_video_hero"] and grid_count == 1
+        secondary_media_h = (
+            max(170, min(280, round(inner_w * 0.32)))
+            if two_image_post
+            else 68
+        )
         signal_url_lines, signal_url_size, signal_url_line_h = self._url_layout(
             result,
             inner_w,
@@ -1643,11 +1696,11 @@ class ShareCardRenderer:
             target_lines=5,
         )
         signal_footer_h = 78 + len(signal_url_lines) * signal_url_line_h
-        lower_h = 34 + len(title_lines) * 46 + (len(desc_lines) * 31 + 18 if desc_lines else 0)
+        lower_h = 34 + len(title_lines) * title_line_h + (len(desc_lines) * 31 + 18 if desc_lines else 0)
         if d["stats"]:
             lower_h += 62
         if grid_count:
-            lower_h += 88
+            lower_h += secondary_media_h + (26 if two_image_post else 20)
         card_h = max(
             560,
             top_y + hero_h + lower_h + signal_footer_h + 36,
@@ -1740,7 +1793,20 @@ class ShareCardRenderer:
         hero_box = (pad, top_y, pad + hero_w, top_y + hero_h)
         try:
             if hero:
-                hero_img = self._cover_fit(self._open_image(hero), hero_w, hero_h).convert("RGBA")
+                source_image = self._open_image(hero)
+                if two_image_post:
+                    hero_img = self._contain_fit(
+                        source_image,
+                        hero_w,
+                        hero_h,
+                        panel,
+                    ).convert("RGBA")
+                else:
+                    hero_img = self._cover_fit(
+                        source_image,
+                        hero_w,
+                        hero_h,
+                    ).convert("RGBA")
             else:
                 hero_img = self._fallback_cover(
                     hero_w, hero_h, _THEMES["dark"], accent_rgb, 0
@@ -1878,8 +1944,8 @@ class ShareCardRenderer:
         self._draw_text(draw, (pad, y), "CONTENT SIGNAL", 13, cyan, bold=True)
         y += 23
         for line in title_lines:
-            self._draw_text(draw, (pad, y), line, 34, ink, bold=True)
-            y += 46
+            self._draw_text(draw, (pad, y), line, title_size, ink, bold=True)
+            y += title_line_h
         if desc_lines:
             y += 3
             for line in desc_lines:
@@ -1898,7 +1964,45 @@ class ShareCardRenderer:
                 self._draw_text(draw, (pad, y), line, 15, ink, bold=True)
                 y += 24
             y += 5
-        if d["grid"]:
+        if two_image_post:
+            media_y = y + 4
+            try:
+                secondary = self._contain_fit(
+                    self._open_image(d["grid"][0]),
+                    inner_w,
+                    secondary_media_h,
+                    panel,
+                ).convert("RGBA")
+                secondary.alpha_composite(
+                    Image.new("RGBA", secondary.size, (*cyan, 10))
+                )
+                card.alpha_composite(secondary, (pad, media_y))
+            except Exception:
+                draw.rectangle(
+                    (pad, media_y, self.width - pad, media_y + secondary_media_h),
+                    fill=(*panel, 230),
+                )
+            draw = ImageDraw.Draw(card)
+            draw.rectangle(
+                (pad, media_y, self.width - pad - 1, media_y + secondary_media_h - 1),
+                outline=(*cyan, 190),
+                width=2,
+            )
+            self._draw_text(
+                draw,
+                (pad + 14, media_y + 12),
+                "MEDIA WINDOW 02",
+                12,
+                (255, 255, 255, 230),
+                bold=True,
+            )
+            draw.line(
+                (pad + 14, media_y + 33, pad + 116, media_y + 33),
+                fill=(*accent_rgb, 220),
+                width=2,
+            )
+            y = media_y + secondary_media_h + 10
+        elif d["grid"]:
             thumb_w = max(1, (inner_w - gap * 3) // 4)
             thumb_y = y + 3
             for idx, path in enumerate(d["grid"][:4]):
@@ -2210,22 +2314,30 @@ class ShareCardRenderer:
         print_y = 122
         hero_h = max(280, min(500, round(print_w * 0.66)))
 
-        title_size = 38 if self.width >= 680 else 31
-        title_lines = self._fit_lines(
-            d["title"] or "未命名档案",
-            self._font(title_size, bold=True),
-            inner_w - 42,
-            4,
+        headline_text, body_text, has_real_title = self._advanced_copy(d)
+        if has_real_title:
+            title_size = 38 if self.width >= 680 else 31
+        else:
+            title_size = 30 if self.width >= 680 else 26
+        title_lines = (
+            self._fit_lines(
+                headline_text,
+                self._font(title_size, bold=True),
+                inner_w - 42,
+                4 if has_real_title else 6,
+            )
+            if headline_text
+            else []
         )
         desc_size = 19 if self.width >= 680 else 17
         desc_lines = (
             self._fit_lines(
-                d["text"],
+                body_text,
                 self._font(desc_size),
                 inner_w - 42,
                 5,
             )
-            if d["text"]
+            if body_text
             else []
         )
         author_name_size = 20 if self.width >= 680 else 17
@@ -2595,17 +2707,25 @@ class ShareCardRenderer:
             + 18
         )
         media_h = max(media_h, required_rail_h)
-        title_size = 38 if self.width >= 680 else 31
-        title_lines = self._fit_lines(
-            d["title"] or "UNTITLED NEON",
-            self._font(title_size, bold=True),
-            inner_w,
-            4,
+        headline_text, body_text, has_real_title = self._advanced_copy(d)
+        if has_real_title:
+            title_size = 38 if self.width >= 680 else 31
+        else:
+            title_size = 31 if self.width >= 680 else 27
+        title_lines = (
+            self._fit_lines(
+                headline_text,
+                self._font(title_size, bold=True),
+                inner_w,
+                4 if has_real_title else 5,
+            )
+            if headline_text
+            else []
         )
         desc_size = 20 if self.width >= 680 else 17
         desc_lines = (
-            self._fit_lines(d["text"], self._font(desc_size), inner_w, 5)
-            if d["text"]
+            self._fit_lines(body_text, self._font(desc_size), inner_w, 5)
+            if body_text
             else []
         )
         stats = d["stats"][:6]
@@ -2893,17 +3013,25 @@ class ShareCardRenderer:
         hero_h = max(250, round(inner_w * 9 / 16))
         if d["hero"] and self.cover_full_size:
             hero_h = self._hero_aspect_height(d["hero"], inner_w, hero_h)
-        title_size = 32 if self.width >= 680 else 27
-        title_lines = self._fit_lines(
-            d["title"] or "未命名动态",
-            self._font(title_size, bold=True),
-            inner_w,
-            4,
+        headline_text, body_text, has_real_title = self._advanced_copy(d)
+        if has_real_title:
+            title_size = 32 if self.width >= 680 else 27
+        else:
+            title_size = 24 if self.width >= 680 else 22
+        title_lines = (
+            self._fit_lines(
+                headline_text,
+                self._font(title_size, bold=True),
+                inner_w,
+                4 if has_real_title else 6,
+            )
+            if headline_text
+            else []
         )
         desc_size = 19 if self.width >= 680 else 17
         desc_lines = (
-            self._fit_lines(d["text"], self._font(desc_size), inner_w, 6)
-            if d["text"]
+            self._fit_lines(body_text, self._font(desc_size), inner_w, 6)
+            if body_text
             else []
         )
         stats = d["stats"][:6]
@@ -3684,6 +3812,13 @@ class ShareCardRenderer:
             y += _L.F_QUOTE_LINE_H
 
     # ==================== 备选布局共享组件 ====================
+
+    @staticmethod
+    def _advanced_copy(d: dict[str, Any]) -> tuple[str, str, bool]:
+        """高级皮肤没有真实标题时提升正文，且不重复绘制同一段内容。"""
+        title = str(d.get("title") or "").strip()
+        text = str(d.get("text") or "").strip()
+        return title or text, text if title else "", bool(title)
 
     def _prep(self, result: ParseResult, images: dict[str, Any]) -> dict[str, Any]:
         """备选布局的公共数据准备。"""
