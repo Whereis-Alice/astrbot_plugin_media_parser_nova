@@ -233,7 +233,7 @@ class BuildStatsLineTests(unittest.TestCase):
     def test_orders_icons_and_skips_missing(self):
         self.assertEqual(
             nitter.build_stats_line({"likes": "10", "views": "3,000"}),
-            "\u2764\ufe0f10 \U0001f4403,000",
+            "\u2764\ufe0f10 \U0001f4c83,000",
         )
 
     def test_returns_blank_for_empty_stats(self):
@@ -255,7 +255,7 @@ class ParseThreadTests(unittest.TestCase):
         )
         self.assertEqual(
             result["stats_line"],
-            "\u2764\ufe0f25,680 \u21a9\ufe0f6,081 \U0001f4ac83 \U0001f440867,413",
+            "\u2764\ufe0f25,680 \u21a9\ufe0f6,081 \U0001f4ac83 \U0001f4c8867,413",
         )
         self.assertEqual(
             result["author_avatar"],

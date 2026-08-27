@@ -48,7 +48,7 @@ DEFAULT_WATERMARK_TAG = "Nova解析"
 
 #: 卡片样式版本：视觉变化时必须 +1，否则用户侧已缓存的旧卡片不会重新渲染。
 #: 19 = 全新 nova_core.card 设计系统（主题 / 布局 / 深浅色三者全部生效）。
-_CARD_STYLE_VERSION = "22"
+_CARD_STYLE_VERSION = "23"
 
 #: 布局与风格枚举（直接取自设计系统，避免两处枚举漂移）
 LAYOUT_NAMES: tuple[str, ...] = LAYOUT_KEYS

@@ -434,52 +434,6 @@ def heart(target: Any, box: tuple[int, int, int, int], color: RGBA) -> None:
     target.alpha_composite(big.resize((w, h), LANCZOS), (x0, y0))
 
 
-def bili_logo(target: Any, box: tuple[int, int, int, int], color: RGBA) -> None:
-    """绘制哔哩哔哩「小电视」标志。
-
-    纯几何绘制（超采样 4x 后缩小），不依赖任何字体或图片素材，
-    因此宿主环境缺少字形也不会渲染成豆腐块。
-    """
-    x0, y0, x1, y1 = (int(v) for v in box)
-    w, h = x1 - x0, y1 - y0
-    if w <= 6 or h <= 6:
-        return
-    s = 4
-    big_w, big_h = w * s, h * s
-    big = Image.new("RGBA", (big_w, big_h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(big)
-    stroke = max(2, int(round(big_w * 0.085)))
-    body_top = int(big_h * 0.30)
-    # 两根天线（先画，机身随后覆盖接缝）
-    d.line(
-        [(int(big_w * 0.31), body_top + stroke), (int(big_w * 0.11), int(big_h * 0.07))],
-        fill=color,
-        width=stroke,
-    )
-    d.line(
-        [(int(big_w * 0.69), body_top + stroke), (int(big_w * 0.89), int(big_h * 0.07))],
-        fill=color,
-        width=stroke,
-    )
-    # 机身
-    d.rounded_rectangle(
-        (0, body_top, big_w - 1, big_h - 1),
-        radius=int(big_w * 0.19),
-        fill=color,
-    )
-    # 双眼（直接写入透明像素以挖空）
-    eye_w = max(2, int(big_w * 0.11))
-    eye_h = max(2, int((big_h - body_top) * 0.30))
-    eye_y = body_top + int((big_h - body_top) * 0.26)
-    for cx in (int(big_w * 0.33), int(big_w * 0.67)):
-        d.rounded_rectangle(
-            (cx - eye_w // 2, eye_y, cx + eye_w // 2, eye_y + eye_h),
-            radius=eye_w // 2,
-            fill=(0, 0, 0, 0),
-        )
-    target.alpha_composite(big.resize((w, h), LANCZOS), (x0, y0))
-
-
 def _star_points(cx: float, cy: float, outer: float, inner: float) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     for index in range(10):

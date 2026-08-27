@@ -61,12 +61,13 @@ _HANDLE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_]")
 _UNAVAILABLE_RE = re.compile(r'class="[^"]*\bunavailable[\w-]*\b')
 
 #: Nitter 统计图标 -> 卡片 stats_line 使用的 emoji 前缀。
-#: 顺序即卡片展示顺序：喜欢 / 转发 / 评论 / 阅读。
+#: 顺序即卡片展示顺序：喜欢 / 转发 / 评论 / 浏览。
+#: views 用 📈（浏览）而不是 👀（播放）——推文的这个数字是曝光量，不是播放次数。
 NITTER_STAT_ICONS: Tuple[Tuple[str, str, str], ...] = (
     ("heart", "likes", "\u2764\ufe0f"),
     ("retweet", "retweets", "\u21a9\ufe0f"),
     ("comment", "replies", "\U0001f4ac"),
-    ("views", "views", "\U0001f440"),
+    ("views", "views", "\U0001f4c8"),
 )
 
 

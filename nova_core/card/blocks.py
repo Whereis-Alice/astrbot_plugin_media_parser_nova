@@ -294,8 +294,8 @@ class EyebrowBlock(Block):
     def _measure(self, ctx: Any, width: int) -> int:
         m = ctx.m
         if self.variant == "bili_top":
-            brand_f = ctx.font(int(m.f_subtitle * 1.02), bold=True)
-            row = max(m.chip_h, ctx.ts.line_height(brand_f, 1.0))
+            title_f = ctx.font(int(m.f_subtitle * 1.02), bold=True)
+            row = max(m.chip_h, ctx.ts.line_height(title_f, 1.0))
             return row + m.gap_md + 1
         if self.variant == "chip":
             return m.chip_h
@@ -309,11 +309,14 @@ class EyebrowBlock(Block):
         return max(m.unit * 2, ctx.ts.line_height(f, 1.0)) + m.gap_xs + 1
 
     def _draw_bili_top(self, ctx: Any, layer: Any, x: int, y: int, width: int) -> None:
-        """仿 B 站手机端动态详情页顶栏：返回箭头 + 小电视字标 + 分区标签 + 右侧更多。"""
+        """仿 B 站手机端动态详情页顶栏：返回箭头 + 来源标题 + 右侧更多。
+
+        不画站点字标 / 图标：这张卡片的内容可能来自任意平台，硬贴一个站点标记
+        既与右侧来源信息重复，也会和正文的真实出处冲突。
+        """
         m, model = ctx.m, ctx.model
-        brand_f = ctx.font(int(m.f_subtitle * 1.02), bold=True)
-        meta_f = ctx.font(m.f_meta)
-        row = max(m.chip_h, ctx.ts.line_height(brand_f, 1.0))
+        title_f = ctx.font(int(m.f_subtitle * 1.02), bold=True)
+        row = max(m.chip_h, ctx.ts.line_height(title_f, 1.0))
         mid = y + row // 2
 
         nav = max(10, int(row * 0.56))
@@ -335,55 +338,20 @@ class EyebrowBlock(Block):
         )
         right_limit = x + width - more_w - m.gap_md
 
+        # 顶栏正题只写来源站点名，等价于 B 站详情页的"返回 + 标题"；
+        # 内容类型（图文/视频）已由正文与媒体区块本身表达，不再另贴标签。
         cursor = x + back_w + m.gap_md
-        logo_h = int(row * 0.66)
-        logo_w = int(logo_h * 1.18)
-        surface.bili_logo(
-            layer,
-            (cursor, mid - logo_h // 2, cursor + logo_w, mid - logo_h // 2 + logo_h),
-            alpha(ctx.accent, 255),
-        )
-        cursor += logo_w + m.gap_2xs * 2
-        cursor += ctx.text(
-            layer,
-            (cursor, y + (row - ctx.ts.line_height(brand_f, 1.0)) // 2),
-            "bilibili",
-            brand_f,
-            ctx.accent,
-            bold=True,
-        )
-
-        if model.content_type:
-            chip_h = max(14, int(row * 0.62))
-            chip_f = ctx.font(max(9, int(m.f_eyebrow * 0.94)), bold=True)
-            cursor += m.gap_sm
-            cursor += _chip(
-                ctx,
+        title = model.platform_name or ""
+        if title and right_limit - cursor > 24:
+            title_lh = ctx.ts.line_height(title_f, 1.0)
+            ctx.text(
                 layer,
-                cursor,
-                mid - chip_h // 2,
-                model.content_type,
-                fill=alpha(ctx.accent, 255),
-                ink=ctx.accent_ink,
-                font=chip_f,
+                (cursor, y + (row - title_lh) // 2),
+                ctx.ts.ellipsize(title, title_f, right_limit - cursor),
+                title_f,
+                ctx.ink,
                 bold=True,
-                radius=max(2, m.radius_chip),
-                pad_x=m.gap_sm,
-                height=chip_h,
             )
-
-        # 右侧仅保留"真实来源站点"，时间已下移到作者行
-        source = model.platform_name or ""
-        if source and "哔哩" not in source and source.lower() != "bilibili":
-            tw = ctx.ts.width(source, meta_f)
-            if cursor + m.gap_md + tw <= right_limit:
-                ctx.text(
-                    layer,
-                    (right_limit - tw, y + (row - ctx.ts.line_height(meta_f, 1.0)) // 2),
-                    source,
-                    meta_f,
-                    ctx.ink_muted,
-                )
 
         surface.hairline(layer, x, y + row + m.gap_md, x + width, ctx.hair)
 
@@ -580,7 +548,10 @@ class IdentityBlock(Block):
         )
 
     def _draw_bili(self, ctx: Any, layer: Any, x: int, y: int, width: int, total: int) -> None:
-        """哔哩哔哩作者行：大圆头像 + 蓝色认证角标 + 深色昵称 + 灰色时间 + 粉色 UP主 药丸。"""
+        """哔哩哔哩作者行：大圆头像 + 蓝色认证角标 + 深色昵称 + 灰色时间。
+
+        不贴"UP主"药丸：内容多数并非来自 B 站，这个身份标记会与真实作者身份冲突。
+        """
         m, model = ctx.m, ctx.model
         name = model.author_name or model.platform_name
         name_f = self._bili_name_font(ctx)
@@ -594,31 +565,7 @@ class IdentityBlock(Block):
         _avatar(ctx, layer, x, av_top, size)
         self._bili_badge(ctx, layer, x, av_top, size)
 
-        pill_f = ctx.font(max(9, int(m.f_eyebrow * 0.92)), bold=True)
-        pill_h = max(15, ctx.ts.line_height(pill_f, 1.0) + m.gap_2xs * 2)
-        pill_text = "UP主"
-        pill_w = ctx.ts.width(pill_text, pill_f) + m.gap_sm * 2
         right = x + width
-        show_pill = width > size + pill_w + m.gap_lg * 2
-        if show_pill:
-            top = y + (total - pill_h) // 2
-            surface.panel(
-                layer,
-                (right - pill_w, top, right, top + pill_h),
-                pill_h // 2,
-                fill=alpha(ctx.accent, 255),
-            )
-            ctx.text(
-                layer,
-                (right - pill_w // 2, top + pill_h // 2),
-                pill_text,
-                pill_f,
-                ctx.accent_ink,
-                bold=True,
-                anchor="mm",
-            )
-            right -= pill_w + m.gap_sm
-
         tx = x + size + m.gap_sm
         block_h = name_lh + sub_lh
         ty = y + max(0, (total - block_h) // 2)
@@ -1629,7 +1576,11 @@ class IpNoteBlock(Block):
 
 @dataclass
 class TabBarBlock(Block):
-    """哔哩哔哩动态详情页的页签条：选中的"评论 N"带粉色下划线，右邻"赞和转发 M"。"""
+    """哔哩哔哩动态详情页的页签条：选中的"评论 N"带粉色下划线，右邻"转发 M"。
+
+    两个页签各自只挂自己的数字；点赞不在这里出现，由底部操作栏负责，
+    避免"赞和转发"这类合并文案挂着单一数值造成歧义。
+    """
 
     variant: str = "bili"
 
@@ -1643,8 +1594,8 @@ class TabBarBlock(Block):
         if not count and model.comments:
             count = str(len(model.comments))
         active = f"评论 {count}".strip() if count else "评论"
-        likes = _stat_value(ctx, ("like",)) or _stat_value(ctx, ("share",))
-        rest = f"赞和转发 {likes}".strip() if likes else "赞和转发"
+        shares = _stat_value(ctx, ("share",))
+        rest = f"转发 {shares}".strip() if shares else "转发"
         return active, rest
 
     def _plan(self, ctx: Any, width: int) -> dict[str, Any]:
@@ -2192,9 +2143,11 @@ class FooterBlock(Block):
         mark_w = ctx.ts.tracked_width(mark, mark_f, mark_tracking) if mark else 0
 
         if self.variant == "bili":
-            # 底部操作栏：水印 + 转发/评论/收藏/点赞 四组数据，链接收进一条通栏灰色药丸里
+            # 底部操作栏：转发/评论/收藏/点赞 均分一行；链接与水印一起收进底部灰色药丸
             icon = max(11, int(m.f_footer * 1.3))
             action_row = max(ctx.ts.line_height(mark_f, 1.2), icon)
+            # 水印在这套皮肤里用常规字重，宽度要照常规字重量
+            mark_w = ctx.ts.tracked_width(mark, font, mark_tracking) if mark else 0
             actions = [
                 (kinds[0], _stat_value(ctx, kinds))
                 for kinds in (("share",), ("comment",), ("star",), ("like",))
@@ -2203,7 +2156,11 @@ class FooterBlock(Block):
             pill_pad = max(m.gap_xs, m.unit)
             pill_inner = max(40, width - pill_pad * 2)
             url_lines = _url_flow(ctx, url, font, pill_inner, pill_inner, self.max_url_lines)
-            pill_h = pill_pad * 2 + row * max(1, len(url_lines))
+            last_w = ctx.ts.width(url_lines[-1], font) if url_lines else 0
+            # 水印贴药丸右下角：与末行链接同排放得下就同排，否则自己占一行
+            mark_inline = bool(mark_w) and last_w + m.gap_md + mark_w <= pill_inner
+            pill_rows = max(1, len(url_lines)) + (1 if mark_w and not mark_inline else 0)
+            pill_h = pill_pad * 2 + row * pill_rows
             head = m.gap_sm + 1 + m.gap_md
             plan = {
                 "font": font,
@@ -2211,6 +2168,7 @@ class FooterBlock(Block):
                 "mark": mark,
                 "mark_w": mark_w,
                 "mark_tracking": mark_tracking,
+                "mark_inline": mark_inline,
                 "url_lines": url_lines,
                 "row": row,
                 "inner_w": pill_inner,
@@ -2267,38 +2225,27 @@ class FooterBlock(Block):
         return int(self._plan(ctx, width)["height"])
 
     def _draw_bili(self, ctx: Any, layer: Any, x: int, y: int, width: int, plan: dict[str, Any]) -> None:
-        """哔哩哔哩底部操作栏：一道分割线 + 水印与四组数据 + 通栏链接药丸。"""
+        """哔哩哔哩底部：分割线 + 均分的数据栏 + 收着链接与水印的药丸。"""
         m, pal = ctx.m, ctx.pal
         row = plan["row"]
         surface.hairline(layer, x, y + m.gap_sm, x + width, ctx.hair)
         top = y + int(plan["head"])
         action_row = int(plan["action_row"])
-        mark_f = plan["mark_f"]
-        if plan["mark"]:
-            ctx.text(
-                layer,
-                (x, top + max(0, (action_row - ctx.ts.line_height(mark_f, 1.2)) // 2)),
-                plan["mark"],
-                mark_f,
-                ctx.accent_text,
-                tracking=plan["mark_tracking"],
-                bold=True,
-            )
 
         icon = int(plan["icon"])
         font = plan["font"]
-        gap = m.gap_lg
         actions = plan["actions"]
-        widths = [icon + m.gap_2xs + ctx.ts.width(value, font) for _, value in actions]
-        total_w = sum(widths) + gap * max(0, len(widths) - 1)
-        cursor = x + width - total_w
-        if actions and cursor >= x + plan["mark_w"] + m.gap_md:
+        if actions:
+            # 数据栏按 B 站动态卡片的做法等分整宽，每格内部居中
             gy = top + max(0, (action_row - icon) // 2)
             tyy = top + max(0, (action_row - row) // 2)
-            for (kind, value), w in zip(actions, widths, strict=False):
-                surface.glyph(layer, (cursor, gy, cursor + icon, gy + icon), kind, alpha(ctx.ink_muted, 255))
-                ctx.text(layer, (cursor + icon + m.gap_2xs, tyy), value, font, ctx.ink_muted)
-                cursor += w + gap
+            slot = width / len(actions)
+            for index, (kind, value) in enumerate(actions):
+                item_w = icon + m.gap_2xs + ctx.ts.width(value, font)
+                left = int(x + slot * index + (slot - item_w) / 2)
+                left = max(x, min(left, x + width - item_w))
+                surface.glyph(layer, (left, gy, left + icon, gy + icon), kind, alpha(ctx.ink_muted, 255))
+                ctx.text(layer, (left + icon + m.gap_2xs, tyy), value, font, ctx.ink_muted)
 
         pill_pad = int(plan["pill_pad"])
         pill_h = int(plan["pill_h"])
@@ -2311,8 +2258,20 @@ class FooterBlock(Block):
             border=ctx.hair,
             border_width=m.hairline,
         )
-        for index, line in enumerate(plan["url_lines"]):
+        lines = plan["url_lines"]
+        for index, line in enumerate(lines):
             ctx.text(layer, (x + pill_pad, pill_top + pill_pad + index * row), line, font, ctx.accent_alt_text)
+        if plan["mark"]:
+            # 水印是署名而不是重点：中性灰、不加粗，靠位置而不是颜色被认出来
+            mark_row = max(0, len(lines) - 1) if plan["mark_inline"] else len(lines)
+            ctx.text(
+                layer,
+                (x + width - pill_pad - plan["mark_w"], pill_top + pill_pad + mark_row * row),
+                plan["mark"],
+                plan["font"],
+                ctx.ink_muted,
+                tracking=plan["mark_tracking"],
+            )
 
     def draw(self, ctx: Any, layer: Any, x: int, y: int, width: int) -> None:
         m = ctx.m

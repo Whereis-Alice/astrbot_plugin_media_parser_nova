@@ -55,6 +55,9 @@ class Probe:
     texts: list[str] = field(default_factory=list)
     tiles: list[tuple[str, int, int]] = field(default_factory=list)
     text_bottoms: list[int] = field(default_factory=list)
+    #: 每次真实绘字的 (文本, x, y, 颜色)，用于断言位置与配色
+    draws: list[tuple[str, int, int, Any]] = field(default_factory=list)
+    ctx: Any = None
 
     @property
     def joined_text(self) -> str:
@@ -81,6 +84,7 @@ def render_probe(
     contexts: list[Any] = []
     tiles: list[tuple[str, int, int]] = []
     bottoms: list[int] = []
+    draws: list[tuple[str, int, int, Any]] = []
 
     real_build_context = card_engine.build_context
     real_tile_image = card_blocks._tile_image
@@ -98,6 +102,7 @@ def render_probe(
     def spy_draw_line(self: Any, draw: Any, xy: Any, text: str, font: Any, fill: Any, **kwargs: Any) -> Any:
         if text:
             bottoms.append(int(xy[1]) + self.line_height(font, 1.0))
+            draws.append((str(text), int(xy[0]), int(xy[1]), fill))
         return real_draw_line(self, draw, xy, text, font, fill, **kwargs)
 
     card_engine.build_context = spy_build_context
@@ -116,7 +121,14 @@ def render_probe(
         card_blocks._tile_image = real_tile_image
         TypeSetter.draw_line = real_draw_line
 
-    return Probe(image=image, texts=list(contexts[0].texts), tiles=tiles, text_bottoms=bottoms)
+    return Probe(
+        image=image,
+        texts=list(contexts[0].texts),
+        tiles=tiles,
+        text_bottoms=bottoms,
+        draws=draws,
+        ctx=contexts[0],
+    )
 
 
 def png(path: Path, size: tuple[int, int], color: tuple[int, int, int]) -> Path:
@@ -447,9 +459,10 @@ def test_bilibili_theme_has_no_fixed_style_watermark(assets: dict[str, Any]) -> 
     )
     probe = render_probe(model, width=720, theme_key="bilibili")
 
-    assert "图文" in probe.texts
+    assert "推特" in probe.texts, "顶栏应写真实来源而不是风格名"
     assert "哔哩哔哩风格" not in probe.joined_text
     assert "B站动态" not in probe.joined_text
+    assert "bilibili" not in probe.texts
 
 
 @pytest.mark.parametrize("theme", THEME_KEYS)
@@ -509,7 +522,7 @@ def bili_model(assets: dict[str, Any]) -> Any:
         display_name="哔哩哔哩",
         author=("凡人修仙传", "@fanrenxiuxianzhuan"),
         extra={
-            "stats_line": "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 \u21a9\ufe0f 33 \U0001f4ac 33 \U0001f440 12.3万 \U0001f4ad 4562",
+            "stats_line": "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 \u21a9\ufe0f 208 \U0001f4ac 33 \U0001f440 12.3万 \U0001f4ad 4562",
             "ip_location": "北京",
             "hot_comments": [
                 {
@@ -554,12 +567,65 @@ def test_bilibili_nine_grid_tiles_are_uniform_squares(bili_model: Any) -> None:
     assert abs(max(widths) - max(heights)) <= 2, "九宫格应接近正方形"
 
 
-def test_bilibili_tabbar_shows_comment_and_like_tabs(bili_model: Any) -> None:
-    """页签条要画出"评论 N"与"赞和转发 M"两个标签。"""
+def test_bilibili_tabbar_splits_comment_and_share_counts(bili_model: Any) -> None:
+    """页签条的两个标签各自只挂自己的数字，点赞不掺和进来。"""
     probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
 
     assert "评论 33" in probe.texts
-    assert "赞和转发 361" in probe.texts
+    assert "转发 208" in probe.texts
+    assert not [t for t in probe.texts if "赞和转发" in t], "合并文案已废弃"
+    assert "转发 361" not in probe.texts, "点赞数不能被当成转发数"
+
+
+def test_bilibili_tabbar_share_tab_stays_blank_without_share_stat(assets: dict[str, Any]) -> None:
+    """没有转发数时转发页签留空标签，绝不回落去借用点赞数。"""
+    model = build_model(
+        make_result(
+            title=None,
+            text="只有点赞数的动态。",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+            extra={"stats_line": "\U0001f44d 361"},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "转发" in probe.texts
+    assert "转发 361" not in probe.texts
+
+
+def test_bilibili_topbar_keeps_only_source_title(assets: dict[str, Any]) -> None:
+    """顶栏只留返回箭头 + 来源标题：站点字标、内容类型胶囊、UP主 标记全部不画。"""
+    model = build_model(
+        make_result(text="来自推特的一条动态。", extra={"stats_line": "\u2764\ufe0f 12"}),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "推特" in probe.texts, "顶栏应写出真实来源"
+    assert "bilibili" not in probe.texts
+    assert "图文" not in probe.texts
+    assert "UP主" not in probe.texts
+
+
+def test_bilibili_watermark_sits_with_the_link_in_neutral_grey(bili_model: Any) -> None:
+    """水印挪到链接同处的右下角，并且用中性灰而不是品牌粉。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    marks = [d for d in probe.draws if d[0] == "Alice解析"]
+    assert len(marks) == 1, f"水印应只画一次：{marks}"
+    _, mark_x, mark_y, mark_fill = marks[0]
+    links = [d for d in probe.draws if d[0].startswith("https://t.bilibili.com")]
+    assert links, "链接应被画出"
+    link_x, link_y = links[0][1], links[0][2]
+
+    assert mark_x > link_x, "水印应贴右侧"
+    assert mark_y >= link_y, "水印应与链接同排或在其下方"
+    assert tuple(mark_fill)[:3] == tuple(probe.ctx.ink_muted)[:3], "水印应用中性灰"
+    assert tuple(mark_fill)[:3] != tuple(probe.ctx.accent_text)[:3], "水印不该用强调色"
 
 
 def test_bilibili_comments_use_native_heading_and_reply_meta(bili_model: Any) -> None:
