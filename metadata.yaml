@@ -15,7 +15,7 @@ desc: |
   - 小红书移动端无水印处理
   - B站 Cookie 高画质解析与管理员协助登录
   - 媒体中转、消息聚合和 ZIP 导出
-version: v1.7.0
+version: v1.7.1
 astrbot_version: ">=4.25.0"
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova

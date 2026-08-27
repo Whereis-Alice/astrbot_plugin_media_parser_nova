@@ -5,8 +5,9 @@ import html as html_lib
 import json
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -486,11 +487,15 @@ class TwitterParser(BaseVideoParser):
                     f"count={len(comments)}, source={tag}"
                 )
                 return comments
-            blocked_only = False
+            has_jsonld = _JSONLD_MARKER in html_text
+            has_comment_node = _COMMENT_NODE_MARKER in html_text
+            if has_jsonld or has_comment_node:
+                # 页面里确实带回复数据却没解析出来，说明结构变了，要报警。
+                blocked_only = False
             failures.append(
                 f"{tag} -> 页面已取回但未解析到回复("
-                f"len={len(html_text)}, jsonld={_JSONLD_MARKER in html_text}, "
-                f"comment_node={_COMMENT_NODE_MARKER in html_text})"
+                f"len={len(html_text)}, jsonld={has_jsonld}, "
+                f"comment_node={has_comment_node})"
             )
 
         self._log_hot_comment_failure(tweet_id, failures, blocked_only)
@@ -518,6 +523,40 @@ class TwitterParser(BaseVideoParser):
         if self._is_local_host(base_url):
             return None
         return self.proxy_url
+
+    @staticmethod
+    def _session_is_public_only(session: Any) -> bool:
+        """判断会话是否装了"只允许连公网地址"的下载防护。"""
+        try:
+            from ...downloader.security import session_uses_public_only_connector
+
+            return bool(session_uses_public_only_connector(session))
+        except Exception:
+            # 安全模块缺失或会话形态异常时按"不受限"处理，交由调用方自建会话。
+            return False
+
+    @asynccontextmanager
+    async def _nitter_session(
+        self,
+        session: Optional[aiohttp.ClientSession],
+    ) -> AsyncIterator[aiohttp.ClientSession]:
+        """提供一个能访问自建 Nitter 的会话。
+
+        插件的下载会话带 SSRF 防护，连接前就会拒绝私网地址，而 Nitter 通常
+        是用户自己跑在 127.0.0.1/内网的实例，会被这层防护挡掉。Nitter 地址
+        来自用户配置、不受第三方响应影响，属于显式信任，因此这里单独开一个
+        默认连接器的临时会话；媒体下载仍然走原来的安全会话，SSRF 防护不变。
+        """
+        if session is not None and not self._session_is_public_only(session):
+            yield session
+            return
+        own_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=_NITTER_BUDGET)
+        )
+        try:
+            yield own_session
+        finally:
+            await own_session.close()
 
     async def _fetch_nitter_page(
         self,
@@ -555,35 +594,36 @@ class TwitterParser(BaseVideoParser):
         limit = self.hot_comment_count
         started = time.monotonic()
         failures: List[str] = []
-        for base_url in self.nitter_base_urls:
-            remaining = _NITTER_BUDGET - (time.monotonic() - started)
-            if remaining <= 1.0:
-                failures.append("其余 Nitter 实例已跳过: 超出时间预算")
-                break
-            url = nitter_source.thread_url(base_url, tweet_id, screen_name)
-            try:
-                html_text = await self._fetch_nitter_page(
-                    session,
-                    url,
-                    self._nitter_proxy(base_url),
-                    min(_NITTER_TIMEOUT, remaining),
+        async with self._nitter_session(session) as fetch_session:
+            for base_url in self.nitter_base_urls:
+                remaining = _NITTER_BUDGET - (time.monotonic() - started)
+                if remaining <= 1.0:
+                    failures.append("其余 Nitter 实例已跳过: 超出时间预算")
+                    break
+                url = nitter_source.thread_url(base_url, tweet_id, screen_name)
+                try:
+                    html_text = await self._fetch_nitter_page(
+                        fetch_session,
+                        url,
+                        self._nitter_proxy(base_url),
+                        min(_NITTER_TIMEOUT, remaining),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures.append(f"{url} -> {type(exc).__name__}: {exc}")
+                    continue
+                parsed = nitter_source.parse_thread(html_text, limit, base_url)
+                if parsed.get("comments") or parsed.get("stats_line"):
+                    logger.debug(
+                        f"[{self.name}] Nitter 抓取成功: tweet_id={tweet_id}, "
+                        f"comments={len(parsed.get('comments') or [])}, "
+                        f"stats={parsed.get('stats_line') or '-'}, source={url}"
+                    )
+                    return parsed
+                failures.append(
+                    f"{url} -> 页面已取回但未解析到内容(len={len(html_text)})"
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                failures.append(f"{url} -> {type(exc).__name__}: {exc}")
-                continue
-            parsed = nitter_source.parse_thread(html_text, limit, base_url)
-            if parsed.get("comments") or parsed.get("stats_line"):
-                logger.debug(
-                    f"[{self.name}] Nitter 抓取成功: tweet_id={tweet_id}, "
-                    f"comments={len(parsed.get('comments') or [])}, "
-                    f"stats={parsed.get('stats_line') or '-'}, source={url}"
-                )
-                return parsed
-            failures.append(
-                f"{url} -> 页面已取回但未解析到内容(len={len(html_text)})"
-            )
         if failures:
             logger.warning(
                 f"[{self.name}] Nitter 未返回可用内容: tweet_id={tweet_id}; "
@@ -622,6 +662,11 @@ class TwitterParser(BaseVideoParser):
             extras["comments"] = list(parsed.get("comments") or [])
             extras["stats_line"] = str(parsed.get("stats_line") or "")
             extras["author_avatar"] = str(parsed.get("author_avatar") or "")
+            if parsed:
+                # Nitter 已经给出可用结果（哪怕这条推文本来就没有回复）。
+                # X 公开页早已不再对未登录访问输出回复数据，再兜底只会白等
+                # 满一个 _HOT_COMMENT_BUDGET，把整条解析拖慢十几秒。
+                return extras
         if extras["comments"] or self.hot_comment_count <= 0:
             return extras
         if not self.nitter_base_urls:
@@ -639,10 +684,10 @@ class TwitterParser(BaseVideoParser):
     ) -> None:
         """按失败性质分级输出日志。
 
-        平台明确拒绝(401/403/404/429)是"X 关掉了未登录访问"，不是插件故障，
-        每条推文都刷 WARN 只会淹没真正的问题；这类情况详情降到 DEBUG，
-        另按冷却期给一条 INFO 说明。其余失败（网络不通、超时、页面结构变化）
-        仍然 WARN。
+        平台明确拒绝(401/403/404/429)、或页面能取回但压根不含回复区，都是
+        "X 关掉了未登录访问"，不是插件故障，每条推文都刷 WARN 只会淹没真正的
+        问题；这类情况详情降到 DEBUG，另按冷却期给一条 INFO 说明。其余失败
+        （网络不通、超时、页面带回复数据却解析不出来）仍然 WARN。
         """
         if not failures:
             return
@@ -656,7 +701,8 @@ class TwitterParser(BaseVideoParser):
             return
         TwitterParser._blocked_notice_at = now
         logger.info(
-            f"[{self.name}] X 拒绝了未登录访问帖子页(HTTP 401/403/404/429)，"
+            f"[{self.name}] X 未向未登录访问提供回复数据"
+            f"(拒绝访问或页面不含回复区)，"
             f"推文将不带热评展示；正文/图片/视频解析不受影响。"
             f"（{int(_BLOCKED_NOTICE_INTERVAL // 60)} 分钟内不再重复提示）"
         )

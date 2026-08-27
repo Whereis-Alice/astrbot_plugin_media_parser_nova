@@ -5,6 +5,10 @@ from unittest.mock import AsyncMock, patch
 
 import aiohttp
 
+from nova_core.downloader.security import (
+    create_public_only_connector,
+    session_uses_public_only_connector,
+)
 from nova_core.parser.manager import ParserManager
 from nova_core.parser.platform import twitter as twitter_module
 from nova_core.parser.platform.twitter import (
@@ -395,8 +399,93 @@ class TwitterNitterExtrasTests(unittest.TestCase):
 
         self.assertEqual(extras["stats_line"], "\u2764\ufe0f1,234")
         self.assertEqual(extras["comments"], [])
-        # 只缺回复时仍然值得再试一次 X 公开页。
+        # Nitter 已给出可用结果（这条推文本来就没有回复），不再白等 X 公开页。
+        parser._fetch_hot_comments.assert_not_awaited()
+
+    def test_public_page_skipped_only_when_nitter_usable(self):
+        parser = TwitterParser(
+            hot_comment_count=2,
+            nitter_base_url="http://a.test",
+        )
+        # Nitter 页面完全解析不出内容时，仍然要回落到 X 公开页。
+        parser._fetch_nitter_page = AsyncMock(return_value="<html></html>")
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+
+        asyncio.run(parser._collect_thread_extras(object(), "999"))
+
         parser._fetch_hot_comments.assert_awaited_once()
+
+    def test_nitter_uses_session_without_public_only_guard(self):
+        """自建 Nitter 是内网地址，不能被下载会话的 SSRF 防护拦下。"""
+        parser = TwitterParser(
+            hot_comment_count=1,
+            nitter_base_url="http://127.0.0.1:8585",
+        )
+        parser._fetch_nitter_page = AsyncMock(return_value=self.NITTER_PAGE)
+
+        async def run():
+            connector = create_public_only_connector()
+            async with aiohttp.ClientSession(connector=connector) as guarded:
+                self.assertTrue(session_uses_public_only_connector(guarded))
+                extras = await parser._fetch_nitter_extras(guarded, "999", "kuuu")
+                used = parser._fetch_nitter_page.await_args.args[0]
+                return extras, used, guarded
+
+        extras, used, guarded = asyncio.run(run())
+
+        self.assertEqual(len(extras.get("comments") or []), 1)
+        self.assertIsNot(used, guarded)
+        self.assertFalse(session_uses_public_only_connector(used))
+        self.assertTrue(used.closed)
+
+    def test_nitter_fetch_reaches_loopback_instance(self):
+        """端到端验证：带 SSRF 防护的会话下，仍能抓到 127.0.0.1 上的 Nitter。"""
+        from aiohttp import web
+
+        async def handler(_request: web.Request) -> web.Response:
+            return web.Response(text=self.NITTER_PAGE, content_type="text/html")
+
+        async def run():
+            app = web.Application()
+            app.router.add_get("/{tail:.*}", handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = runner.addresses[0][1]
+            parser = TwitterParser(
+                hot_comment_count=3,
+                nitter_base_url=f"http://127.0.0.1:{port}",
+            )
+            connector = create_public_only_connector()
+            try:
+                async with aiohttp.ClientSession(connector=connector) as guarded:
+                    return await parser._fetch_nitter_extras(
+                        guarded, "999", "kuuu_Arcana"
+                    )
+            finally:
+                await runner.cleanup()
+
+        extras = asyncio.run(run())
+
+        self.assertEqual(len(extras.get("comments") or []), 1)
+        self.assertEqual(extras["stats_line"], "\u2764\ufe0f1,234")
+
+    def test_nitter_reuses_unguarded_session(self):
+        parser = TwitterParser(
+            hot_comment_count=1,
+            nitter_base_url="http://a.test",
+        )
+        parser._fetch_nitter_page = AsyncMock(return_value=self.NITTER_PAGE)
+
+        async def run():
+            async with aiohttp.ClientSession() as plain:
+                await parser._fetch_nitter_extras(plain, "999", "kuuu")
+                return parser._fetch_nitter_page.await_args.args[0], plain
+
+        used, plain = asyncio.run(run())
+
+        self.assertIs(used, plain)
 
     def test_hint_logged_once_when_nitter_not_configured(self):
         parser = TwitterParser(hot_comment_count=2)
