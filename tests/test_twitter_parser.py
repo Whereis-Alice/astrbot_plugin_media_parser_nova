@@ -309,6 +309,164 @@ class TwitterPublicCommentTests(unittest.TestCase):
         parser._fetch_public_page.assert_not_awaited()
 
 
+class TwitterNitterExtrasTests(unittest.TestCase):
+    """Nitter 热评/统计来源与 X 公开页兜底之间的调度逻辑。"""
+
+    NITTER_PAGE = (
+        '<div id="m" class="main-tweet">'
+        '<div class="timeline-item " data-username="kuuu_Arcana">'
+        '<a class="tweet-link" href="/kuuu_Arcana/status/999#m"></a>'
+        '<img class="avatar round" src="/pic/profile_images%2F7%2Fkuuu_bigger.jpg" />'
+        '<a class="fullname" href="/kuuu_Arcana" title="Kuuu">Kuuu</a>'
+        '<div class="tweet-content media-body" dir="auto">main text</div>'
+        '<div class="tweet-stats">'
+        '<span class="tweet-stat"><div class="icon-container">'
+        '<span class="icon-heart" title=""></span> 1,234</div></span>'
+        "</div></div></div>"
+        '<div id="r" class="replies">'
+        '<div class="reply thread thread-line">'
+        '<div class="timeline-item thread-last " data-username="fan">'
+        '<a class="tweet-link" href="/fan/status/1000#m"></a>'
+        '<a class="fullname" href="/fan" title="Fan">Fan</a>'
+        '<div class="tweet-content media-body" dir="auto">nice art</div>'
+        '<div class="tweet-stats">'
+        '<span class="tweet-stat"><div class="icon-container">'
+        '<span class="icon-heart" title=""></span> 9</div></span>'
+        "</div></div></div></div>"
+    )
+
+    def setUp(self):
+        # 提示日志按类属性做冷却，逐个测试重置以免互相影响。
+        twitter_module.TwitterParser._nitter_hint_at = 0.0
+
+    def test_nitter_success_skips_public_page(self):
+        parser = TwitterParser(
+            hot_comment_count=3,
+            nitter_base_url="http://127.0.0.1:8585/",
+        )
+        parser._fetch_nitter_page = AsyncMock(return_value=self.NITTER_PAGE)
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+
+        extras = asyncio.run(
+            parser._collect_thread_extras(object(), "999", "kuuu_Arcana")
+        )
+
+        self.assertEqual(len(extras["comments"]), 1)
+        self.assertEqual(extras["comments"][0]["message"], "nice art")
+        self.assertEqual(extras["stats_line"], "\u2764\ufe0f1,234")
+        self.assertEqual(
+            extras["author_avatar"],
+            "https://pbs.twimg.com/profile_images/7/kuuu_400x400.jpg",
+        )
+        parser._fetch_hot_comments.assert_not_awaited()
+        self.assertEqual(
+            parser._fetch_nitter_page.await_args.args[1],
+            "http://127.0.0.1:8585/kuuu_Arcana/status/999",
+        )
+
+    def test_nitter_failure_falls_back_to_public_page(self):
+        parser = TwitterParser(
+            hot_comment_count=2,
+            nitter_base_url="http://a.test, http://b.test",
+        )
+        parser._fetch_nitter_page = AsyncMock(side_effect=OSError("connect refused"))
+        parser._fetch_hot_comments = AsyncMock(
+            return_value=[{"username": "x", "message": "fallback", "likes": 1}]
+        )
+
+        extras = asyncio.run(parser._collect_thread_extras(object(), "999"))
+
+        self.assertEqual(extras["comments"][0]["message"], "fallback")
+        self.assertEqual(extras["stats_line"], "")
+        # 两个实例都要试过再兜底。
+        self.assertEqual(parser._fetch_nitter_page.await_count, 2)
+        parser._fetch_hot_comments.assert_awaited_once()
+
+    def test_stats_survive_when_only_comments_missing(self):
+        page = self.NITTER_PAGE.split('<div id="r"')[0]
+        parser = TwitterParser(
+            hot_comment_count=2,
+            nitter_base_url="http://a.test",
+        )
+        parser._fetch_nitter_page = AsyncMock(return_value=page)
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+
+        extras = asyncio.run(parser._collect_thread_extras(object(), "999"))
+
+        self.assertEqual(extras["stats_line"], "\u2764\ufe0f1,234")
+        self.assertEqual(extras["comments"], [])
+        # 只缺回复时仍然值得再试一次 X 公开页。
+        parser._fetch_hot_comments.assert_awaited_once()
+
+    def test_hint_logged_once_when_nitter_not_configured(self):
+        parser = TwitterParser(hot_comment_count=2)
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+
+        with patch.object(twitter_module.logger, "info") as info:
+            asyncio.run(parser._collect_thread_extras(object(), "1"))
+            asyncio.run(parser._collect_thread_extras(object(), "2"))
+
+        self.assertEqual(info.call_count, 1)
+
+    def test_disabled_hot_comments_still_fetch_nitter_stats(self):
+        parser = TwitterParser(
+            hot_comment_count=0,
+            nitter_base_url="http://a.test",
+        )
+        parser._fetch_nitter_page = AsyncMock(return_value=self.NITTER_PAGE)
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+
+        extras = asyncio.run(parser._collect_thread_extras(object(), "999"))
+
+        self.assertEqual(extras["stats_line"], "\u2764\ufe0f1,234")
+        self.assertEqual(extras["comments"], [])
+        parser._fetch_hot_comments.assert_not_awaited()
+
+    def test_local_nitter_bypasses_parse_proxy(self):
+        parser = TwitterParser(
+            use_parse_proxy=True,
+            proxy_url="http://127.0.0.1:7890",
+            nitter_base_url="http://127.0.0.1:8585, https://nitter.example",
+        )
+
+        self.assertIsNone(parser._nitter_proxy("http://127.0.0.1:8585"))
+        self.assertIsNone(parser._nitter_proxy("http://192.168.1.9:8585"))
+        self.assertIsNone(parser._nitter_proxy("http://172.20.0.3:8585"))
+        self.assertEqual(
+            parser._nitter_proxy("https://nitter.example"),
+            "http://127.0.0.1:7890",
+        )
+
+    def test_parse_publishes_stats_line_and_avatar_fallback(self):
+        parser = TwitterParser(
+            hot_comment_count=1,
+            nitter_base_url="http://127.0.0.1:8585",
+        )
+        parser._fetch_media_info = AsyncMock(
+            return_value={
+                "images": [],
+                "videos": [],
+                "text": "main text",
+                "title": "",
+                "author": "Kuuu(@kuuu_Arcana)",
+                "avatar_url": "",
+                "timestamp": "2026-08-26 11:00:00",
+            }
+        )
+        parser._fetch_nitter_page = AsyncMock(return_value=self.NITTER_PAGE)
+
+        result = asyncio.run(
+            parser.parse(object(), "https://x.com/kuuu_Arcana/status/999")
+        )
+
+        self.assertEqual(result["stats_line"], "\u2764\ufe0f1,234")
+        self.assertEqual(
+            result["avatar_url"],
+            "https://pbs.twimg.com/profile_images/7/kuuu_400x400.jpg",
+        )
+        self.assertEqual(len(result.get("hot_comments") or []), 1)
+
+
 class TwitterTextEntityTests(unittest.TestCase):
     def test_twitter_text_unescapes_html_entities(self):
         text = TwitterParser._twitter_text({"text": "(&gt;_&lt;) &amp; more"})

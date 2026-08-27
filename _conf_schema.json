@@ -396,7 +396,7 @@
                     "twitter": {
                         "description": "Twitter/X",
                         "type": "bool",
-                        "hint": "从 X 的公开帖子页提取当前访客可见的精选回复；页面未公开回复或结构变化时会自动跳过。",
+                        "hint": "X 已不再对未登录访问输出回复数据，需在下方填写 Nitter 实例地址才能拿到热评；未配置时会尝试公开帖子页并在失败后自动跳过。",
                         "default": true
                     },
                     "xiaoheihe": {
@@ -404,6 +404,12 @@
                         "type": "bool",
                         "hint": "仅对小黑盒 BBS 帖子生效；使用帖子详情接口返回的热门评论，不影响游戏详情页。",
                         "default": true
+                    },
+                    "twitter_nitter_base_url": {
+                        "description": "Twitter/X 的 Nitter 实例地址",
+                        "type": "string",
+                        "hint": "留空则不使用。X 已停止对未登录访问输出带回复的服务端渲染页，填入一个可用的 Nitter 实例（例如自建的 http://127.0.0.1:8585）后即可恢复 Twitter 热评，并顺带补全推文的喜欢/转发/评论/阅读统计。可用逗号分隔多个实例按顺序回退；指向本机或内网的地址会自动绕过代理。",
+                        "default": ""
                     }
                 }
             },

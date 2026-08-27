@@ -347,6 +347,8 @@ class HotCommentConfig:
     xiaohongshu: bool = True
     twitter: bool = True
     xiaoheihe: bool = True
+    #: Twitter/X 热评的 Nitter 实例地址（逗号分隔可配多个），留空表示不使用。
+    twitter_nitter_base_url: str = ""
 
 
 @dataclass
@@ -754,6 +756,9 @@ class ConfigManager:
                     True,
                     "message.hot_comments.xiaoheihe",
                 ),
+                twitter_nitter_base_url=str(
+                    hot_comments.get("twitter_nitter_base_url", "") or ""
+                ).strip(),
             ),
             card_render=CardRenderConfig(
                 enabled=self._parse_bool(
@@ -1275,6 +1280,9 @@ class ConfigManager:
                     use_video_proxy=self.proxy.twitter_use_video_proxy,
                     proxy_url=proxy_addr,
                     hot_comment_count=twitter_hc,
+                    nitter_base_url=(
+                        self.message.hot_comments.twitter_nitter_base_url
+                    ),
                 )
             )
         if self._enable_pixiv:

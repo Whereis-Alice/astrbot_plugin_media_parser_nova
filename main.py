@@ -44,7 +44,7 @@ from .nova_core.translation import MetadataTranslator, build_card_metadata_list
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.6.1",
+    "1.7.0",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):

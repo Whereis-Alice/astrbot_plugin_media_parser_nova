@@ -122,6 +122,8 @@ _EMOJI_RE = re.compile(
     "\U00002600-\U000026FF"
     "\U00002700-\U000027BF"
     "\U0000FE00-\U0000FE0F"
+    "\U00002B00-\U00002BFF"
+    "\U0001F650-\U0001F67F"
     "\U0001F1E6-\U0001F1FF"
     "\U0001F3FB-\U0001F3FF"
     "\U0000200D"
@@ -145,22 +147,55 @@ _KEEP_PUNCTUATION = frozenset(
     "，。、；：？！…—～·「」『』（）【】《》〈〉“”‘’〔〕｛｝"
 )
 
+#: 社媒正文常拿这些码位当"看不见的占位空白"来撑行距（推特尤其爱用
+#: U+2800 BRAILLE PATTERN BLANK）。中文字体普遍不含这些字形，直接渲染会
+#: 变成 ⬚ 豆腐块——这正是卡片里出现方块的主因。统一换成空格，
+#: 既保留作者想要的留白，又不会缺字。
+_BLANK_CODEPOINTS = frozenset(
+    "\u2800"  # BRAILLE PATTERN BLANK
+    "\u180e"  # MONGOLIAN VOWEL SEPARATOR
+    "\u115f\u1160\u3164\uffa0"  # HANGUL FILLER 系列
+    "\u2060\u2061\u2062\u2063\u2064"  # WORD JOINER / 不可见运算符
+    "\u200b\u200c\ufeff"  # 零宽空格 / 零宽非连接 / BOM
+    "\u00a0\u2007\u202f"  # 各种不换行空格
+    "\u3000"  # 全角空格（NFKC 已会转，这里兜底）
+)
+#: 控制字符 / 格式字符 / 代理区 / 私用区 / 未分配码位一律没有字形，
+#: 留在文本里只会变成豆腐块或触发 Pillow 异常，直接丢弃（换行除外）。
+_DROP_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cs", "Cn"})
+_KEEP_CONTROL = frozenset("\n\r\t")
+#: 清洗后可能留下大量空行（原本是占位空白行），最多保留一个空行。
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
 
 def clean_text(text: str | None) -> str:
-    """去 emoji + 逐字 NFKC 归一化，避免字体缺字渲染成方块。
+    """去 emoji / 不可渲染码位 + 逐字 NFKC 归一化，避免字体缺字渲染成方块。
 
     与整串 NFKC 不同：中文全角标点原样保留，避免正文里出现
     「先量后画,彻底移除」这种半角逗号紧贴汉字的排版事故。
     """
     if not text:
         return ""
-    cleaned = "".join(
-        ch if ch in _KEEP_PUNCTUATION else unicodedata.normalize("NFKC", ch)
-        for ch in text
-    )
+    chars: list[str] = []
+    for ch in text:
+        if ch in _KEEP_CONTROL:
+            chars.append(ch)
+            continue
+        if ch in _BLANK_CODEPOINTS:
+            chars.append(" ")
+            continue
+        if unicodedata.category(ch) in _DROP_CATEGORIES:
+            continue
+        chars.append(
+            ch if ch in _KEEP_PUNCTUATION else unicodedata.normalize("NFKC", ch)
+        )
+    cleaned = "".join(chars)
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = _EMOJI_RE.sub("", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # 逐行去尾部空白，再压缩连续空行，避免"占位空白行"清洗后留下大片空档。
+    cleaned = "\n".join(line.rstrip() for line in cleaned.split("\n"))
+    cleaned = _BLANK_LINES_RE.sub("\n\n", cleaned)
     return cleaned.strip()
 
 

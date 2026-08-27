@@ -14,6 +14,7 @@ import aiohttp
 from ...constants import Config
 from ...logger import logger
 from ..utils import build_request_headers
+from . import nitter as nitter_source
 from .base import BaseVideoParser
 
 
@@ -64,6 +65,14 @@ _BLOCKED_NOTICE_INTERVAL = 900.0
 # 热评是附加信息，不能拖慢正文解析：单次请求与整体抓取都设上限。
 _PUBLIC_PAGE_TIMEOUT = 12.0
 _HOT_COMMENT_BUDGET = 26.0
+# Nitter 实例通常自建/同机，响应很快；给一个更短的超时避免拖慢正文。
+_NITTER_TIMEOUT = 10.0
+_NITTER_BUDGET = 18.0
+_NITTER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_NITTER_HINT_INTERVAL = 3600.0
 
 
 class TwitterParser(BaseVideoParser):
@@ -71,6 +80,8 @@ class TwitterParser(BaseVideoParser):
 
     # 进程内共享：控制"平台拒绝"提示的冷却，避免每条推文刷一行日志。
     _blocked_notice_at: float = 0.0
+    # 进程内共享：控制"建议配置 Nitter"提示的冷却。
+    _nitter_hint_at: float = 0.0
 
     def __init__(
         self,
@@ -79,6 +90,7 @@ class TwitterParser(BaseVideoParser):
         use_video_proxy: bool = False,
         proxy_url: str = None,
         hot_comment_count: int = 0,
+        nitter_base_url: str = "",
     ):
         """初始化Twitter解析器
 
@@ -87,6 +99,8 @@ class TwitterParser(BaseVideoParser):
             use_image_proxy: 图片下载是否使用代理
             use_video_proxy: 视频下载是否使用代理
             proxy_url: 代理地址（格式：http://host:port 或 socks5://host:port）
+            hot_comment_count: 热评条数上限，0 表示不抓热评
+            nitter_base_url: Nitter 实例地址（可用逗号分隔多个），留空关闭
         """
         super().__init__("twitter")
         self.use_parse_proxy = use_parse_proxy
@@ -97,6 +111,7 @@ class TwitterParser(BaseVideoParser):
             self.hot_comment_count = min(20, max(0, int(hot_comment_count)))
         except (TypeError, ValueError):
             self.hot_comment_count = 0
+        self.nitter_base_urls = nitter_source.normalize_base_urls(nitter_base_url)
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         self.headers = {
             "User-Agent": (
@@ -480,6 +495,141 @@ class TwitterParser(BaseVideoParser):
 
         self._log_hot_comment_failure(tweet_id, failures, blocked_only)
         return []
+
+    @staticmethod
+    def _is_local_host(base_url: str) -> bool:
+        """判断 Nitter 地址是否指向本机/内网，用于决定是否绕过代理。"""
+        host = urlparse(str(base_url or "")).hostname or ""
+        host = host.strip("[]").lower()
+        if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local"):
+            return True
+        if host.startswith(("10.", "192.168.", "127.")):
+            return True
+        if host.startswith("172."):
+            parts = host.split(".")
+            if len(parts) > 1 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
+                return True
+        return False
+
+    def _nitter_proxy(self, base_url: str) -> Optional[str]:
+        """自建/内网 Nitter 一律直连；公共实例才跟随解析代理设置。"""
+        if not self.proxy_url or not self.use_parse_proxy:
+            return None
+        if self._is_local_host(base_url):
+            return None
+        return self.proxy_url
+
+    async def _fetch_nitter_page(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        proxy: Optional[str],
+        timeout: float = _NITTER_TIMEOUT,
+    ) -> str:
+        """抓取一次 Nitter 帖子页 HTML，失败抛异常。"""
+        async with session.get(
+            url,
+            headers={
+                "User-Agent": _NITTER_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=max(3.0, float(timeout))),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            return await response.text(errors="replace")
+
+    async def _fetch_nitter_extras(
+        self,
+        session: aiohttp.ClientSession,
+        tweet_id: str,
+        screen_name: str = "",
+    ) -> Dict[str, Any]:
+        """依次尝试已配置的 Nitter 实例，返回回复与统计数据。
+
+        Nitter 是 X 的开源前端，未登录即可拿到回复区与统计数字，是当前唯一
+        稳定的热评来源（X 自身的 SSR 页面已不再输出 JSON-LD）。
+        """
+        limit = self.hot_comment_count
+        started = time.monotonic()
+        failures: List[str] = []
+        for base_url in self.nitter_base_urls:
+            remaining = _NITTER_BUDGET - (time.monotonic() - started)
+            if remaining <= 1.0:
+                failures.append("其余 Nitter 实例已跳过: 超出时间预算")
+                break
+            url = nitter_source.thread_url(base_url, tweet_id, screen_name)
+            try:
+                html_text = await self._fetch_nitter_page(
+                    session,
+                    url,
+                    self._nitter_proxy(base_url),
+                    min(_NITTER_TIMEOUT, remaining),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures.append(f"{url} -> {type(exc).__name__}: {exc}")
+                continue
+            parsed = nitter_source.parse_thread(html_text, limit, base_url)
+            if parsed.get("comments") or parsed.get("stats_line"):
+                logger.debug(
+                    f"[{self.name}] Nitter 抓取成功: tweet_id={tweet_id}, "
+                    f"comments={len(parsed.get('comments') or [])}, "
+                    f"stats={parsed.get('stats_line') or '-'}, source={url}"
+                )
+                return parsed
+            failures.append(
+                f"{url} -> 页面已取回但未解析到内容(len={len(html_text)})"
+            )
+        if failures:
+            logger.warning(
+                f"[{self.name}] Nitter 未返回可用内容: tweet_id={tweet_id}; "
+                + "; ".join(failures)
+            )
+        return {}
+
+    def _log_nitter_hint(self) -> None:
+        """未配置 Nitter 时，按冷却期提示一次可行方案。"""
+        now = time.monotonic()
+        if now - TwitterParser._nitter_hint_at < _NITTER_HINT_INTERVAL:
+            return
+        TwitterParser._nitter_hint_at = now
+        logger.info(
+            f"[{self.name}] X 已停止对未登录访问输出服务端渲染的回复数据，"
+            f"因此热评通常抓不到。可在配置项"
+            f"「附加内容：热评 → Nitter 实例地址」填入一个可用的 Nitter "
+            f"（例如自建的 http://127.0.0.1:8585），即可恢复热评并补全"
+            f"点赞/转发/阅读等统计数字。（1 小时内不再重复提示）"
+        )
+
+    async def _collect_thread_extras(
+        self,
+        session: aiohttp.ClientSession,
+        tweet_id: str,
+        screen_name: str = "",
+    ) -> Dict[str, Any]:
+        """汇总热评与统计数字：Nitter 优先，X 公开页兜底。"""
+        extras: Dict[str, Any] = {
+            "comments": [],
+            "stats_line": "",
+            "author_avatar": "",
+        }
+        if self.nitter_base_urls:
+            parsed = await self._fetch_nitter_extras(session, tweet_id, screen_name)
+            extras["comments"] = list(parsed.get("comments") or [])
+            extras["stats_line"] = str(parsed.get("stats_line") or "")
+            extras["author_avatar"] = str(parsed.get("author_avatar") or "")
+        if extras["comments"] or self.hot_comment_count <= 0:
+            return extras
+        if not self.nitter_base_urls:
+            self._log_nitter_hint()
+        extras["comments"] = await self._fetch_hot_comments(
+            session, tweet_id, screen_name
+        )
+        return extras
 
     def _log_hot_comment_failure(
         self,
@@ -1079,23 +1229,31 @@ class TwitterParser(BaseVideoParser):
             tweet_id = tweet_id_match.group(1)
             # 链接里通常已带作者 handle，热评抓取要用它拼规范路径。
             screen_name = self._screen_name_from_url(url)
-            comments_task = None
-            if self.hot_comment_count > 0 and session is not None:
-                comments_task = asyncio.create_task(
-                    self._fetch_hot_comments(session, tweet_id, screen_name)
+            # Nitter 即使不取热评也能补全统计数字，因此两个条件任一成立就并发跑。
+            extras_task = None
+            if session is not None and (
+                self.hot_comment_count > 0 or self.nitter_base_urls
+            ):
+                extras_task = asyncio.create_task(
+                    self._collect_thread_extras(session, tweet_id, screen_name)
                 )
             try:
                 media_info = await self._fetch_media_info(session, tweet_id)
             except (asyncio.CancelledError, Exception):
-                if comments_task is not None:
-                    comments_task.cancel()
-                    await asyncio.gather(comments_task, return_exceptions=True)
+                if extras_task is not None:
+                    extras_task.cancel()
+                    await asyncio.gather(extras_task, return_exceptions=True)
                 raise
 
             hot_comments: List[Dict[str, Any]] = []
-            if comments_task is not None:
+            stats_line = ""
+            nitter_avatar = ""
+            if extras_task is not None:
                 try:
-                    hot_comments = await comments_task
+                    extras = await extras_task
+                    hot_comments = list(extras.get("comments") or [])
+                    stats_line = str(extras.get("stats_line") or "")
+                    nitter_avatar = str(extras.get("author_avatar") or "")
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1144,7 +1302,8 @@ class TwitterParser(BaseVideoParser):
                 "url": url,
                 "title": str(title or "").strip(),
                 "author": author,
-                "avatar_url": str(media_info.get("avatar_url") or ""),
+                # FxTwitter/GraphQL 拿不到头像时，用 Nitter 还原的 CDN 直链兜底。
+                "avatar_url": str(media_info.get("avatar_url") or "") or nitter_avatar,
                 "desc": text,
                 "timestamp": timestamp,
                 "image_headers": image_headers,
@@ -1157,6 +1316,8 @@ class TwitterParser(BaseVideoParser):
             }
             if hot_comments:
                 metadata_base["hot_comments"] = hot_comments
+            if stats_line:
+                metadata_base["stats_line"] = stats_line
 
             if has_videos and has_images:
                 result_dict = {
