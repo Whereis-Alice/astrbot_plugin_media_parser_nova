@@ -1,12 +1,30 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+import aiohttp
 
 from nova_core.parser.manager import ParserManager
+from nova_core.parser.platform import twitter as twitter_module
 from nova_core.parser.platform.twitter import (
     TwitterParser,
 )
+
+
+def _forbidden(*_args, **_kwargs) -> aiohttp.ClientResponseError:
+    """构造一个与 X 风控一致的 403 异常。"""
+    return aiohttp.ClientResponseError(
+        request_info=SimpleNamespace(
+            real_url="https://x.com/i/status/123",
+            url="https://x.com/i/status/123",
+            method="GET",
+            headers={},
+        ),
+        history=(),
+        status=403,
+        message="Forbidden",
+    )
 
 
 class TwitterParserTests(unittest.TestCase):
@@ -177,7 +195,8 @@ class TwitterPublicCommentTests(unittest.TestCase):
         comments = asyncio.run(parser._fetch_hot_comments(object(), "123"))
 
         self.assertEqual(comments, [])
-        self.assertEqual(parser._fetch_public_page.await_count, 2)
+        # 页面能取回就说明 UA 没被拒，不应再用第二个爬虫 UA 重复请求同一地址。
+        self.assertEqual(parser._fetch_public_page.await_count, 1)
 
     def test_fetch_hot_comments_retries_through_proxy_when_direct_fails(self):
         parser = TwitterParser(
@@ -187,7 +206,7 @@ class TwitterPublicCommentTests(unittest.TestCase):
         )
         calls = []
 
-        async def fake_page(session, url, proxy):
+        async def fake_page(session, url, proxy, user_agent=None, timeout=None):
             calls.append((url, proxy))
             if proxy is None:
                 raise OSError("connect timeout")
@@ -199,6 +218,88 @@ class TwitterPublicCommentTests(unittest.TestCase):
 
         self.assertEqual(len(comments), 2)
         self.assertEqual(calls[-1][1], "http://127.0.0.1:7890")
+        # 直连是传输层失败，同一代理下不应继续换 UA/换路径空转。
+        self.assertEqual(len([item for item in calls if item[1] is None]), 1)
+
+    def test_fetch_hot_comments_uses_canonical_path_first(self):
+        parser = TwitterParser(hot_comment_count=2)
+        calls = []
+
+        async def fake_page(session, url, proxy, user_agent=None, timeout=None):
+            calls.append(url)
+            raise _forbidden()
+
+        parser._fetch_public_page = fake_page
+
+        self.assertEqual(
+            asyncio.run(parser._fetch_hot_comments(object(), "123", "kuuu_Arcana")),
+            [],
+        )
+        self.assertEqual(calls[0], "https://x.com/kuuu_Arcana/status/123")
+        self.assertIn("https://x.com/i/status/123", calls)
+        # twitter.com 会 301 到 x.com，不再作为"第二来源"重复请求。
+        self.assertFalse([url for url in calls if "twitter.com" in url])
+
+    def test_fetch_hot_comments_switches_user_agent_on_forbidden(self):
+        parser = TwitterParser(hot_comment_count=2)
+        seen = []
+
+        async def fake_page(session, url, proxy, user_agent=None, timeout=None):
+            seen.append(user_agent)
+            raise _forbidden()
+
+        parser._fetch_public_page = fake_page
+
+        asyncio.run(parser._fetch_hot_comments(object(), "123"))
+
+        self.assertEqual(len(set(seen)), 2)
+
+    def test_forbidden_only_failures_do_not_emit_warning(self):
+        parser = TwitterParser(hot_comment_count=2)
+        parser._fetch_public_page = AsyncMock(side_effect=_forbidden())
+        TwitterParser._blocked_notice_at = 0.0
+
+        with patch.object(twitter_module.logger, "warning") as warn:
+            asyncio.run(parser._fetch_hot_comments(object(), "123"))
+
+        warn.assert_not_called()
+
+    def test_unexpected_failure_still_warns(self):
+        parser = TwitterParser(hot_comment_count=2)
+        parser._fetch_public_page = AsyncMock(side_effect=OSError("boom"))
+
+        with patch.object(twitter_module.logger, "warning") as warn:
+            asyncio.run(parser._fetch_hot_comments(object(), "123"))
+
+        warn.assert_called_once()
+
+    def test_blocked_notice_is_rate_limited(self):
+        parser = TwitterParser(hot_comment_count=2)
+        parser._fetch_public_page = AsyncMock(side_effect=_forbidden())
+        TwitterParser._blocked_notice_at = 0.0
+
+        with patch.object(twitter_module.logger, "info") as info:
+            asyncio.run(parser._fetch_hot_comments(object(), "123"))
+            asyncio.run(parser._fetch_hot_comments(object(), "456"))
+
+        info.assert_called_once()
+
+    def test_screen_name_from_url(self):
+        self.assertEqual(
+            TwitterParser._screen_name_from_url(
+                "https://x.com/kuuu_Arcana/status/2092232578006925597"
+            ),
+            "kuuu_Arcana",
+        )
+        self.assertEqual(
+            TwitterParser._screen_name_from_url("https://x.com/i/status/123"),
+            "i",
+        )
+        # handle 为 i 时不该拼出与 /i/status 重复的地址
+        self.assertEqual(
+            TwitterParser._public_page_urls("123", "i"),
+            ["https://x.com/i/status/123"],
+        )
 
     def test_fetch_hot_comments_disabled_returns_empty(self):
         parser = TwitterParser(hot_comment_count=0)

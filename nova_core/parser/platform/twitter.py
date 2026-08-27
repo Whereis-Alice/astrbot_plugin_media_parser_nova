@@ -4,6 +4,7 @@ import asyncio
 import html as html_lib
 import json
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -43,17 +44,33 @@ _JSONLD_SCRIPT_RE = re.compile(
     re.S | re.I,
 )
 # X 仅对爬虫 UA 返回内含 JSON-LD 的服务端渲染页；浏览器 UA 只会拿到
-# 不含任何回复内容的 JS 外壳。
-_CRAWLER_USER_AGENT = (
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+# 不含任何回复内容的 JS 外壳。同一个 UA 被风控拒绝(403)时换另一个爬虫
+# UA 再试一次，因为 X 对不同爬虫的放行策略并不一致。
+_CRAWLER_USER_AGENTS: Tuple[str, ...] = (
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
 )
-_PUBLIC_PAGE_HOSTS: Tuple[str, ...] = ("x.com", "twitter.com")
+_UA_LABEL_RE = re.compile(r"compatible;\s*([A-Za-z]+)")
+# 只保留 x.com。twitter.com 会 301 到 x.com，作为"第二来源"没有任何意义，
+# 反而让失败日志看起来像请求了两个不同站点（旧日志里两条的 url= 都是 x.com）。
+_PUBLIC_PAGE_HOST = "x.com"
+_HANDLE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_]")
 _JSONLD_MARKER = "application/ld+json"
 _COMMENT_NODE_MARKER = '"Comment"'
+# 未登录抓取 X 回复随时可能被平台关掉：401/403/404/429 属于"平台不允许"，
+# 不是插件异常。这类结果按冷却期提示一次即可，避免每条推文刷一行 WARN。
+_BLOCKED_STATUSES = frozenset({401, 403, 404, 429})
+_BLOCKED_NOTICE_INTERVAL = 900.0
+# 热评是附加信息，不能拖慢正文解析：单次请求与整体抓取都设上限。
+_PUBLIC_PAGE_TIMEOUT = 12.0
+_HOT_COMMENT_BUDGET = 26.0
 
 
 class TwitterParser(BaseVideoParser):
     """Twitter/X 解析器实现。"""
+
+    # 进程内共享：控制"平台拒绝"提示的冷却，避免每条推文刷一行日志。
+    _blocked_notice_at: float = 0.0
 
     def __init__(
         self,
@@ -316,24 +333,62 @@ class TwitterParser(BaseVideoParser):
             return comments
         return cls._parse_logged_out_comments_html(html_text, limit)
 
+    @staticmethod
+    def _ua_label(user_agent: str) -> str:
+        """从爬虫 UA 里取一个短标签，只用于日志可读性。"""
+        match = _UA_LABEL_RE.search(str(user_agent or ""))
+        return match.group(1) if match else "bot"
+
+    @staticmethod
+    def _status_code_of(exc: BaseException) -> Optional[int]:
+        """取 aiohttp 异常携带的 HTTP 状态码，非 HTTP 错误返回 None。"""
+        status = getattr(exc, "status", None)
+        return status if isinstance(status, int) else None
+
+    @staticmethod
+    def _screen_name_from_url(url: str) -> str:
+        """从帖子链接里取作者 handle（形如 /{screen_name}/status/{id}）。"""
+        match = re.search(
+            r"(?:twitter\.com|x\.com)/([A-Za-z0-9_]{1,15})/status/\d",
+            str(url or ""),
+        )
+        return match.group(1) if match else ""
+
+    @classmethod
+    def _public_page_urls(cls, tweet_id: str, screen_name: str = "") -> List[str]:
+        """按可用性从高到低给出公开帖子页地址。
+
+        X 的规范帖子路径是 /{screen_name}/status/{id}，/i/status/{id} 只是一个
+        重定向入口，服务端渲染对它的支持并不稳定。已知作者时优先用规范路径，
+        再回退到 /i/ 形式。
+        """
+        urls: List[str] = []
+        handle = _HANDLE_UNSAFE_RE.sub("", str(screen_name or ""))[:15]
+        if handle and handle.lower() != "i":
+            urls.append(f"https://{_PUBLIC_PAGE_HOST}/{handle}/status/{tweet_id}")
+        urls.append(f"https://{_PUBLIC_PAGE_HOST}/i/status/{tweet_id}")
+        return urls
+
     async def _fetch_public_page(
         self,
         session: aiohttp.ClientSession,
         url: str,
         proxy: Optional[str],
+        user_agent: str = _CRAWLER_USER_AGENTS[0],
+        timeout: float = _PUBLIC_PAGE_TIMEOUT,
     ) -> str:
         """抓取一次 X 公开页 HTML，返回正文（失败抛异常）。"""
         async with session.get(
             url,
             headers={
                 **self.headers,
-                "User-Agent": _CRAWLER_USER_AGENT,
+                "User-Agent": user_agent,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 "Cache-Control": "no-cache",
             },
             proxy=proxy,
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=max(3.0, float(timeout))),
             allow_redirects=True,
         ) as response:
             response.raise_for_status()
@@ -343,59 +398,118 @@ class TwitterParser(BaseVideoParser):
         self,
         session: aiohttp.ClientSession,
         tweet_id: str,
+        screen_name: str = "",
     ) -> List[Dict[str, Any]]:
         """从无需登录的 X 帖子页获取当前公开可见的精选回复。
 
         X 只对爬虫 UA 返回带 JSON-LD 的服务端渲染页面，普通浏览器 UA 拿到的
-        是纯 JS 外壳（里面没有任何回复），因此这里固定使用爬虫 UA。
-        另外 x.com 在部分网络环境下直连不可达，若已配置代理则在直连失败后
-        自动用代理重试一次，避免"没有报错也没有评论"的静默失败。
+        是纯 JS 外壳（里面没有任何回复），因此这里只用爬虫 UA。
+        尝试顺序：规范路径 → /i/ 路径，每个路径依次换爬虫 UA；若配置了代理但
+        解析不走代理，则整轮直连失败后再用代理跑一遍，避免"既没报错也没评论"
+        的静默失败。整体受 _HOT_COMMENT_BUDGET 时间预算约束，绝不拖慢正文解析。
         """
         limit = self.hot_comment_count
         if limit <= 0:
             return []
 
-        attempts: List[Tuple[str, Optional[str]]] = []
         primary_proxy = self.proxy_url if self.use_parse_proxy else None
-        for host in _PUBLIC_PAGE_HOSTS:
-            attempts.append((f"https://{host}/i/status/{tweet_id}", primary_proxy))
+        proxies: List[Optional[str]] = [primary_proxy]
         if self.proxy_url and not self.use_parse_proxy:
-            # 直连拿不到时用代理兜底：热评抓取走的是 x.com 本站，
-            # 和 FxTwitter 的可达性不一样。
-            attempts.append(
-                (f"https://{_PUBLIC_PAGE_HOSTS[0]}/i/status/{tweet_id}", self.proxy_url)
-            )
+            # 直连拿不到时用代理兜底：热评抓的是 x.com 本站，
+            # 可达性和 FxTwitter 不一样。
+            proxies.append(self.proxy_url)
 
+        attempts: List[Tuple[str, str, Optional[str]]] = []
+        for proxy in proxies:
+            for url in self._public_page_urls(tweet_id, screen_name):
+                for user_agent in _CRAWLER_USER_AGENTS:
+                    attempts.append((url, user_agent, proxy))
+
+        started = time.monotonic()
         failures: List[str] = []
-        for url, proxy in attempts:
+        # blocked_only 表示"全部失败都是平台明确拒绝"，用于区分平台限制与真故障。
+        blocked_only = bool(attempts)
+        dead_proxies: set = set()
+        served: set = set()
+
+        for url, user_agent, proxy in attempts:
+            if proxy in dead_proxies or (url, proxy) in served:
+                continue
+            remaining = _HOT_COMMENT_BUDGET - (time.monotonic() - started)
+            if remaining <= 1.0:
+                blocked_only = False
+                failures.append("其余来源已跳过: 超出热评抓取时间预算")
+                break
             via = "(经代理)" if proxy else ""
+            tag = f"{url}{via}[{self._ua_label(user_agent)}]"
             try:
-                html_text = await self._fetch_public_page(session, url, proxy)
+                html_text = await self._fetch_public_page(
+                    session,
+                    url,
+                    proxy,
+                    user_agent,
+                    min(_PUBLIC_PAGE_TIMEOUT, remaining),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                failures.append(f"{url}{via} -> {type(exc).__name__}: {exc}")
+                status = self._status_code_of(exc)
+                failures.append(f"{tag} -> {type(exc).__name__}: {exc}")
+                if status is None:
+                    # 连不上/超时：同一代理下换 UA 或换路径都是白试。
+                    blocked_only = False
+                    dead_proxies.add(proxy)
+                elif status not in _BLOCKED_STATUSES:
+                    blocked_only = False
                 continue
+            # 页面能取回说明这条链路上 UA 没被拒，换 UA 也不会多出回复。
+            served.add((url, proxy))
             comments = self._extract_public_comments(html_text, limit)
             if comments:
                 logger.debug(
                     f"[{self.name}] 公开回复抓取成功: tweet_id={tweet_id}, "
-                    f"count={len(comments)}, source={url}"
+                    f"count={len(comments)}, source={tag}"
                 )
                 return comments
-            has_jsonld = _JSONLD_MARKER in html_text
-            has_comment_node = _COMMENT_NODE_MARKER in html_text
+            blocked_only = False
             failures.append(
-                f"{url}{via} -> 页面已取回但未解析到回复("
-                f"len={len(html_text)}, jsonld={has_jsonld}, "
-                f"comment_node={has_comment_node})"
+                f"{tag} -> 页面已取回但未解析到回复("
+                f"len={len(html_text)}, jsonld={_JSONLD_MARKER in html_text}, "
+                f"comment_node={_COMMENT_NODE_MARKER in html_text})"
             )
 
-        logger.warning(
-            f"[{self.name}] 未能获取公开热评(已请求 {len(attempts)} 个来源): "
-            f"tweet_id={tweet_id}; " + "; ".join(failures)
-        )
+        self._log_hot_comment_failure(tweet_id, failures, blocked_only)
         return []
+
+    def _log_hot_comment_failure(
+        self,
+        tweet_id: str,
+        failures: List[str],
+        blocked_only: bool,
+    ) -> None:
+        """按失败性质分级输出日志。
+
+        平台明确拒绝(401/403/404/429)是"X 关掉了未登录访问"，不是插件故障，
+        每条推文都刷 WARN 只会淹没真正的问题；这类情况详情降到 DEBUG，
+        另按冷却期给一条 INFO 说明。其余失败（网络不通、超时、页面结构变化）
+        仍然 WARN。
+        """
+        if not failures:
+            return
+        detail = f"tweet_id={tweet_id}; " + "; ".join(failures)
+        if not blocked_only:
+            logger.warning(f"[{self.name}] 未能获取公开热评: {detail}")
+            return
+        logger.debug(f"[{self.name}] 公开热评被平台拒绝: {detail}")
+        now = time.monotonic()
+        if now - TwitterParser._blocked_notice_at < _BLOCKED_NOTICE_INTERVAL:
+            return
+        TwitterParser._blocked_notice_at = now
+        logger.info(
+            f"[{self.name}] X 拒绝了未登录访问帖子页(HTTP 401/403/404/429)，"
+            f"推文将不带热评展示；正文/图片/视频解析不受影响。"
+            f"（{int(_BLOCKED_NOTICE_INTERVAL // 60)} 分钟内不再重复提示）"
+        )
 
     def can_parse(self, url: str) -> bool:
         """判断是否可以解析此URL
@@ -963,10 +1077,12 @@ class TwitterParser(BaseVideoParser):
             if not tweet_id_match:
                 raise RuntimeError(f"无法解析此URL: {url}")
             tweet_id = tweet_id_match.group(1)
+            # 链接里通常已带作者 handle，热评抓取要用它拼规范路径。
+            screen_name = self._screen_name_from_url(url)
             comments_task = None
             if self.hot_comment_count > 0 and session is not None:
                 comments_task = asyncio.create_task(
-                    self._fetch_hot_comments(session, tweet_id)
+                    self._fetch_hot_comments(session, tweet_id, screen_name)
                 )
             try:
                 media_info = await self._fetch_media_info(session, tweet_id)
