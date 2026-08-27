@@ -255,7 +255,7 @@ class M3U8Handler:
                     await run_blocking(os.fsync, output_file.fileno())
                     await run_blocking(output_file.close)
                     output_file = None
-                    os.replace(temp_path, output_path)
+                    await run_blocking(os.replace, temp_path, output_path)
                 return
             except asyncio.CancelledError:
                 if output_file is not None:
@@ -343,7 +343,9 @@ class M3U8Handler:
                 f"M3U8分片数量超过安全限制（{len(segments)} > {MAX_HLS_SEGMENTS}）"
             )
 
-        os.makedirs(output_dir, exist_ok=True)
+        await run_blocking(os.makedirs, output_dir, exist_ok=True)
+        # 目录创建后立即补标记，避免空目录清理逻辑摘掉在用目录的缓存标记
+        await run_blocking(stamp_subdir, output_dir)
 
         async def download_segment(i: int, url: str) -> Optional[str]:
             """下载单个分片"""
@@ -508,14 +510,9 @@ class M3U8Handler:
         self,
         merged_path: str,
         output_path: str,
-        use_ffmpeg: bool,
         budget: ByteBudget,
     ) -> bool:
         """将拼接后的 TS/fMP4 正确封装为输出文件并原子提交。"""
-        if not use_ffmpeg:
-            os.replace(merged_path, output_path)
-            return True
-
         ffmpeg_output = f"{merged_path}.mp4"
         try:
             process = await asyncio.create_subprocess_exec(
@@ -542,7 +539,7 @@ class M3U8Handler:
             if size > budget.limit:
                 logger.warning("M3U8单流封装输出超过下载硬限制")
                 return False
-            os.replace(ffmpeg_output, output_path)
+            await run_blocking(os.replace, ffmpeg_output, output_path)
             return True
         except FileNotFoundError:
             logger.warning("ffmpeg 未找到，无法正确封装M3U8单流")
@@ -573,7 +570,9 @@ class M3U8Handler:
             (下载是否成功, 错误原因, HTTP状态码)
         """
         output_dir = os.path.dirname(os.path.abspath(output_path))
-        os.makedirs(output_dir, exist_ok=True)
+        await run_blocking(os.makedirs, output_dir, exist_ok=True)
+        # 目录创建后立即补标记，避免空目录清理逻辑摘掉在用目录的缓存标记
+        await run_blocking(stamp_subdir, output_dir)
         temp_dir = tempfile.mkdtemp(prefix=".m3u8_", dir=output_dir)
         budget = ByteBudget(resolve_max_bytes(max_bytes, is_video=True))
         try:
@@ -588,7 +587,7 @@ class M3U8Handler:
                 video_merged = os.path.join(temp_dir, "video.m4s")
                 if await self.merge_segments(v_init, v_files, video_merged, budget):
                     if await self._publish_single_stream(
-                        video_merged, output_path, use_ffmpeg, budget
+                        video_merged, output_path, budget
                     ):
                         logger.info(f"✓ 视频下载完成: {output_path}")
                         return True, None, None
@@ -604,7 +603,7 @@ class M3U8Handler:
                 video_merged = os.path.join(temp_dir, "video.m4s")
                 if await self.merge_segments(v_init, v_files, video_merged, budget):
                     if await self._publish_single_stream(
-                        video_merged, output_path, use_ffmpeg, budget
+                        video_merged, output_path, budget
                     ):
                         logger.info(f"✓ 视频下载完成: {output_path}")
                         return True, None, None
@@ -664,7 +663,7 @@ class M3U8Handler:
                         output_size = await run_blocking(os.path.getsize, ffmpeg_output)
                         if output_size > budget.limit:
                             raise M3U8DownloadError("M3U8合并输出超过下载硬限制")
-                        os.replace(ffmpeg_output, output_path)
+                        await run_blocking(os.replace, ffmpeg_output, output_path)
                         logger.info(f"✓ 视频下载完成: {output_path}")
                         return True, None, None
 

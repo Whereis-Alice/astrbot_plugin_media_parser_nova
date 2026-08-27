@@ -196,7 +196,7 @@ class ParseRecordManager:
 
         with self._lock:
             self._load()
-            self._prune(current)
+            pruned = self._prune(current)
             allowed: List[Tuple[str, Any]] = []
             blocked: List[BlockedParseItem] = []
             changed = False
@@ -248,7 +248,9 @@ class ParseRecordManager:
                     self._append_timestamp("users", normalized_user_key, current)
                     changed = True
 
-            if changed or blocked:
+            # 命中限流本身不会改动记录内容，只有新增记录或裁剪掉过期记录时才落盘，
+            # 避免无谓的整文件重写。
+            if changed or pruned:
                 self._save(current)
             return allowed, blocked
 
@@ -265,7 +267,7 @@ class ParseRecordManager:
         current = int(now or time.time())
         with self._lock:
             self._load()
-            self._prune(current)
+            pruned = self._prune(current)
             changed = False
             seen_keys = set()
 
@@ -291,7 +293,7 @@ class ParseRecordManager:
                 self._append_timestamp("links", final_key, current)
                 changed = True
 
-            if changed:
+            if changed or pruned:
                 self._save(current)
 
     def _load(self) -> None:
@@ -349,36 +351,50 @@ class ParseRecordManager:
         try:
             if directory:
                 os.makedirs(directory, exist_ok=True)
+            # 先在内存里完成序列化，再一次性写入临时文件；json.dump 会在循环中
+            # 反复对文件对象做小块阻塞写入，这里合并为单次写入。
+            payload = json.dumps(
+                self._records,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             tmp_path = f"{self.record_file}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    self._records,
-                    f,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+                f.write(payload)
             os.replace(tmp_path, self.record_file)
         except Exception as e:
             logger.warning(f"写入解析频率记录失败: {e}")
 
-    def _prune(self, current: int) -> None:
+    def _prune(self, current: int) -> bool:
+        """裁剪过期记录，返回内存记录是否真的发生了变化。"""
         retention = self.retention_seconds
         if retention <= 0:
+            pruned = bool(
+                self._records.get("links") or self._records.get("users")
+            )
             self._records = self._empty_records()
-            return
+            return pruned
+
         cutoff = current - retention
+        pruned = False
         for bucket in ("links", "users"):
             raw_items = self._records.get(bucket)
             if not isinstance(raw_items, dict):
                 self._records[bucket] = {}
+                pruned = True
                 continue
             for key in list(raw_items.keys()):
-                values = self._normalize_timestamps(raw_items.get(key))
+                original = raw_items.get(key)
+                values = self._normalize_timestamps(original)
                 values = [ts for ts in values if ts >= cutoff]
                 if values:
+                    if values != original:
+                        pruned = True
                     raw_items[key] = values
                 else:
                     raw_items.pop(key, None)
+                    pruned = True
+        return pruned
 
     @staticmethod
     def _normalize_timestamps(values: Any) -> List[int]:

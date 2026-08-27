@@ -1,5 +1,6 @@
 """配置管理模块，负责默认值处理、类型转换与配置兜底。"""
 
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from .translation.provider_defs import (
     LLM_PROVIDER_DEFAULTS,
     LLM_PROVIDER_OPTIONS,
 )
+
+DEFAULT_MAX_VIDEO_SIZE_MB = 1000.0
 
 BILIBILI_QUALITY_MAP = {
     "不限制": 0,
@@ -113,19 +116,52 @@ LEGACY_TRANSLATION_APPLY_SCOPES = {
 }
 DEFAULT_CARD_WATERMARK = "Nova解析"
 
-CARD_SKIN_NOVA = "nova"
-CARD_SKIN_EDITORIAL = "editorial"
-CARD_SKIN_SIGNAL = "signal"
-CARD_SKIN_POSTER = "poster"
-CARD_SKIN_NEON = "neon"
+# 卡片皮肤与布局的唯一事实来源是 nova_core/card/theme.py 的 THEMES / LAYOUTS，
+# 这里只保留 key -> 中文 label 的映射，别名归一化一律复用 theme 模块的解析函数。
+CARD_SKIN_AURORA = "aurora"
+CARD_SKIN_BROADSHEET = "broadsheet"
+CARD_SKIN_TELEMETRY = "telemetry"
+CARD_SKIN_GALLERY = "gallery"
+CARD_SKIN_NOCTURNE = "nocturne"
 CARD_SKIN_BILIBILI = "bilibili"
-CARD_SKINS = {
-    CARD_SKIN_NOVA,
-    CARD_SKIN_EDITORIAL,
-    CARD_SKIN_SIGNAL,
-    CARD_SKIN_POSTER,
-    CARD_SKIN_NEON,
-    CARD_SKIN_BILIBILI,
+DEFAULT_CARD_SKIN = CARD_SKIN_AURORA
+CARD_SKINS: Dict[str, str] = {
+    CARD_SKIN_AURORA: "极光",
+    CARD_SKIN_BROADSHEET: "报章",
+    CARD_SKIN_TELEMETRY: "测控",
+    CARD_SKIN_GALLERY: "展陈",
+    CARD_SKIN_NOCTURNE: "夜曲",
+    CARD_SKIN_BILIBILI: "哔哩哔哩",
+}
+
+# v1.4 及更早版本的公开常量名，指向对应的新皮肤，避免外部导入直接失效。
+CARD_SKIN_NOVA = CARD_SKIN_AURORA
+CARD_SKIN_EDITORIAL = CARD_SKIN_BROADSHEET
+CARD_SKIN_SIGNAL = CARD_SKIN_TELEMETRY
+CARD_SKIN_POSTER = CARD_SKIN_GALLERY
+CARD_SKIN_NEON = CARD_SKIN_NOCTURNE
+
+DEFAULT_CARD_LAYOUT = "standard"
+CARD_LAYOUTS: Dict[str, str] = {
+    "standard": "标准",
+    "magazine": "杂志",
+    "immersive": "沉浸",
+    "feed": "紧凑流",
+}
+
+#: theme.THEME_ALIASES 未收录、但历史版本曾接受过的皮肤写法（仅做兜底补充）。
+LEGACY_CARD_SKIN_VALUES: Dict[str, str] = {
+    "基础": CARD_SKIN_AURORA,
+    "编辑": CARD_SKIN_BROADSHEET,
+    "杂志高级": CARD_SKIN_BROADSHEET,
+    "数据终端": CARD_SKIN_TELEMETRY,
+    "档案海报": CARD_SKIN_GALLERY,
+    "霓虹风格": CARD_SKIN_NOCTURNE,
+    "b站卡片": CARD_SKIN_BILIBILI,
+}
+#: theme.LAYOUT_ALIASES 未收录的旧布局选项（v1.4 schema 里的“信息流”）。
+LEGACY_CARD_LAYOUT_VALUES: Dict[str, str] = {
+    "信息流": "feed",
 }
 
 
@@ -322,8 +358,8 @@ class CardRenderConfig:
     custom_font: str = ""
     save_dir: str = ""
     theme: str = "dark"
-    layout: str = "standard"
-    skin: str = CARD_SKIN_NOVA
+    layout: str = DEFAULT_CARD_LAYOUT
+    skin: str = DEFAULT_CARD_SKIN
     width: int = 800
     cover_full_size: bool = False
     show_play_button: bool = False
@@ -397,7 +433,7 @@ class PermissionConfig:
 
 @dataclass
 class DownloadConfig:
-    max_video_size_mb: float = 1000.0
+    max_video_size_mb: float = DEFAULT_MAX_VIDEO_SIZE_MB
     large_video_threshold_mb: float = Config.DEFAULT_LARGE_VIDEO_THRESHOLD_MB
     cache_dir: str = ""
     cache_dir_available: bool = False
@@ -520,6 +556,7 @@ class ConfigManager:
                 "permissions": None,
             }
         self._migrate_message_config(config)
+        self._migrate_translation_config(config)
         self._parse_config(config)
 
     # ── 内部解析 ────────────────────────────────────────
@@ -719,7 +756,11 @@ class ConfigManager:
                 ),
             ),
             card_render=CardRenderConfig(
-                enabled=bool(card_render.get("enable", False)),
+                enabled=self._parse_bool(
+                    card_render.get("enable", False),
+                    False,
+                    "message.card_render.enable",
+                ),
                 mode=self._parse_card_mode(
                     card_render.get("mode", CARD_MODE_COMBINED)
                 ),
@@ -730,19 +771,23 @@ class ConfigManager:
                     card_render.get("theme", "dark")
                 ),
                 layout=self._parse_card_layout(
-                    card_render.get("layout", "standard")
+                    card_render.get("layout", DEFAULT_CARD_LAYOUT)
                 ),
                 skin=self._parse_card_skin(
-                    card_render.get("skin", CARD_SKIN_NOVA)
+                    card_render.get("skin", DEFAULT_CARD_SKIN)
                 ),
                 width=self._parse_card_width(
                     card_render.get("width", 800)
                 ),
-                cover_full_size=bool(
-                    card_render.get("cover_full_size", False)
+                cover_full_size=self._parse_bool(
+                    card_render.get("cover_full_size", False),
+                    False,
+                    "message.card_render.cover_full_size",
                 ),
-                show_play_button=bool(
-                    card_render.get("show_play_button", False)
+                show_play_button=self._parse_bool(
+                    card_render.get("show_play_button", False),
+                    False,
+                    "message.card_render.show_play_button",
                 ),
                 watermark=self._parse_card_watermark(
                     card_render.get("watermark", DEFAULT_CARD_WATERMARK)
@@ -812,7 +857,8 @@ class ConfigManager:
         download_raw = self._as_dict(config.get("download"))
 
         max_video_size_mb = self._parse_non_negative_float(
-            download_raw.get("max_video_size_mb", 1000.0), 1000.0
+            download_raw.get("max_video_size_mb", DEFAULT_MAX_VIDEO_SIZE_MB),
+            DEFAULT_MAX_VIDEO_SIZE_MB,
         )
         large_video_threshold_mb = self._parse_non_negative_float(
             download_raw.get(
@@ -900,9 +946,9 @@ class ConfigManager:
                 translation_raw.get("content_scope", "正文和标题")
             ),
             apply_scope=self._parse_translation_apply_scope(
-                translation_raw.get(
-                    "output_mode", TRANSLATION_APPLY_CARD_AND_TEXT
-                )
+                translation_raw.get("apply_scope")
+                or translation_raw.get("output_mode")
+                or TRANSLATION_APPLY_CARD_AND_TEXT
             ),
             target_language=self._parse_translation_target_language(
                 translation_raw.get("target_language", "简体中文")
@@ -915,6 +961,27 @@ class ConfigManager:
             base_url=base_url,
             api_key=str(custom_provider_raw.get("api_key", "") or "").strip(),
             model=str(custom_provider_raw.get("model", "gpt-5.5") or "gpt-5.5").strip(),
+            temperature=self._parse_translation_temperature(
+                translation_llm_raw.get("temperature", 0.0)
+            ),
+            max_completion_tokens=self._parse_bounded_int(
+                translation_llm_raw.get("max_completion_tokens", 4000),
+                4000,
+                256,
+                32000,
+            ),
+            request_timeout_seconds=self._parse_bounded_int(
+                translation_llm_raw.get("request_timeout_seconds", 60),
+                60,
+                10,
+                600,
+            ),
+            max_text_chars_per_request=self._parse_bounded_int(
+                translation_llm_raw.get("max_text_chars_per_request", 4000),
+                4000,
+                500,
+                20000,
+            ),
         )
 
         cache_dir_available = check_cache_dir_available(cache_dir)
@@ -969,10 +1036,10 @@ class ConfigManager:
             if max_quality_label in BILIBILI_QUALITY_MAP:
                 max_quality = BILIBILI_QUALITY_MAP[max_quality_label]
             else:
-                max_quality = BILIBILI_QUALITY_MAP["720P"]
+                max_quality = BILIBILI_QUALITY_MAP["不限制"]
                 logger.warning(
                     f"无效的B站最大画质配置 {max_quality_label!r}，"
-                    "已按安全默认值720P处理"
+                    "已按“不限制”处理（不会静默降画质）"
                 )
             admin_assist_raw = bili.get("admin_assist", {})
             if not isinstance(admin_assist_raw, dict):
@@ -1089,11 +1156,15 @@ class ConfigManager:
                 "admin.debug",
             ),
         )
-        import logging
-
-        logger.setLevel(logging.DEBUG if self.admin.debug_mode else logging.NOTSET)
+        # 不在解析配置时调用 logger.setLevel：该 logger 是宿主 AstrBot 的全局实例，
+        # 改动会污染其它插件与框架自身的日志级别。debug 能力改为局部判断。
         if self.admin.debug_mode:
             logger.debug("Debug模式已启用")
+            if not self._debug_logging_enabled():
+                logger.info(
+                    "Debug模式已启用，但当前日志级别未开放 DEBUG；"
+                    "请在 AstrBot 日志配置中调低级别以查看调试日志"
+                )
 
         if (
             self.message.archive.command
@@ -1105,6 +1176,17 @@ class ConfigManager:
             self.message.archive.command = ""
 
     # ── 工厂方法 ────────────────────────────────────────
+
+    @staticmethod
+    def _debug_logging_enabled() -> bool:
+        """判断当前日志级别是否已开放 DEBUG（无法判断时按已开放处理）。"""
+        checker = getattr(logger, "isEnabledFor", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker(logging.DEBUG))
+        except Exception:
+            return True
 
     def _parser_enabled(self, parser_name: str) -> bool:
         return self.parser_output.controller_has_any_output(parser_name)
@@ -1267,40 +1349,57 @@ class ConfigManager:
 
     @staticmethod
     def _parse_card_layout(value) -> str:
-        layout = str(value or "").strip().lower()
-        if layout in ("magazine", "杂志"):
-            return "magazine"
-        if layout in ("immersive", "沉浸", "沉浸式"):
-            return "immersive"
-        if layout in ("feed", "信息流"):
-            return "feed"
-        if layout in ("standard", "标准"):
-            return "standard"
-        return "standard"
+        """把任意历史 / 中文 / 英文布局写法归一到 4 个布局 key 之一。"""
+        raw = str(value or "").strip()
+        if not raw:
+            return DEFAULT_CARD_LAYOUT
+        legacy = LEGACY_CARD_LAYOUT_VALUES.get(raw.lower())
+        if legacy:
+            return legacy
+        try:
+            # 延迟导入：渲染层位于配置层下游，模块级导入会形成循环依赖。
+            from .card.theme import resolve_layout_key
+        except Exception:  # pragma: no cover - 渲染层不可用时退化为直通
+            lowered = raw.lower()
+            return lowered if lowered in CARD_LAYOUTS else DEFAULT_CARD_LAYOUT
+        return resolve_layout_key(raw)
 
     @staticmethod
     def _parse_card_skin(value) -> str:
-        skin = str(value or "").strip().lower()
-        if skin in ("editorial", "编辑室", "编辑", "杂志高级"):
-            return CARD_SKIN_EDITORIAL
-        if skin in ("signal", "信号终端", "终端", "数据终端"):
-            return CARD_SKIN_SIGNAL
-        if skin in ("poster", "海报档案", "海报", "档案海报"):
-            return CARD_SKIN_POSTER
-        if skin in ("neon", "霓虹", "霓虹夜景", "霓虹风格"):
-            return CARD_SKIN_NEON
-        if skin in (
-            "bilibili",
-            "哔哩哔哩",
-            "哔哩哔哩风格",
-            "b站动态",
-            "b站风格",
-            "b站卡片",
-        ):
-            return CARD_SKIN_BILIBILI
-        if skin in ("nova", "nova 原生", "原生", "基础"):
-            return CARD_SKIN_NOVA
-        return CARD_SKIN_NOVA
+        """把任意历史 / 中文 / 英文皮肤写法归一到 6 个皮肤 key 之一。"""
+        raw = str(value or "").strip()
+        if not raw:
+            return DEFAULT_CARD_SKIN
+        legacy = LEGACY_CARD_SKIN_VALUES.get(raw.lower())
+        if legacy:
+            return legacy
+        try:
+            # 延迟导入：渲染层位于配置层下游，模块级导入会形成循环依赖。
+            from .card.theme import resolve_theme_key
+        except Exception:  # pragma: no cover - 渲染层不可用时退化为直通
+            lowered = raw.lower()
+            return lowered if lowered in CARD_SKINS else DEFAULT_CARD_SKIN
+        return resolve_theme_key(raw)
+
+    @staticmethod
+    def _parse_bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+        """把整数配置夹到 [minimum, maximum]，非法值回落默认值。"""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, parsed))
+
+    @staticmethod
+    def _parse_translation_temperature(value) -> float:
+        """采样温度：限制在 0.0-2.0，非法值回落 0.0。"""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            return 0.0
+        return max(0.0, min(2.0, parsed))
 
     @staticmethod
     def _parse_translation_target_language(value) -> str:
@@ -1384,9 +1483,9 @@ class ConfigManager:
             return parsed
         logger.warning(
             f"布尔配置 {field_name} 的值 {value!r} 无效，"
-            f"已安全按关闭处理（字段缺省值为 {default!r}）"
+            f"已回落到字段缺省值 {default!r}"
         )
-        return False
+        return bool(default)
 
     @classmethod
     def _parse_rate_limit_rule(cls, value) -> ParseRateLimitRuleConfig:
@@ -1476,6 +1575,33 @@ class ConfigManager:
                 save_config()
             except Exception as exc:
                 logger.warning(f"保存归档配置迁移结果失败: {exc}")
+
+    @classmethod
+    def _migrate_translation_config(cls, config: Dict[str, Any]) -> None:
+        """把旧键 translation.output_mode 迁移到与代码同名的 apply_scope。"""
+        translation = cls._as_dict(config.get("translation"))
+        if not translation:
+            return
+
+        legacy_value = str(translation.get("output_mode", "") or "").strip()
+        if not legacy_value:
+            return
+
+        migrated = cls._parse_translation_apply_scope(legacy_value)
+        current = str(translation.get("apply_scope", "") or "").strip()
+        # 升级后 apply_scope 会被 schema 默认值填满，此时以旧键为准；
+        # 用户已显式改成非默认值则不覆盖。旧键随后清空，迁移只发生一次。
+        if not current or current == TRANSLATION_APPLY_CARD_AND_TEXT:
+            translation["apply_scope"] = migrated
+        translation["output_mode"] = ""
+        config["translation"] = translation
+
+        save_config = getattr(config, "save_config", None)
+        if callable(save_config):
+            try:
+                save_config()
+            except Exception as exc:
+                logger.warning(f"保存译文应用范围配置迁移结果失败: {exc}")
 
     @staticmethod
     def _normalize_llm_provider_source(value: Any) -> str:

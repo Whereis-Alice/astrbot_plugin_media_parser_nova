@@ -144,7 +144,7 @@ async def _merge_dash_streams(
                 cleanup_file(temp_output)
                 logger.warning("DASH合并输出超过下载硬限制")
                 return False
-            os.replace(temp_output, output_path)
+            await run_blocking(os.replace, temp_output, output_path)
             return True
 
         error_output = stderr.decode("utf-8", errors="ignore").strip() if stderr else ""
@@ -320,7 +320,7 @@ async def download_dash_to_cache(
                     "error": "DASH音视频合并失败",
                 }
         else:
-            if not _replace_as_output(video_file_path, output_path):
+            if not await run_blocking(_replace_as_output, video_file_path, output_path):
                 return {
                     "file_path": None,
                     "size_mb": None,

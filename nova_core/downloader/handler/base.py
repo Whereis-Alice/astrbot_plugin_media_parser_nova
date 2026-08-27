@@ -4,13 +4,13 @@ import asyncio
 import os
 import re
 import uuid
-from typing import Optional, Callable, Dict, Any, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
 from ...logger import logger
 
-from ...storage import cleanup_file
+from ...storage import cleanup_file, stamp_subdir
 from ..utils import extract_size_from_headers
 from ..validator import validate_media_response
 from ..budget import ByteBudget, DownloadLimitExceeded, resolve_max_bytes
@@ -288,7 +288,7 @@ async def range_download_file(
 
     tasks = [asyncio.create_task(download_chunk(i)) for i in range(num_chunks)]
     try:
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
         for task in tasks:
             if not task.done():
@@ -307,8 +307,13 @@ async def range_download_file(
         await active_budget.release(budget_reserved)
         return None
 
-    failed_chunks = []
+    failed_chunks: List[Optional[int]] = []
     for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, Exception):
+            # CancelledError 等非 Exception 异常必须向上传播，不能当成普通失败吞掉
+            cleanup_file(temp_path)
+            await active_budget.release(budget_reserved)
+            raise result
         if isinstance(result, Exception):
             logger.warning(f"Chunk下载异常: {result}")
             failed_chunks.append(None)
@@ -345,7 +350,7 @@ async def range_download_file(
         return None
 
     try:
-        _replace_file(temp_path, output_path)
+        await run_blocking(_replace_file, temp_path, output_path)
     except asyncio.CancelledError:
         cleanup_file(temp_path)
         await active_budget.release(budget_reserved)
@@ -390,6 +395,8 @@ async def download_media_stream(
         file_dir = os.path.dirname(file_path)
         if file_dir:
             await run_blocking(os.makedirs, file_dir, exist_ok=True)
+            # 及时补齐缓存归属标记，避免空目录清理逻辑把标记文件摘掉
+            await run_blocking(stamp_subdir, file_dir)
         output_file = await run_blocking(open, temp_path, "wb")
 
         async def write_chunk(chunk: bytes) -> None:
@@ -410,7 +417,7 @@ async def download_media_stream(
         await run_blocking(os.fsync, output_file.fileno())
         await run_blocking(output_file.close)
         output_file = None
-        _replace_file(temp_path, file_path)
+        await run_blocking(_replace_file, temp_path, file_path)
         return True
     except (asyncio.CancelledError, DownloadLimitExceeded):
         if output_file is not None:

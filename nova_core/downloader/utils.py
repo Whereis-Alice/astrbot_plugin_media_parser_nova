@@ -2,7 +2,8 @@
 
 import os
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional
+from urllib.parse import urlsplit
 
 from ..logger import logger
 from ..storage import stamp_subdir
@@ -169,9 +170,10 @@ def get_video_suffix(content_type: str = None, url: str = None) -> str:
                 return ext
 
     if url:
-        url_lower = url.lower()
+        # 只取 URL 的 path 部分判后缀，避免查询串里出现 .mp4 之类被误判
+        path_lower = urlsplit(url).path.lower()
         for ext in _VIDEO_EXT_LIST:
-            if ext in url_lower:
+            if path_lower.endswith(ext):
                 return ext
 
     return ".mp4"
@@ -193,49 +195,6 @@ def strip_media_prefixes(url: str) -> str:
     if stripped.startswith("range:"):
         stripped = stripped[6:]
     return stripped
-
-
-def process_gather_results(
-    results: List[Any], items: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """处理 asyncio.gather 返回的下载结果，统一错误处理逻辑
-
-    Args:
-        results: asyncio.gather 返回的结果列表（可能包含异常）
-        items: 原始媒体项列表
-
-    Returns:
-        处理后的结果列表，每个项包含url、file_path、success、index等字段
-    """
-    processed_results = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            item = items[i] if i < len(items) else {}
-            url_list = item.get("url_list", [])
-            processed_results.append(
-                {
-                    "url": url_list[0] if url_list else None,
-                    "file_path": None,
-                    "success": False,
-                    "index": item.get("index", i),
-                    "error": str(result),
-                }
-            )
-        elif isinstance(result, dict):
-            processed_results.append(result)
-        else:
-            item = items[i] if i < len(items) else {}
-            url_list = item.get("url_list", [])
-            processed_results.append(
-                {
-                    "url": url_list[0] if url_list else None,
-                    "file_path": None,
-                    "success": False,
-                    "index": item.get("index", i),
-                    "error": "Unknown error",
-                }
-            )
-    return processed_results
 
 
 def generate_cache_file_path(

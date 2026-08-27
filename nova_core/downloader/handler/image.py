@@ -106,7 +106,7 @@ async def _convert_image_to_png(
                     f"{input_path}, {output_size} > {hard_limit}"
                 )
                 return False
-            os.replace(temp_output, output_path)
+            await run_blocking(os.replace, temp_output, output_path)
             logger.debug(f"图片已转换为 PNG: {output_path}")
             return True
         logger.warning(f"ffmpeg 转换图片失败: {input_path}")
@@ -248,7 +248,6 @@ async def download_image_to_cache(
                 "size_mb": None,
                 "status_code": status_code,
                 "error": "图片格式转换失败，原格式不在直接发送范围内",
-                "converted_to_png": False,
             }
 
     return {
@@ -256,5 +255,4 @@ async def download_image_to_cache(
         "size_mb": size_mb,
         "status_code": status_code,
         "error": None,
-        "converted_to_png": file_path.lower().endswith(".png"),
     }

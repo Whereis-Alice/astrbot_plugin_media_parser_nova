@@ -255,7 +255,7 @@ async def _run_ffmpeg_cover_extract(
             if size > DEFAULT_IMAGE_MAX_BYTES:
                 cleanup_file(temp_output)
                 return False, "截取的视频封面超过安全大小限制"
-            os.replace(temp_output, output_path)
+            await run_blocking(os.replace, temp_output, output_path)
             return True, ""
         except OSError as e:
             cleanup_file(temp_output)

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from ..logger import logger
 from .provider_defs import LLM_PROVIDER_DEFAULTS
 
 
@@ -80,8 +84,42 @@ PROVIDER_DEFINITIONS: Dict[str, LLMProviderDefinition] = {
 class LLMClient:
     """Build provider-specific requests and extract text responses."""
 
-    def __init__(self, config: Any):
+    # 值得重试的状态码：限流与网关类临时故障
+    RETRY_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+    MAX_TRANSPORT_ATTEMPTS = 3
+    RETRY_BASE_DELAY_SECONDS = 1.0
+    MAX_RETRY_DELAY_SECONDS = 30.0
+
+    def __init__(
+        self,
+        config: Any,
+        session: Optional[aiohttp.ClientSession] = None,
+    ):
         self.config = config
+        # 复用同一个 ClientSession，避免每批翻译都新建连接池
+        self._session: Optional[aiohttp.ClientSession] = session
+        self._owns_session = session is None
+        self._session_lock = asyncio.Lock()
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """惰性创建并复用 ClientSession；外部传入的 session 优先使用。"""
+        session = self._session
+        if session is not None and not session.closed:
+            return session
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+                self._owns_session = True
+            return self._session
+
+    async def aclose(self) -> None:
+        """关闭自建的 ClientSession；外部传入的 session 交由调用方关闭。"""
+        session = self._session
+        owns_session = self._owns_session
+        self._session = None
+        self._owns_session = True
+        if session is not None and owns_session and not session.closed:
+            await session.close()
 
     def missing_fields(self) -> List[str]:
         provider = self._provider_definition()
@@ -103,60 +141,145 @@ class LLMClient:
         timeout = aiohttp.ClientTimeout(total=max(10, int(timeout_seconds)))
         drop_temperature = False
         token_limit_field = self._provider_definition().token_limit_field
-        working_payload = copy.deepcopy(payload)
+        # build_http_request 内部已对 payload 深拷贝，这里无需重复 deepcopy
+        working_payload = payload
         retried_token_limit_field = False
         retried_temperature = False
         previous_http_error: Optional[LLMHTTPError] = None
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for _ in range(3):
-                request = self.build_http_request(
-                    working_payload,
-                    drop_temperature=drop_temperature,
-                    token_limit_field=token_limit_field,
-                )
-                try:
-                    async with session.post(
-                        request.url,
-                        json=request.json,
-                        headers=request.headers,
-                    ) as response:
-                        body = await response.text()
-                        if response.status >= 400:
-                            raise LLMHTTPError(
-                                response.status,
-                                body,
-                                self._load_error_payload(body),
-                            )
-                        return self.extract_content(json.loads(body))
-                except LLMHTTPError as exc:
-                    if previous_http_error is not None:
-                        exc.__cause__ = previous_http_error
-                    if (
-                        not retried_token_limit_field
-                        and self._should_retry_token_limit_field(
-                            exc,
-                            token_limit_field,
-                        )
-                    ):
-                        retried_token_limit_field = True
-                        token_limit_field = self._alternate_token_limit_field(
-                            token_limit_field
-                        )
-                        previous_http_error = exc
-                        continue
-                    if not retried_temperature and self._should_drop_temperature(exc):
-                        retried_temperature = True
-                        drop_temperature = True
-                        previous_http_error = exc
-                        continue
-                    if previous_http_error is not None:
-                        raise exc from previous_http_error
-                    raise
+        session = await self._ensure_session()
+        for _ in range(3):
+            request = self.build_http_request(
+                working_payload,
+                drop_temperature=drop_temperature,
+                token_limit_field=token_limit_field,
+            )
+            try:
+                return await self._post_with_retry(session, request, timeout=timeout)
+            except LLMHTTPError as exc:
+                if previous_http_error is not None:
+                    exc.__cause__ = previous_http_error
+                if (
+                    not retried_token_limit_field
+                    and self._should_retry_token_limit_field(
+                        exc,
+                        token_limit_field,
+                    )
+                ):
+                    retried_token_limit_field = True
+                    token_limit_field = self._alternate_token_limit_field(
+                        token_limit_field
+                    )
+                    previous_http_error = exc
+                    continue
+                if not retried_temperature and self._should_drop_temperature(exc):
+                    retried_temperature = True
+                    drop_temperature = True
+                    previous_http_error = exc
+                    continue
+                if previous_http_error is not None:
+                    raise exc from previous_http_error
+                raise
 
         if previous_http_error is not None:
             raise RuntimeError("LLM 请求在参数协商后仍失败") from previous_http_error
         raise RuntimeError("LLM 请求失败")
+
+    async def _post_with_retry(
+        self,
+        session: aiohttp.ClientSession,
+        request: ProviderHttpRequest,
+        *,
+        timeout: aiohttp.ClientTimeout,
+    ) -> str:
+        """发送单次翻译请求；对 429/5xx 与网络抖动做指数退避重试（最多 3 次）。"""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.MAX_TRANSPORT_ATTEMPTS):
+            is_last_attempt = attempt >= self.MAX_TRANSPORT_ATTEMPTS - 1
+            try:
+                async with session.post(
+                    request.url,
+                    json=request.json,
+                    headers=request.headers,
+                    timeout=timeout,
+                ) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        error = LLMHTTPError(
+                            response.status,
+                            body,
+                            self._load_error_payload(body),
+                        )
+                        if (
+                            response.status in self.RETRY_STATUS_CODES
+                            and not is_last_attempt
+                        ):
+                            delay = self._retry_delay_seconds(
+                                response.headers.get("Retry-After"),
+                                attempt,
+                            )
+                            logger.warning(
+                                f"LLM 请求返回 HTTP {response.status}，"
+                                f"{delay:.1f}s 后重试"
+                                f"（第 {attempt + 2}/{self.MAX_TRANSPORT_ATTEMPTS} 次）"
+                            )
+                            last_error = error
+                            await asyncio.sleep(delay)
+                            continue
+                        raise error
+                    return self.extract_content(json.loads(body))
+            except asyncio.CancelledError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if is_last_attempt:
+                    raise
+                last_error = exc
+                delay = self._retry_delay_seconds(None, attempt)
+                logger.warning(
+                    f"LLM 请求网络异常，{delay:.1f}s 后重试"
+                    f"（第 {attempt + 2}/{self.MAX_TRANSPORT_ATTEMPTS} 次）: {exc}"
+                )
+                await asyncio.sleep(delay)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("LLM 请求失败")
+
+    @classmethod
+    def _retry_delay_seconds(
+        cls,
+        retry_after: Optional[str],
+        attempt: int,
+    ) -> float:
+        """计算退避时长：优先尊重 Retry-After，否则按指数退避。"""
+        parsed = cls._parse_retry_after(retry_after)
+        if parsed is not None:
+            return parsed
+        delay = cls.RETRY_BASE_DELAY_SECONDS * (2 ** max(0, int(attempt)))
+        return min(delay, cls.MAX_RETRY_DELAY_SECONDS)
+
+    @classmethod
+    def _parse_retry_after(cls, retry_after: Optional[str]) -> Optional[float]:
+        """解析 Retry-After（支持秒数与 HTTP-date 两种格式）。"""
+        raw = str(retry_after or "").strip()
+        if not raw:
+            return None
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            seconds = None
+        if seconds is None:
+            try:
+                deadline = parsedate_to_datetime(raw)
+            except (TypeError, ValueError):
+                return None
+            if deadline is None:
+                return None
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            seconds = (deadline - datetime.now(timezone.utc)).total_seconds()
+        if seconds < 0:
+            return 0.0
+        return min(seconds, cls.MAX_RETRY_DELAY_SECONDS)
 
     def build_http_request(
         self,

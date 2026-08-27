@@ -17,6 +17,7 @@ from ..logger import logger
 from ..storage.cache_marker import (
     EXPIRY_FILE_NAME,
     MARKER_FILE_NAME,
+    mark_subdir_expires_at,
     stamp_subdir,
 )
 
@@ -26,6 +27,8 @@ _ARCHIVE_ROOT_NAME = "media_parser_nova"
 _WORKSPACE_PREFIX = "media_parser_nova_zip_"
 _ARCHIVE_FILE_NAME = "media_parser_nova.zip"
 _DISK_SPACE_RESERVE_BYTES = 16 * 1024 * 1024
+# ZIP 工作目录的兜底存活时间，超时后由 cleanup_expired_zip_workspaces 回收。
+_WORKSPACE_MAX_AGE_SECONDS = 6 * 3600
 
 
 class ArchiveSizeLimitError(ValueError):
@@ -256,6 +259,9 @@ def build_zip_archive(
 
     workspace = _create_workspace(output_dir)
     stamp_subdir(workspace)
+    # 同时写入过期时间，否则 cleanup_expired_zip_workspaces 会因缺少过期文件而
+    # 永久跳过该工作目录。
+    mark_subdir_expires_at(workspace, time.time() + _WORKSPACE_MAX_AGE_SECONDS)
     archive_path = Path(workspace) / _ARCHIVE_FILE_NAME
 
     try:

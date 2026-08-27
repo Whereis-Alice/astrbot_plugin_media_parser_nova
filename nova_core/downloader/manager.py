@@ -14,10 +14,21 @@ import aiohttp
 from ..constants import Config
 from ..logger import logger
 from ..storage import cleanup_directory, cleanup_file
+from .fileio import gather_cancel_on_error, run_blocking
 from .router import download_media
 from .utils import check_cache_dir_available, strip_media_prefixes
 from .validator import get_video_size, validate_media_url
 from .handler.video_cover import extract_video_cover_to_cache
+
+
+# 仅在出现 status/http/code 等上下文关键字时才认定为 HTTP 状态码，避免把
+# "120.5MB" 之类的数字误判成状态码。
+_STATUS_CODE_CONTEXT_PATTERN = re.compile(
+    r"(?:status(?:[_\s-]*code)?|http|code|响应码|状态码)\D{0,10}?([1-5]\d{2})(?!\d)",
+    re.IGNORECASE,
+)
+# 退化匹配：独立出现且两侧都不带数字或小数点的三位数。
+_STANDALONE_STATUS_CODE_PATTERN = re.compile(r"(?<![\d.])([1-5]\d{2})(?![\d.])")
 
 
 class DownloadManager:
@@ -263,7 +274,10 @@ class DownloadManager:
         """从下载错误文本中提取 HTTP 状态码。"""
         if not error:
             return None
-        match = re.search(r"\b([1-5]\d{2})\b", str(error))
+        text = str(error)
+        match = _STATUS_CODE_CONTEXT_PATTERN.search(text)
+        if not match:
+            match = _STANDALONE_STATUS_CODE_PATTERN.search(text)
         if not match:
             return None
         try:
@@ -447,7 +461,6 @@ class DownloadManager:
                                 ),
                                 "success": True,
                                 "error": result.get("error"),
-                                "converted_to_png": result.get("converted_to_png"),
                             }
                         if result and result.get("error"):
                             last_error = str(result.get("error"))
@@ -488,6 +501,10 @@ class DownloadManager:
         for idx, result in enumerate(raw_results):
             item = media_items[idx] if idx < len(media_items) else {}
             if isinstance(result, asyncio.CancelledError):
+                raise result
+            # 非 Exception 的 BaseException（如 CancelledError 之外的中断信号）
+            # 不能当成正常结果静默丢弃，必须向上传播。
+            if isinstance(result, BaseException) and not isinstance(result, Exception):
                 raise result
             if isinstance(result, Exception):
                 results.append(
@@ -566,6 +583,8 @@ class DownloadManager:
             f"缓存目录可用={self.cache_dir_available}"
         )
 
+        # 第一遍：完成无需网络请求的本地判定，并收集待预检的视频计划。
+        video_plans: List[Optional[Dict[str, Any]]] = []
         for idx, url_list in enumerate(video_urls):
             force_download = force_flags[idx] if idx < len(force_flags) else False
             requires_local = self._video_requires_local(url_list, force_download)
@@ -575,26 +594,61 @@ class DownloadManager:
 
             if not url_list:
                 video_skip_reasons[idx] = "未找到视频URL"
+                video_plans.append(None)
                 continue
 
             if requires_local and not self.cache_dir_available:
                 video_skip_reasons[idx] = (
                     "媒体文件缓存目录不可用，无法处理必须下载到缓存的视频"
                 )
+                video_plans.append(None)
                 continue
 
             mode = "local" if self.cache_dir_available else "direct"
             if requires_local:
                 mode = "local"
 
-            if not contains_stream:
-                size_mb, status_code, reason, denied = await self._precheck_video(
-                    session=session,
-                    url_list=url_list,
-                    metadata=metadata,
-                    proxy_addr=proxy_addr,
-                    require_accessible_for_direct=(mode == "direct"),
+            video_plans.append(
+                {
+                    "url_list": url_list,
+                    "mode": mode,
+                    "needs_precheck": not contains_stream,
+                }
+            )
+
+        # 第二遍：并发预检普通视频，任一预检失败时取消其余预检并向上抛出。
+        precheck_indexes = [
+            idx
+            for idx, plan in enumerate(video_plans)
+            if plan and plan["needs_precheck"]
+        ]
+        precheck_results: Dict[
+            int, Tuple[Optional[float], Optional[int], Optional[str], bool]
+        ] = {}
+        if precheck_indexes:
+            gathered = await gather_cancel_on_error(
+                *(
+                    self._precheck_video(
+                        session=session,
+                        url_list=video_plans[idx]["url_list"],
+                        metadata=metadata,
+                        proxy_addr=proxy_addr,
+                        require_accessible_for_direct=(
+                            video_plans[idx]["mode"] == "direct"
+                        ),
+                    )
+                    for idx in precheck_indexes
                 )
+            )
+            precheck_results = dict(zip(precheck_indexes, gathered))
+
+        # 第三遍：按原始顺序回填预检结果并组装本地下载任务。
+        for idx, plan in enumerate(video_plans):
+            if not plan:
+                continue
+
+            if idx in precheck_results:
+                size_mb, status_code, reason, denied = precheck_results[idx]
                 video_sizes[idx] = size_mb
                 video_status_codes[idx] = status_code
                 has_access_denied = has_access_denied or denied
@@ -604,16 +658,16 @@ class DownloadManager:
                     video_skip_reasons[idx] = reason
                     continue
 
-            video_modes[idx] = mode
+            video_modes[idx] = plan["mode"]
             if on_sendable_media:
                 await on_sendable_media()
-            if mode == "local":
+            if plan["mode"] == "local":
                 local_items.append(
                     {
                         "kind": "video",
                         "position": idx,
                         "index": idx,
-                        "url_list": url_list,
+                        "url_list": plan["url_list"],
                         "media_id": media_id,
                         "headers": metadata.get("video_headers", {}),
                         "proxy": self._proxy_for(metadata, "video", proxy_addr),
@@ -737,7 +791,9 @@ class DownloadManager:
         has_valid_media = bool(valid_video_count or valid_image_count)
 
         if not has_valid_media and self.cache_dir:
-            cleanup_directory(os.path.join(self.cache_dir, media_id))
+            await run_blocking(
+                cleanup_directory, os.path.join(self.cache_dir, media_id)
+            )
 
         valid_sizes = [s for s in video_sizes if s is not None]
         metadata["file_paths"] = file_paths

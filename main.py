@@ -44,7 +44,7 @@ from .nova_core.translation import MetadataTranslator, build_card_metadata_list
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.4.0",
+    "1.5.0",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -97,6 +97,9 @@ class MediaParserNovaPlugin(Star):
             request_cooldown_minutes=cfg.bilibili.admin_request_cooldown_minutes,
             command=cfg.bilibili.admin_cookie_update_command,
         )
+
+    async def initialize(self):
+        """事件循环就绪后再启动后台清理任务（__init__ 阶段无运行中的事件循环）。"""
         self._start_expired_cache_cleanup()
 
     async def terminate(self):
@@ -104,6 +107,11 @@ class MediaParserNovaPlugin(Star):
         await self._shutdown_delayed_cleanups()
         await self.admin_cookie_assist.shutdown()
         await self.download_manager.shutdown()
+        # 翻译客户端持有复用的 ClientSession，插件卸载/重载时必须显式关闭。
+        try:
+            await self.metadata_translator.aclose()
+        except Exception as exc:
+            self.logger.warning(f"关闭翻译 HTTP 会话失败: {exc!r}")
 
     # ── 内部辅助 ────────────────────────────────────────
 
@@ -440,7 +448,10 @@ class MediaParserNovaPlugin(Star):
             self.logger.warning(f"卡片渲染模块不可用，已回退纯文本: {e}")
             return
 
-        async def render_one(index: int, metadata: Dict[str, Any]) -> None:
+        async def render_one(
+            metadata: Dict[str, Any],
+            target: Dict[str, Any],
+        ) -> None:
             if (
                 metadata.get('error') or
                 not metadata.get("_enable_text_metadata", True)
@@ -464,19 +475,29 @@ class MediaParserNovaPlugin(Star):
             )
             if path:
                 # 发送器和节点构建器继续读取下载后的原 metadata。
-                target = metadata_list[index]
                 target["_card_file_path"] = str(path)
                 target["_card_mode"] = card_cfg.mode
                 target["_card_include_hot_comments"] = (
                     card_cfg.include_hot_comments
                 )
 
+        # 渲染副本与原元数据严格按位配对，避免下标错位或越界。
+        render_pairs = list(zip(render_list, metadata_list))
         tasks = [
-            asyncio.create_task(render_one(index, metadata))
-            for index, metadata in enumerate(render_list)
+            asyncio.create_task(render_one(render_metadata, target_metadata))
+            for render_metadata, target_metadata in render_pairs
         ]
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for index, (result, (render_metadata, _)) in enumerate(
+                zip(results, render_pairs)
+            ):
+                if isinstance(result, BaseException):
+                    link = str(render_metadata.get("url") or "").strip() or "未知链接"
+                    self.logger.warning(
+                        f"卡片渲染任务失败: 索引={index}, 链接={link}, "
+                        f"原因={result!r}"
+                    )
 
     async def _process_and_send_metadata(
         self,
@@ -929,10 +950,16 @@ class MediaParserNovaPlugin(Star):
         connector = create_public_only_connector(
             trusted_proxy_urls=trusted_proxies,
         )
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-        ) as session:
+        try:
+            session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+            )
+        except BaseException:
+            # 会话构造失败时不会接管 connector，需手动关闭避免连接器泄漏。
+            await connector.close()
+            raise
+        async with session:
             metadata_list = await self.parser_manager.parse_text(
                 parse_text, session, links_with_parser=links_with_parser
             )

@@ -43,6 +43,8 @@ OBVIOUS_SIMPLIFIED_CHARS = set(
 SIMPLIFIED_CHINESE = "简体中文"
 TRADITIONAL_CHINESE = "繁体中文"
 CONTENT_SCOPE_BODY_AND_TITLE = "正文和标题"
+# 批次并发上限：并发提速但避免把上游 LLM 打到限流
+TRANSLATION_MAX_CONCURRENT_REQUESTS = 3
 
 
 def build_card_metadata_list(
@@ -95,6 +97,13 @@ class MetadataTranslator:
         self.astrbot_context = astrbot_context
         self.llm_client = LLMClient(config)
 
+    async def aclose(self) -> None:
+        """释放翻译使用的 HTTP 资源（复用的 ClientSession）。"""
+        llm_client = getattr(self, "llm_client", None)
+        closer = getattr(llm_client, "aclose", None)
+        if callable(closer):
+            await closer()
+
     async def translate_metadata_list(
         self,
         metadata_list: List[Dict[str, Any]],
@@ -119,27 +128,46 @@ class MetadataTranslator:
 
         started_at = time.perf_counter()
         translated: Dict[str, str] = {}
-        try:
-            for batch in item_groups:
-                batch_result = await self._translate_batch(
+        semaphore = asyncio.Semaphore(TRANSLATION_MAX_CONCURRENT_REQUESTS)
+
+        async def run_batch(batch: List[Dict[str, str]]) -> Dict[str, str]:
+            """限流执行单批翻译。"""
+            async with semaphore:
+                return await self._translate_batch(
                     batch,
                     target_language=target_language,
                     event_context=event_context or {},
                 )
-                translated.update(batch_result)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(f"元数据翻译失败，使用原文输出: {exc}")
-            return
+
+        # 并发发起各批次，返回结果与 item_groups 顺序一一对应；
+        # 单批失败只丢弃该批，已成功的批次结果保留
+        batch_results = await asyncio.gather(
+            *(run_batch(batch) for batch in item_groups),
+            return_exceptions=True,
+        )
+        failed_batches = 0
+        for index, batch_result in enumerate(batch_results):
+            if isinstance(batch_result, asyncio.CancelledError):
+                raise batch_result
+            if isinstance(batch_result, BaseException):
+                failed_batches += 1
+                logger.warning(
+                    f"第 {index + 1}/{len(item_groups)} 批元数据翻译失败，"
+                    f"该批使用原文输出: {batch_result}"
+                )
+                continue
+            translated.update(batch_result)
 
         if not translated:
+            if failed_batches:
+                logger.warning("所有批次元数据翻译均失败，使用原文输出")
             return
         self._apply_translations(metadata_list, translated, target_language)
         logger.debug(
             f"元数据翻译完成: requests={len(item_groups)} "
             f"items={sum(len(group) for group in item_groups)} "
             f"translated={len(translated)} "
+            f"failed_batches={failed_batches} "
             f"elapsed={time.perf_counter() - started_at:.2f}s"
         )
 

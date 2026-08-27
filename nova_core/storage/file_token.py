@@ -1,4 +1,5 @@
 """文件 Token 服务集成，将已下载媒体注册为可回调的临时 URL。"""
+import asyncio
 import os
 from typing import Any, Dict, List, Optional
 
@@ -53,22 +54,37 @@ async def register_files_with_token_service(
         )
         return
 
-    file_token_urls: List[Optional[str]] = []
-    for idx, fp in enumerate(file_paths):
-        is_local = idx < len(local_modes) and local_modes[idx] == "local"
-        if is_local and fp and os.path.exists(fp):
-            try:
-                token = await file_token_service.register_file(
-                    fp, timeout=file_token_ttl
-                )
-                url = f"{callback_api_base}/api/file/{token}"
-                file_token_urls.append(url)
-                logger.debug(f"已注册文件到Token服务: {fp}")
-            except Exception as e:
-                logger.warning(f"注册文件到Token服务失败: {fp}, 错误: {e}")
-                file_token_urls.append(None)
-        else:
-            file_token_urls.append(None)
+    async def register_one(file_path: str) -> Optional[str]:
+        """注册单个文件，失败时返回 None 以便回退为本地文件发送。"""
+        try:
+            token = await file_token_service.register_file(
+                file_path, timeout=file_token_ttl
+            )
+            logger.debug(f"已注册文件到Token服务: {file_path}")
+            return f"{callback_api_base}/api/file/{token}"
+        except Exception as e:
+            logger.warning(f"注册文件到Token服务失败: {file_path}, 错误: {e}")
+            return None
+
+    # 并发注册，避免逐个 await 串行等待远端服务。
+    registrable_indexes = [
+        idx
+        for idx, fp in enumerate(file_paths)
+        if idx < len(local_modes)
+        and local_modes[idx] == "local"
+        and fp
+        and os.path.exists(fp)
+    ]
+    registered_urls: Dict[int, Optional[str]] = {}
+    if registrable_indexes:
+        gathered = await asyncio.gather(
+            *(register_one(file_paths[idx]) for idx in registrable_indexes)
+        )
+        registered_urls = dict(zip(registrable_indexes, gathered))
+
+    file_token_urls: List[Optional[str]] = [
+        registered_urls.get(idx) for idx in range(len(file_paths))
+    ]
 
     metadata['file_token_urls'] = file_token_urls
     metadata['use_file_token_service'] = any(
