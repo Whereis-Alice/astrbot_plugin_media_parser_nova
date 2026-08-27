@@ -266,12 +266,14 @@ def build_parse_result(
         hot_comments = metadata.get("hot_comments")
         if isinstance(hot_comments, list):
             normalized_comments = []
+            comment_avatars: List[Optional[PathTask]] = []
             for item in hot_comments[:5]:
                 if not isinstance(item, dict):
                     continue
                 message = str(item.get("message") or "").strip()
                 if not message:
                     continue
+                avatar_urls = _normalize_urls(item.get("avatar_url"))
                 normalized_comments.append(
                     {
                         "username": str(
@@ -281,10 +283,17 @@ def build_parse_result(
                         "likes": item.get("likes", 0),
                         "time": str(item.get("time") or "").strip(),
                         "message": message,
+                        "avatar_url": avatar_urls[0] if avatar_urls else "",
                     }
+                )
+                # 评论头像与作者头像同一套下载逻辑，失败时区块自动回落到首字占位
+                comment_avatars.append(
+                    _as_download_path_task(avatar_urls, save_path, metadata)
                 )
             if normalized_comments:
                 extra["hot_comments"] = normalized_comments
+                if any(task is not None for task in comment_avatars):
+                    extra["hot_comment_avatars"] = comment_avatars
 
     return ParseResult(
         platform=platform,

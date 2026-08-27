@@ -494,3 +494,138 @@ def test_render_sync_writes_png_and_avatar_changes_the_output(
     with Image.open(with_avatar) as image:
         assert image.width == 720
     assert with_avatar.read_bytes() != without_avatar.read_bytes()
+
+# ============================ 哔哩哔哩仿站结构 ============================
+
+
+@pytest.fixture(scope="module")
+def bili_model(assets: dict[str, Any]) -> Any:
+    """一条贴近 B 站手机端动态详情页的样本：九图 + IP 属地 + 带头像热评 + emoji 统计行。"""
+    result = make_result(
+        title=None,
+        text="#凡人慕兰之战# 正文用于验证富文本与话题着色 @凡人修仙传官方 https://b23.tv/abcdef",
+        url="https://t.bilibili.com/1234567890",
+        platform="bilibili",
+        display_name="哔哩哔哩",
+        author=("凡人修仙传", "@fanrenxiuxianzhuan"),
+        extra={
+            "stats_line": "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 \u21a9\ufe0f 33 \U0001f4ac 33 \U0001f440 12.3万 \U0001f4ad 4562",
+            "ip_location": "北京",
+            "hot_comments": [
+                {
+                    "username": "热评用户甲",
+                    "uid": "10001",
+                    "likes": 41,
+                    "time": "8月22日 江苏",
+                    "message": "第一条热门评论内容。",
+                },
+                {
+                    "username": "热评用户乙",
+                    "uid": "10002",
+                    "likes": 9,
+                    "time": "8月22日 北京",
+                    "message": "第二条热门评论内容。",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {
+            "avatar": assets["avatar"],
+            "hero": None,
+            "grid": assets["gallery"],
+            "comment_avatars": {0: assets["avatar"], 1: assets["avatar"]},
+        },
+        watermark="Alice解析",
+    )
+
+
+def test_bilibili_nine_grid_tiles_are_uniform_squares(bili_model: Any) -> None:
+    """B 站九宫格必须是等高等宽的正方格，不能因为末行不足而被拉伸。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert len(probe.tiles) == 9, f"九图应贴 9 格，实际 {len(probe.tiles)}"
+    heights = {h for _, _, h in probe.tiles}
+    widths = [w for _, w, _ in probe.tiles]
+    assert len(heights) == 1, f"格子高度不一致：{sorted(heights)}"
+    # 列宽按整数像素分配，末列允许 1px 的取整补偿。
+    assert max(widths) - min(widths) <= 1, f"格子宽度差过大：{sorted(widths)}"
+    assert abs(max(widths) - max(heights)) <= 2, "九宫格应接近正方形"
+
+
+def test_bilibili_tabbar_shows_comment_and_like_tabs(bili_model: Any) -> None:
+    """页签条要画出"评论 N"与"赞和转发 M"两个标签。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "评论 33" in probe.texts
+    assert "赞和转发 361" in probe.texts
+
+
+def test_bilibili_comments_use_native_heading_and_reply_meta(bili_model: Any) -> None:
+    """B 站评论区要有"热门评论"小标题、排序入口，以及"时间 + 回复"的元信息行。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "热门评论" in probe.texts
+    assert "按热度" in probe.texts
+    assert "8月22日 江苏 回复" in probe.texts
+    assert "热评用户甲" in probe.texts
+
+
+def test_bilibili_ip_note_only_lists_consumption_metrics(bili_model: Any) -> None:
+    """补充说明行只放播放/弹幕这类消费指标，点赞投币收藏留给底部操作栏，避免数字重复。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    note = [t for t in probe.texts if "播放" in t]
+    assert note, "IP 说明行应画出播放数"
+    line = note[0]
+    assert "弹幕" in line
+    assert "投币" not in line and "收藏" not in line and "点赞" not in line
+
+
+def test_ip_note_block_measures_zero_without_stats(assets: dict[str, Any]) -> None:
+    """没有可显示的消费指标时，补充说明行必须完全不占高度、不绘制。"""
+    model = build_model(
+        make_result(
+            title=None,
+            text="没有统计行的动态。",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+            extra={"stats_line": ""},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["tall"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=720, theme_key="bilibili", layout_key="feed")
+
+    assert not [t for t in probe.texts if "播放" in t or "弹幕" in t]
+
+
+# ============================ 统计区块窄栏回归 ============================
+
+
+@pytest.mark.parametrize("theme", ("broadsheet", "nocturne"))
+@pytest.mark.parametrize("width", (520, 640, 800))
+def test_ledger_stats_keep_every_value_readable_in_narrow_columns(
+    assets: dict[str, Any], theme: str, width: int
+) -> None:
+    """账簿式统计在杂志布局的窄侧栏里会被挤成 40px 一格，数值绝不能被省略成空串。"""
+    values = ("361", "1024", "876", "33", "12.3万", "4562")
+    model = build_model(
+        make_result(
+            title="窄栏统计回归",
+            text="杂志布局的侧栏只有整宽的三分之一左右。",
+            extra={
+                "stats_line": (
+                    "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 "
+                    "\u21a9\ufe0f 33 \U0001f440 12.3万 \U0001f4ad 4562"
+                )
+            },
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=width, theme_key=theme, layout_key="magazine")
+
+    for value in values:
+        assert value in probe.texts, f"{theme}@{width} 丢了统计值 {value}：{probe.texts}"

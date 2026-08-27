@@ -492,7 +492,8 @@ def _star_points(cx: float, cy: float, outer: float, inner: float) -> list[tuple
 def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -> None:
     """绘制一枚极简线性图标，用于统计行 / 封面浮层。
 
-    kind: play / danmaku / like / coin / star / share / comment / eye / clock / dot
+    kind: play / danmaku / like / dislike / coin / star / share / comment / eye /
+          clock / back / more / sort / bolt / dot
     全部为几何绘制（超采样 3x），不依赖 emoji 字体。
     """
     x0, y0, x1, y1 = (int(v) for v in box)
@@ -573,6 +574,52 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
         d.ellipse((line // 2, line // 2, big_w - 1 - line // 2, big_h - 1 - line // 2), outline=color, width=line)
         d.line([px(0.50, 0.28), px(0.50, 0.52)], fill=color, width=line)
         d.line([px(0.50, 0.52), px(0.72, 0.60)], fill=color, width=line)
+    elif kind == "dislike":
+        # 与 like 完全上下镜像，构成 B 站的「踩」图标
+        d.polygon(
+            [
+                px(0.34, 0.02),
+                px(0.34, 0.56),
+                px(0.52, 0.56),
+                px(0.60, 0.94),
+                px(0.74, 0.94),
+                px(0.78, 0.82),
+                px(0.70, 0.60),
+                px(0.96, 0.60),
+                px(1.00, 0.50),
+                px(0.90, 0.02),
+            ],
+            fill=color,
+        )
+        d.rounded_rectangle(
+            (0, 0, int(big_w * 0.24), int(big_h * 0.54)),
+            radius=int(big_w * 0.06),
+            fill=color,
+        )
+    elif kind == "back":
+        thick = max(2, int(round(line * 1.15)))
+        d.line([px(0.68, 0.10), px(0.34, 0.50)], fill=color, width=thick)
+        d.line([px(0.34, 0.50), px(0.68, 0.90)], fill=color, width=thick)
+    elif kind == "more":
+        dot_r = max(1, int(round(big_w * 0.11)))
+        for fy in (0.17, 0.50, 0.83):
+            cx, cy = px(0.50, fy)
+            d.ellipse((cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r), fill=color)
+    elif kind == "sort":
+        for fy, fx in ((0.22, 0.92), (0.50, 0.70), (0.78, 0.48)):
+            d.line([px(0.08, fy), px(fx, fy)], fill=color, width=line)
+    elif kind == "bolt":
+        d.polygon(
+            [
+                px(0.58, 0.04),
+                px(0.20, 0.56),
+                px(0.46, 0.56),
+                px(0.38, 0.96),
+                px(0.80, 0.42),
+                px(0.52, 0.42),
+            ],
+            fill=color,
+        )
     else:  # dot
         d.ellipse(
             (int(big_w * 0.30), int(big_h * 0.30), int(big_w * 0.70), int(big_h * 0.70)),

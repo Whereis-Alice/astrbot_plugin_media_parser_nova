@@ -1,5 +1,6 @@
 """微博解析器实现。"""
 
+import html as html_lib
 import json
 import re
 from datetime import datetime
@@ -1019,6 +1020,8 @@ class WeiboParser(BaseVideoParser):
         text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
 
         text = re.sub(r"<[^>]+>", "", text)
+
+        text = html_lib.unescape(text)
 
         text = re.sub(r"\s+", " ", text)
         text = text.strip()

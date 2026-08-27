@@ -48,7 +48,7 @@ DEFAULT_WATERMARK_TAG = "Nova解析"
 
 #: 卡片样式版本：视觉变化时必须 +1，否则用户侧已缓存的旧卡片不会重新渲染。
 #: 19 = 全新 nova_core.card 设计系统（主题 / 布局 / 深浅色三者全部生效）。
-_CARD_STYLE_VERSION = "20"
+_CARD_STYLE_VERSION = "22"
 
 #: 布局与风格枚举（直接取自设计系统，避免两处枚举漂移）
 LAYOUT_NAMES: tuple[str, ...] = LAYOUT_KEYS
@@ -186,11 +186,20 @@ class ShareCardRenderer:
 
     async def _collect_images(self, result: ParseResult) -> dict[str, Any]:
         """并发获取头像 / 视频封面 / 图集图片的本地路径。"""
-        images: dict[str, Any] = {"avatar": None, "hero": None, "grid": []}
+        images: dict[str, Any] = {
+            "avatar": None,
+            "hero": None,
+            "grid": [],
+            "comment_avatars": {},
+        }
 
         tasks: list[tuple[str, PathTask]] = []
         if result.author and result.author.avatar:
             tasks.append(("avatar", result.author.avatar))
+
+        for index, task in enumerate(result.extra.get("hot_comment_avatars") or []):
+            if isinstance(task, PathTask):
+                tasks.append((f"comment_avatar:{index}", task))
 
         video = result.video
         hero_task: Optional[PathTask] = None
@@ -234,6 +243,8 @@ class ShareCardRenderer:
                 images["avatar"] = path
             elif kind == "hero":
                 images["hero"] = path
+            elif kind.startswith("comment_avatar:"):
+                images["comment_avatars"][int(kind.split(":", 1)[1])] = path
             else:
                 images["grid"].append(path)
 

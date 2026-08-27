@@ -778,8 +778,8 @@ class BilibiliParser(BaseVideoParser):
                 result_links_set.add(opus_url)
 
         dynamic_pattern = (
-            rf'https?://(?:www|m|mobile)\.bilibili\.com/dynamic/'
-            rf'(\d+)[^\s<>"\'()]*'
+            r'https?://(?:www|m|mobile)\.bilibili\.com/dynamic/'
+            r'(\d+)[^\s<>"\'()]*'
         )
         dynamic_matches = re.finditer(dynamic_pattern, text, re.IGNORECASE)
         for match in dynamic_matches:
@@ -1092,6 +1092,28 @@ class BilibiliParser(BaseVideoParser):
             return ""
         return self._normalize_bilibili_url(author_obj.get("face"))
 
+    def _extract_polymer_stats(self, modules: Dict[str, Any]) -> str:
+        """从 polymer 动态结构中提取点赞/评论/转发，拼成统计行。
+
+        图文动态（opus / t.bilibili.com）没有视频 stat 对象，
+        统计数据挂在 modules.module_stat 上，缺了它卡片底部操作栏
+        就只剩图标没有数字。
+        """
+        stat_obj = modules.get("module_stat") or {}
+        if not isinstance(stat_obj, dict):
+            return ""
+        parts: List[str] = []
+        for key, icon in (("like", "\U0001f44d"), ("comment", "\U0001f4ac"), ("forward", "\u21a9\ufe0f")):
+            node = stat_obj.get(key)
+            if isinstance(node, dict):
+                raw = node.get("count")
+            else:
+                raw = node
+            value = _format_count(raw)
+            if value != "0":
+                parts.append(f"{icon} {value}")
+        return " ".join(parts)
+
     @staticmethod
     def _extract_polymer_comment_subject(
         data: Dict[str, Any],
@@ -1347,6 +1369,10 @@ class BilibiliParser(BaseVideoParser):
                 "desc": final_desc,
                 "timestamp": final_timestamp,
                 "avatar_url": video_result.get("avatar_url", ""),
+                "stats_line": (
+                    video_result.get("stats_line", "")
+                    or self._extract_polymer_stats(modules)
+                ),
                 "video_cover_urls": video_result.get("video_cover_urls", []),
                 "video_urls": self._add_range_prefix_to_video_urls(
                     video_result.get("video_urls", [])
@@ -1403,6 +1429,7 @@ class BilibiliParser(BaseVideoParser):
             "desc": desc,
             "timestamp": timestamp,
             "avatar_url": self._extract_polymer_avatar(modules),
+            "stats_line": self._extract_polymer_stats(modules),
             "video_cover_urls": [],
             "video_urls": [],
             "image_urls": image_urls,

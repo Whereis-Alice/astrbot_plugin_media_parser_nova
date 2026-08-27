@@ -261,17 +261,17 @@ BILIBILI = ThemeRecipe(
     ornament=(),
     panel="card",
     ornament_frame="none",
-    # 全部走 B 站专属变体：小电视标志、封面浮层、UP 主行、图标统计、楼层评论
-    eyebrow="bili",
+    # 全部走 B 站专属变体：顶栏、认证头像、话题正文、方格图集、页签、楼层评论、底部操作栏
+    eyebrow="bili_top",
     identity="bili",
-    headline="display",
-    body="plain",
+    headline="bili_post",
+    body="bili",
     media="bili",
     stats="bili",
     comments="bili",
     footer="bili",
     tracking_eyebrow=0.0,
-    headline_scale=0.94,
+    headline_scale=1.0,
     accent_source="fixed",
     accent_fixed=hex_to_rgb("#FB7299"),
     accent_adjust=False,          # 品牌粉必须原样呈现
@@ -279,13 +279,14 @@ BILIBILI = ThemeRecipe(
     radius_scale=0.36,            # 还原 B 站标志性的小圆角
     brand="bilibili",
     order=(
-        # B 站视频卡片的真实阅读顺序：品牌条 -> 封面 -> 标题 -> UP主 -> 简介 -> 数据
+        # 对齐 B 站移动端动态详情页：顶栏 -> 作者 -> 正文 -> 图集 -> 属地 -> 页签 -> 评论 -> 操作栏
         "eyebrow",
-        "media",
-        "headline",
         "identity",
+        "headline",
         "body",
-        "stats",
+        "media",
+        "ipnote",
+        "tabbar",
         "quote",
         "warnings",
         "comments",

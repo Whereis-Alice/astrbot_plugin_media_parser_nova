@@ -123,6 +123,7 @@ class CommentItem:
     likes: str
     time: str
     message: str
+    avatar: Path | None = None
 
 
 @dataclass(slots=True)
@@ -184,18 +185,29 @@ def _duration_text(seconds: Any) -> str:
     return fmt_duration(value)
 
 
-def normalize_comments(result: Any, max_chars: int, limit: int = 5) -> list[CommentItem]:
-    """把 extra['hot_comments'] 归一化为 CommentItem 列表。"""
+def normalize_comments(
+    result: Any,
+    max_chars: int,
+    limit: int = 5,
+    avatars: dict[int, Any] | None = None,
+) -> list[CommentItem]:
+    """把 extra['hot_comments'] 归一化为 CommentItem 列表。
+
+    avatars 以 hot_comments 的原始下标为键（下载失败的条目直接缺席），
+    因此这里必须按原始下标取头像，不能按过滤后的序号取。
+    """
     raw = getattr(result, "extra", {}).get("hot_comments")
     if not isinstance(raw, list):
         return []
+    avatar_map = avatars or {}
     items: list[CommentItem] = []
-    for entry in raw[:limit]:
+    for index, entry in enumerate(raw[:limit]):
         if not isinstance(entry, dict):
             continue
         message = limit_chars(clean_text(str(entry.get("message") or "")), max_chars)
         if not message:
             continue
+        avatar_path = avatar_map.get(index)
         items.append(
             CommentItem(
                 username=clean_text(str(entry.get("username") or "未知用户")) or "未知用户",
@@ -203,6 +215,7 @@ def normalize_comments(result: Any, max_chars: int, limit: int = 5) -> list[Comm
                 likes=compact_number(entry.get("likes", 0)),
                 time=clean_text(str(entry.get("time") or "")),
                 message=message,
+                avatar=Path(str(avatar_path)) if avatar_path else None,
             )
         )
     return items
@@ -295,7 +308,11 @@ def build_model(
         duration_text=duration,
         online=clean_text(str(extra.get("online") or "")),
         warnings=[clean_text(str(w)) for w in (extra.get("limit_warnings") or []) if str(w).strip()],
-        comments=normalize_comments(result, comment_max_chars),
+        comments=normalize_comments(
+            result,
+            comment_max_chars,
+            avatars=images.get("comment_avatars") or {},
+        ),
         quote=quote,
         url=str(getattr(result, "url", "") or "").strip(),
         watermark=str(watermark or "").strip(),

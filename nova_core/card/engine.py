@@ -52,7 +52,7 @@ WARN_DARK: RGB = (255, 186, 84)
 WARN_LIGHT: RGB = (176, 96, 12)
 
 #: 这些区块总是横跨整幅，不进杂志布局的侧栏
-FULL_WIDTH_TAIL = ("warnings", "comments", "footer")
+FULL_WIDTH_TAIL = ("ipnote", "tabbar", "warnings", "comments", "footer")
 
 
 # ============================ 渲染上下文 ============================
@@ -358,6 +358,10 @@ def _make_block(name: str, theme: ThemeRecipe, layout: LayoutPreset, headline_sc
         return blk.MediaBlock(variant=theme.media)
     if name == "stats":
         return blk.StatsBlock(variant=theme.stats)
+    if name == "ipnote":
+        return blk.IpNoteBlock()
+    if name == "tabbar":
+        return blk.TabBarBlock()
     if name == "quote":
         return blk.QuoteBlock(variant="quote" if theme.panel == "none" else "panel")
     if name == "warnings":

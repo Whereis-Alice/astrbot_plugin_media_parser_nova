@@ -5,7 +5,7 @@ import html as html_lib
 import json
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -38,6 +38,18 @@ _LOGGED_OUT_COMMENT_RE = re.compile(
     re.S,
 )
 _JS_STRING_FIELD_TEMPLATE = r'{field}:"((?:\\.|[^"\\])*)"'
+_JSONLD_SCRIPT_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.S | re.I,
+)
+# X 仅对爬虫 UA 返回内含 JSON-LD 的服务端渲染页；浏览器 UA 只会拿到
+# 不含任何回复内容的 JS 外壳。
+_CRAWLER_USER_AGENT = (
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+)
+_PUBLIC_PAGE_HOSTS: Tuple[str, ...] = ("x.com", "twitter.com")
+_JSONLD_MARKER = "application/ld+json"
+_COMMENT_NODE_MARKER = '"Comment"'
 
 
 class TwitterParser(BaseVideoParser):
@@ -87,6 +99,19 @@ class TwitterParser(BaseVideoParser):
         except (TypeError, ValueError, json.JSONDecodeError):
             decoded = raw.replace('\\"', '"').replace("\\\\", "\\")
         return html_lib.unescape(str(decoded or "")).strip()
+
+    @staticmethod
+    def _unescape_entities(value: Any) -> str:
+        """反转义推文文本中的 HTML 实体（&amp;gt; / &amp;lt; / &amp;amp; 等）。
+
+        Twitter/X 的 full_text 与 FxTwitter 的 text 字段都以 HTML 实体形式
+        转义 < > &，直接展示会出现 "&gt;" 之类的字面量。必须在按
+        display_text_range 截取之后再反转义，否则下标会错位。
+        """
+        text = str(value or "")
+        if "&" not in text:
+            return text
+        return html_lib.unescape(text)
 
     @classmethod
     def _comment_author_field(cls, author_block: str, field: str) -> str:
@@ -155,30 +180,222 @@ class TwitterParser(BaseVideoParser):
         comments.sort(key=lambda item: int(item.get("likes", 0) or 0), reverse=True)
         return comments[: max(0, int(limit))]
 
+    @classmethod
+    def _jsonld_comment_entries(cls, node: Any, sink: List[Dict[str, Any]]) -> None:
+        """递归收集 JSON-LD 结构中所有 @type == Comment 的节点。"""
+        if isinstance(node, dict):
+            node_type = node.get("@type") or node.get("type")
+            types = node_type if isinstance(node_type, list) else [node_type]
+            if any(str(item or "").lower() == "comment" for item in types):
+                sink.append(node)
+            for value in node.values():
+                cls._jsonld_comment_entries(value, sink)
+        elif isinstance(node, list):
+            for value in node:
+                cls._jsonld_comment_entries(value, sink)
+
+    @staticmethod
+    def _jsonld_like_count(node: Any) -> int:
+        """从 interactionStatistic 中取出点赞数。"""
+        stats = node.get("interactionStatistic") if isinstance(node, dict) else None
+        if isinstance(stats, dict):
+            stats = [stats]
+        if not isinstance(stats, list):
+            return 0
+        fallback = 0
+        for item in stats:
+            if not isinstance(item, dict):
+                continue
+            try:
+                count = int(item.get("userInteractionCount") or 0)
+            except (TypeError, ValueError):
+                continue
+            interaction = item.get("interactionType")
+            if isinstance(interaction, dict):
+                interaction = interaction.get("@type") or interaction.get("name")
+            if "like" in str(interaction or "").lower():
+                return count
+            fallback = max(fallback, 0)
+        return fallback
+
+    @staticmethod
+    def _jsonld_text_field(node: Any, *keys: str) -> str:
+        """从可能是字符串/对象的 JSON-LD 字段中取出文本。"""
+        if isinstance(node, str):
+            return html_lib.unescape(node).strip()
+        if not isinstance(node, dict):
+            return ""
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return html_lib.unescape(value).strip()
+            if isinstance(value, dict):
+                nested = TwitterParser._jsonld_text_field(
+                    value, "contentUrl", "url", "name", "@id"
+                )
+                if nested:
+                    return nested
+        return ""
+
+    @classmethod
+    def _parse_jsonld_comments(
+        cls,
+        html_text: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """解析 X 爬虫页 <script type="application/ld+json"> 中的公开回复。
+
+        这是首选策略：JSON-LD 是结构化数据，比正则匹配内联 JS 更稳定，
+        X 前端改版时通常不会影响它。
+        """
+        comments: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for match in _JSONLD_SCRIPT_RE.finditer(str(html_text or "")):
+            payload = html_lib.unescape(match.group(1) or "").strip()
+            if not payload:
+                continue
+            try:
+                document = json.loads(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            nodes: List[Dict[str, Any]] = []
+            cls._jsonld_comment_entries(document, nodes)
+            for node in nodes:
+                message = cls._jsonld_text_field(node, "text", "articleBody")
+                if not message:
+                    continue
+                identifier = str(
+                    node.get("identifier")
+                    or cls._jsonld_text_field(node, "@id", "url")
+                    or ""
+                ).strip()
+                comment_id = identifier.rsplit("/", 1)[-1] if identifier else ""
+                dedupe_key = comment_id or message
+                if dedupe_key in seen_ids:
+                    continue
+                seen_ids.add(dedupe_key)
+                author = node.get("author")
+                display_name = cls._jsonld_text_field(author, "name", "givenName")
+                screen_name = cls._jsonld_text_field(
+                    author, "alternateName", "additionalName"
+                )
+                if not screen_name:
+                    author_url = cls._jsonld_text_field(author, "url", "@id")
+                    if author_url:
+                        screen_name = author_url.rstrip("/").rsplit("/", 1)[-1]
+                username = display_name or screen_name or "未知用户"
+                if screen_name and screen_name.lower() != username.lower():
+                    username = f"{username}(@{screen_name})"
+                comments.append(
+                    {
+                        "username": username,
+                        "uid": cls._jsonld_text_field(author, "identifier"),
+                        "likes": cls._jsonld_like_count(node),
+                        "time": cls._format_public_comment_time(
+                            cls._jsonld_text_field(
+                                node, "datePublished", "dateCreated"
+                            )
+                        ),
+                        "message": message,
+                        "avatar_url": cls._jsonld_text_field(author, "image", "thumbnailUrl"),
+                        "comment_id": comment_id,
+                    }
+                )
+        comments.sort(key=lambda item: int(item.get("likes", 0) or 0), reverse=True)
+        return comments[: max(0, int(limit))]
+
+    @classmethod
+    def _extract_public_comments(
+        cls,
+        html_text: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """按 JSON-LD → 内联 JS 的顺序尝试解析公开回复。"""
+        comments = cls._parse_jsonld_comments(html_text, limit)
+        if comments:
+            return comments
+        return cls._parse_logged_out_comments_html(html_text, limit)
+
+    async def _fetch_public_page(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        proxy: Optional[str],
+    ) -> str:
+        """抓取一次 X 公开页 HTML，返回正文（失败抛异常）。"""
+        async with session.get(
+            url,
+            headers={
+                **self.headers,
+                "User-Agent": _CRAWLER_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Cache-Control": "no-cache",
+            },
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=20),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            return await response.text(errors="replace")
+
     async def _fetch_hot_comments(
         self,
         session: aiohttp.ClientSession,
         tweet_id: str,
     ) -> List[Dict[str, Any]]:
-        """从无需登录的 X 帖子页获取当前公开可见的精选回复。"""
-        if self.hot_comment_count <= 0:
+        """从无需登录的 X 帖子页获取当前公开可见的精选回复。
+
+        X 只对爬虫 UA 返回带 JSON-LD 的服务端渲染页面，普通浏览器 UA 拿到的
+        是纯 JS 外壳（里面没有任何回复），因此这里固定使用爬虫 UA。
+        另外 x.com 在部分网络环境下直连不可达，若已配置代理则在直连失败后
+        自动用代理重试一次，避免"没有报错也没有评论"的静默失败。
+        """
+        limit = self.hot_comment_count
+        if limit <= 0:
             return []
-        proxy = self.proxy_url if self.use_parse_proxy else None
-        async with session.get(
-            f"https://x.com/i/status/{tweet_id}",
-            headers={
-                **self.headers,
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            proxy=proxy,
-            timeout=aiohttp.ClientTimeout(total=25),
-        ) as response:
-            response.raise_for_status()
-            html_text = await response.text(errors="replace")
-        return self._parse_logged_out_comments_html(
-            html_text,
-            self.hot_comment_count,
+
+        attempts: List[Tuple[str, Optional[str]]] = []
+        primary_proxy = self.proxy_url if self.use_parse_proxy else None
+        for host in _PUBLIC_PAGE_HOSTS:
+            attempts.append((f"https://{host}/i/status/{tweet_id}", primary_proxy))
+        if self.proxy_url and not self.use_parse_proxy:
+            # 直连拿不到时用代理兜底：热评抓取走的是 x.com 本站，
+            # 和 FxTwitter 的可达性不一样。
+            attempts.append(
+                (f"https://{_PUBLIC_PAGE_HOSTS[0]}/i/status/{tweet_id}", self.proxy_url)
+            )
+
+        failures: List[str] = []
+        for url, proxy in attempts:
+            via = "(经代理)" if proxy else ""
+            try:
+                html_text = await self._fetch_public_page(session, url, proxy)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures.append(f"{url}{via} -> {type(exc).__name__}: {exc}")
+                continue
+            comments = self._extract_public_comments(html_text, limit)
+            if comments:
+                logger.debug(
+                    f"[{self.name}] 公开回复抓取成功: tweet_id={tweet_id}, "
+                    f"count={len(comments)}, source={url}"
+                )
+                return comments
+            has_jsonld = _JSONLD_MARKER in html_text
+            has_comment_node = _COMMENT_NODE_MARKER in html_text
+            failures.append(
+                f"{url}{via} -> 页面已取回但未解析到回复("
+                f"len={len(html_text)}, jsonld={has_jsonld}, "
+                f"comment_node={has_comment_node})"
+            )
+
+        logger.warning(
+            f"[{self.name}] 未能获取公开热评(已请求 {len(attempts)} 个来源): "
+            f"tweet_id={tweet_id}; " + "; ".join(failures)
         )
+        return []
 
     def can_parse(self, url: str) -> bool:
         """判断是否可以解析此URL
@@ -307,10 +524,12 @@ class TwitterParser(BaseVideoParser):
         if isinstance(raw_text, dict):
             text = raw_text.get("text")
             if text:
-                return TwitterParser._apply_display_text_range(
-                    str(text), raw_text.get("display_text_range")
+                return TwitterParser._unescape_entities(
+                    TwitterParser._apply_display_text_range(
+                        str(text), raw_text.get("display_text_range")
+                    )
                 )
-        return str(tweet.get("text", "") or "")
+        return TwitterParser._unescape_entities(tweet.get("text", ""))
 
     @staticmethod
     def _fxtwitter_author(author_info: Dict[str, Any]) -> str:
@@ -579,10 +798,12 @@ class TwitterParser(BaseVideoParser):
             (tweet.get("note_tweet") or {}).get("note_tweet_results") or {}
         ).get("result") or {}
         if isinstance(note_tweet, dict) and note_tweet.get("text"):
-            return str(note_tweet.get("text") or "")
+            return TwitterParser._unescape_entities(note_tweet.get("text"))
         text = str(legacy.get("full_text") or "")
-        return TwitterParser._apply_display_text_range(
-            text, legacy.get("display_text_range")
+        return TwitterParser._unescape_entities(
+            TwitterParser._apply_display_text_range(
+                text, legacy.get("display_text_range")
+            )
         )
 
     def _extract_graphql_quote(

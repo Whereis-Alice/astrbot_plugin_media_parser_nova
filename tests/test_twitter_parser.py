@@ -93,5 +93,137 @@ class TwitterParserTests(unittest.TestCase):
         self.assertEqual(comments[1]["message"], "Low & reply")
 
 
+_JSONLD_PAGE = """
+<html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SocialMediaPosting",
+  "identifier": "2092232578006925597",
+  "comment": [
+    {
+      "@type": "Comment",
+      "@id": "https://x.com/alpha/status/111",
+      "identifier": "111",
+      "text": "\u666e\u901a\u56de\u590d",
+      "datePublished": "2026-08-25T04:00:00.000Z",
+      "author": {
+        "@type": "Person",
+        "name": "\u963f\u5c14\u6cd5",
+        "alternateName": "alpha",
+        "identifier": "9001",
+        "image": {"@type": "ImageObject", "contentUrl": "https://cdn.example/a.jpg"}
+      },
+      "interactionStatistic": [
+        {"@type": "InteractionCounter",
+         "interactionType": "https://schema.org/LikeAction",
+         "userInteractionCount": 7}
+      ]
+    },
+    {
+      "@type": "Comment",
+      "@id": "https://x.com/beta/status/222",
+      "identifier": "222",
+      "text": "\u70ed\u95e8\u56de\u590d 5 &gt; 3",
+      "datePublished": "2026-08-25T05:00:00.000Z",
+      "author": {
+        "@type": "Person",
+        "name": "Beta",
+        "url": "https://x.com/beta",
+        "image": "https://cdn.example/b.jpg"
+      },
+      "interactionStatistic": [
+        {"@type": "InteractionCounter",
+         "interactionType": "https://schema.org/ReplyAction",
+         "userInteractionCount": 3},
+        {"@type": "InteractionCounter",
+         "interactionType": "https://schema.org/LikeAction",
+         "userInteractionCount": 99}
+      ]
+    }
+  ]
+}
+</script>
+</head><body></body></html>
+"""
+
+
+class TwitterPublicCommentTests(unittest.TestCase):
+    def test_jsonld_comments_sorted_by_likes(self):
+        comments = TwitterParser._parse_jsonld_comments(_JSONLD_PAGE, 5)
+
+        self.assertEqual(len(comments), 2)
+        self.assertEqual(comments[0]["likes"], 99)
+        self.assertEqual(comments[0]["username"], "Beta")
+        self.assertEqual(comments[0]["message"], "\u70ed\u95e8\u56de\u590d 5 > 3")
+        self.assertEqual(comments[0]["avatar_url"], "https://cdn.example/b.jpg")
+        self.assertEqual(comments[1]["username"], "\u963f\u5c14\u6cd5(@alpha)")
+        self.assertEqual(comments[1]["uid"], "9001")
+        self.assertEqual(comments[1]["avatar_url"], "https://cdn.example/a.jpg")
+        self.assertTrue(comments[1]["time"])
+
+    def test_jsonld_comments_respect_limit(self):
+        comments = TwitterParser._parse_jsonld_comments(_JSONLD_PAGE, 1)
+
+        self.assertEqual([item["likes"] for item in comments], [99])
+
+    def test_extract_public_comments_on_empty_page(self):
+        self.assertEqual(TwitterParser._extract_public_comments("<html></html>", 3), [])
+
+    def test_fetch_hot_comments_returns_empty_when_page_has_no_replies(self):
+        parser = TwitterParser(hot_comment_count=3)
+        parser._fetch_public_page = AsyncMock(return_value="<html>no data</html>")
+
+        comments = asyncio.run(parser._fetch_hot_comments(object(), "123"))
+
+        self.assertEqual(comments, [])
+        self.assertEqual(parser._fetch_public_page.await_count, 2)
+
+    def test_fetch_hot_comments_retries_through_proxy_when_direct_fails(self):
+        parser = TwitterParser(
+            use_parse_proxy=False,
+            proxy_url="http://127.0.0.1:7890",
+            hot_comment_count=2,
+        )
+        calls = []
+
+        async def fake_page(session, url, proxy):
+            calls.append((url, proxy))
+            if proxy is None:
+                raise OSError("connect timeout")
+            return _JSONLD_PAGE
+
+        parser._fetch_public_page = fake_page
+
+        comments = asyncio.run(parser._fetch_hot_comments(object(), "123"))
+
+        self.assertEqual(len(comments), 2)
+        self.assertEqual(calls[-1][1], "http://127.0.0.1:7890")
+
+    def test_fetch_hot_comments_disabled_returns_empty(self):
+        parser = TwitterParser(hot_comment_count=0)
+        parser._fetch_public_page = AsyncMock(return_value=_JSONLD_PAGE)
+
+        self.assertEqual(asyncio.run(parser._fetch_hot_comments(object(), "1")), [])
+        parser._fetch_public_page.assert_not_awaited()
+
+
+class TwitterTextEntityTests(unittest.TestCase):
+    def test_twitter_text_unescapes_html_entities(self):
+        text = TwitterParser._twitter_text({"text": "(&gt;_&lt;) &amp; more"})
+
+        self.assertEqual(text, "(>_<) & more")
+
+    def test_graphql_text_unescapes_after_display_range(self):
+        tweet = {
+            "legacy": {
+                "full_text": "@someone hello &amp; bye",
+                "display_text_range": [9, 24],
+            }
+        }
+
+        self.assertEqual(TwitterParser._graphql_tweet_text(tweet), "hello & bye")
+
+
 if __name__ == "__main__":
     unittest.main()
