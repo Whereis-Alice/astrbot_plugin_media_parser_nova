@@ -661,6 +661,14 @@ class XiaohongshuParser(BaseVideoParser):
         return {
             "username": str(username),
             "uid": str(user_id),
+            # 卡片评论区要画真头像
+            "avatar_url": str(
+                user_info.get("image")
+                or user_info.get("avatar")
+                or user_info.get("images")
+                or user_info.get("userAvatar")
+                or ""
+            ).strip(),
             "likes": likes_value,
             "message": str(message).replace("\n", " ").strip(),
             "time": self._format_comment_time(created),

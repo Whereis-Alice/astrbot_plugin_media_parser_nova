@@ -5,7 +5,7 @@ from typing import List, Tuple
 from ..logger import logger
 
 from .platform.base import BaseVideoParser
-from .utils import is_live_url
+from .utils import is_live_url, trim_url_tail
 
 
 class LinkRouter:
@@ -47,7 +47,10 @@ class LinkRouter:
                 if not isinstance(link, str) or not link.strip():
                     logger.warning(f"解析器 {parser.name} 返回了无效链接项，已跳过")
                     continue
-                link = link.strip()
+                link = trim_url_tail(link.strip())
+                if not link:
+                    logger.warning(f"解析器 {parser.name} 返回了无效链接项，已跳过")
+                    continue
                 if is_live_url(link):
                     logger.debug(f"提取到直播域名链接，跳过: {link}")
                     continue

@@ -26,6 +26,44 @@ def format_duration_ms(duration_ms) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+# RFC 3986 允许出现在 URL 里的字符集合（外加常见的未编码方括号与竖线）。
+# 中日韩文字、全角标点、emoji 一律不在其中：它们只会出现在"链接后面紧跟的正文"里。
+_URL_SAFE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "-._~:/?#[]@!$" + "&'()*+,;=%|"
+)
+
+# 链接尾部常被正文标点粘住，这些字符在结尾时一律剥掉。
+_URL_TRAILING_JUNK = "。，、；：！？）】》」』〉…,.;:!?)]}'\">"
+
+
+def trim_url_tail(url: str) -> str:
+    """截掉链接尾部粘连的非 URL 字符（正文、中文标点等）。
+
+    用户在群里常把链接和文字连着发，例如 https://b23.tv/5AeLOCA媒体解析 。
+    各平台的提链正则普遍用"排除法"字符集（只排掉空白和尖括号引号），会把紧跟
+    的中文一起吃进链接，导致后续请求命中 404 或短链展开失败。
+
+    Args:
+        url: 原始提取到的链接
+
+    Returns:
+        只保留合法 URL 字符前缀、并剥掉尾部标点的链接
+    """
+    if not url:
+        return url
+    text = str(url).strip()
+    cut = len(text)
+    for index, char in enumerate(text):
+        if char not in _URL_SAFE_CHARS:
+            cut = index
+            break
+    trimmed = text[:cut].rstrip(_URL_TRAILING_JUNK)
+    return trimmed or text
+
+
 def _ensure_url_has_scheme(url: str) -> str:
     """确保URL带有scheme，便于urlparse正确解析hostname。"""
     if not url:

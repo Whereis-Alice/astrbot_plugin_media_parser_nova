@@ -25,6 +25,8 @@ async def render_card_rika(
     cover_full_size: bool = False,
     show_play_button: bool = False,
     watermark: str = "Nova解析",
+    show_watermark: bool = True,
+    show_url: bool = True,
     hot_comment_max_chars: int = 180,
     cache_key: Optional[str] = None,
 ) -> Optional[Path]:
@@ -52,6 +54,8 @@ async def render_card_rika(
             cover_full_size=cover_full_size,
             show_play_button=show_play_button,
             watermark=watermark,
+            show_watermark=show_watermark,
+            show_url=show_url,
             hot_comment_max_chars=hot_comment_max_chars,
         )
         url_key = str(metadata.get("url") or "")

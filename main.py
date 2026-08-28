@@ -471,6 +471,8 @@ class MediaParserNovaPlugin(Star):
                 cover_full_size=card_cfg.cover_full_size,
                 show_play_button=card_cfg.show_play_button,
                 watermark=card_cfg.watermark,
+                show_watermark=card_cfg.show_watermark,
+                show_url=card_cfg.show_url,
                 hot_comment_max_chars=card_cfg.hot_comment_max_chars,
             )
             if path:

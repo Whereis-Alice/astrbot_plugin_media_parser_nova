@@ -425,9 +425,17 @@ def test_wrap_keeps_short_ascii_words_intact(tmp_path: Path) -> None:
     assert "".join(renderer._wrap(long_url, font, max_width)) == long_url
 
 
+#: 除 bilibili 之外的皮肤：它们的页脚承载完整链接，bilibili 皮肤把链接收进顶栏。
+FOOTER_URL_THEME_KEYS = tuple(key for key in THEME_KEYS if key != "bilibili")
+
+
 @pytest.mark.parametrize("layout", LAYOUT_KEYS)
 def test_footer_draws_protocol_query_and_fragment(assets: dict[str, Any], layout: str) -> None:
-    """四种布局的页脚都要画出完整链接：协议、查询参数与片段一个字符都不许丢。"""
+    """四种布局的页脚都要画出完整链接：协议、查询参数与片段一个字符都不许丢。
+
+    bilibili 皮肤是唯一例外：它仿的是 B 站详情页，链接被压进顶栏右上角的署名行，
+    行为由 :func:`test_bilibili_tucks_the_link_into_the_top_right_credit_line` 单独覆盖。
+    """
     model = build_model(
         make_result(
             title="完整链接测试",
@@ -439,7 +447,7 @@ def test_footer_draws_protocol_query_and_fragment(assets: dict[str, Any], layout
         {"avatar": None, "hero": None, "grid": [assets["wide"]]},
         watermark="Alice解析",
     )
-    for theme in THEME_KEYS:
+    for theme in FOOTER_URL_THEME_KEYS:
         probe = render_probe(model, width=800, theme_key=theme, layout_key=layout)
         drawn = "".join(probe.texts)
         assert not any("http" in text and text.endswith("…") for text in probe.texts), (
@@ -448,6 +456,34 @@ def test_footer_draws_protocol_query_and_fragment(assets: dict[str, Any], layout
         assert FULL_URL in drawn, (
             f"{theme}/{layout} 布局丢失了链接片段，实际绘制：{probe.texts}"
         )
+
+
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+def test_bilibili_tucks_the_link_into_the_top_right_credit_line(
+    assets: dict[str, Any], layout: str
+) -> None:
+    """bilibili 皮肤把超长链接收进顶栏右上角：允许省略，但域名必须还认得出来。"""
+    model = build_model(
+        make_result(
+            title="完整链接测试",
+            text="链接收在顶栏右上角，不再占用页脚。",
+            url=FULL_URL,
+            platform="bilibili",
+            display_name="哔哩哔哩",
+        ),
+        {"avatar": None, "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key=layout)
+
+    credits = [text for text in probe.texts if "bilibili.com" in text]
+    assert credits, f"{layout} 顶栏丢了来源链接：{probe.texts}"
+    credit = credits[0]
+    assert "Alice解析" in credit, "署名应与链接同处一行"
+    assert credit.startswith("bilibili.com/video/"), (
+        f"链接应剥掉协议头与 www. 后从域名开始：{credit!r}"
+    )
+    assert "…" in credit, "超长链接在顶栏里应被省略而不是撑破版面"
 
 
 def test_bilibili_theme_has_no_fixed_style_watermark(assets: dict[str, Any]) -> None:
@@ -567,18 +603,22 @@ def test_bilibili_nine_grid_tiles_are_uniform_squares(bili_model: Any) -> None:
     assert abs(max(widths) - max(heights)) <= 2, "九宫格应接近正方形"
 
 
-def test_bilibili_tabbar_splits_comment_and_share_counts(bili_model: Any) -> None:
-    """页签条的两个标签各自只挂自己的数字，点赞不掺和进来。"""
+def test_bilibili_tabbar_merges_like_and_share_like_native(bili_model: Any) -> None:
+    """页签条照抄 B 站原版：「评论 N」+「赞和转发 M」，M 是点赞与转发之和。"""
     probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
 
     assert "评论 33" in probe.texts
-    assert "转发 208" in probe.texts
-    assert not [t for t in probe.texts if "赞和转发" in t], "合并文案已废弃"
-    assert "转发 361" not in probe.texts, "点赞数不能被当成转发数"
+    # 样本统计行里点赞 361、转发 208，原版页签显示两者相加。
+    assert "赞和转发 569" in probe.texts
+    assert not [t for t in probe.texts if t.startswith("转发 ")], (
+        f"不该再出现独立的转发页签：{probe.texts}"
+    )
 
 
-def test_bilibili_tabbar_share_tab_stays_blank_without_share_stat(assets: dict[str, Any]) -> None:
-    """没有转发数时转发页签留空标签，绝不回落去借用点赞数。"""
+def test_bilibili_tabbar_falls_back_to_the_single_available_count(
+    assets: dict[str, Any],
+) -> None:
+    """只拿到点赞数时，合并页签就显示这一个数字，不留空也不编造。"""
     model = build_model(
         make_result(
             title=None,
@@ -592,8 +632,28 @@ def test_bilibili_tabbar_share_tab_stays_blank_without_share_stat(assets: dict[s
     )
     probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
 
-    assert "转发" in probe.texts
-    assert "转发 361" not in probe.texts
+    assert "赞和转发 361" in probe.texts
+
+
+def test_bilibili_tabbar_label_stays_bare_without_any_count(
+    assets: dict[str, Any],
+) -> None:
+    """点赞与转发都拿不到时，页签只写标签，绝不吐出 0。"""
+    model = build_model(
+        make_result(
+            title=None,
+            text="没有任何互动数据的动态。",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+            extra={"stats_line": "\U0001f4ac 33"},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "赞和转发" in probe.texts, f"标签本身要在：{probe.texts}"
+    assert "赞和转发 0" not in probe.texts
 
 
 def test_bilibili_topbar_keeps_only_source_title(assets: dict[str, Any]) -> None:
@@ -611,21 +671,76 @@ def test_bilibili_topbar_keeps_only_source_title(assets: dict[str, Any]) -> None
     assert "UP主" not in probe.texts
 
 
-def test_bilibili_watermark_sits_with_the_link_in_neutral_grey(bili_model: Any) -> None:
-    """水印挪到链接同处的右下角，并且用中性灰而不是品牌粉。"""
+def test_bilibili_credit_line_sits_in_the_top_right_corner(bili_model: Any) -> None:
+    """链接与署名合成一行、收在顶栏右上角，用最小字号的中性灰，不抢正文的戏。"""
     probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
 
-    marks = [d for d in probe.draws if d[0] == "Alice解析"]
-    assert len(marks) == 1, f"水印应只画一次：{marks}"
-    _, mark_x, mark_y, mark_fill = marks[0]
-    links = [d for d in probe.draws if d[0].startswith("https://t.bilibili.com")]
-    assert links, "链接应被画出"
-    link_x, link_y = links[0][1], links[0][2]
+    credits = [d for d in probe.draws if "Alice解析" in d[0]]
+    assert len(credits) == 1, f"署名应只画一次：{credits}"
+    credit, credit_x, credit_y, credit_fill = credits[0]
 
-    assert mark_x > link_x, "水印应贴右侧"
-    assert mark_y >= link_y, "水印应与链接同排或在其下方"
-    assert tuple(mark_fill)[:3] == tuple(probe.ctx.ink_muted)[:3], "水印应用中性灰"
-    assert tuple(mark_fill)[:3] != tuple(probe.ctx.accent_text)[:3], "水印不该用强调色"
+    assert "t.bilibili.com/1234567890" in credit, f"链接应与署名同行：{credit!r}"
+    assert credit.index("t.bilibili.com") < credit.index("Alice解析"), "署名排在链接右侧"
+    assert tuple(credit_fill)[:3] == tuple(probe.ctx.ink_muted)[:3], "署名行应用中性灰"
+    assert tuple(credit_fill)[:3] != tuple(probe.ctx.accent_text)[:3], "署名不该用品牌粉"
+
+    # 位置：贴着卡片右上角 —— 横向落在右半区，纵向高于作者名那一行。
+    assert credit_x > probe.image.width // 2, f"署名应贴右侧，实际 x={credit_x}"
+    author = [d for d in probe.draws if d[0] == "凡人修仙传"]
+    assert author, "作者名应被画出"
+    assert credit_y < author[0][2], "署名应在作者行之上（顶栏内）"
+    assert credit_y < probe.image.height // 4, "署名应落在卡片顶部区域"
+
+
+def test_bilibili_bottom_action_bar_is_the_last_thing_drawn(bili_model: Any) -> None:
+    """底部操作栏仿 B 站原版：左侧「点我发评论」药丸 + 右侧四组数字，且位于卡片最底部。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    hints = [d for d in probe.draws if d[0] == "点我发评论"]
+    assert len(hints) == 1, f"评论药丸文案应只画一次：{hints}"
+    hint_y = hints[0][2]
+
+    # 操作栏右侧四组数字：转发 208 / 评论 33 / 收藏 876 / 点赞 361，全部同排。
+    action_numbers = [d for d in probe.draws if d[0] in {"208", "33", "876", "361"}]
+    assert {d[0] for d in action_numbers} == {"208", "33", "876", "361"}, (
+        f"四组互动数字应齐全：{[d[0] for d in probe.draws]}"
+    )
+    rows = {d[2] for d in action_numbers}
+    assert len(rows) == 1, f"四组数字应在同一行：{sorted(rows)}"
+    assert all(d[1] > hints[0][1] for d in action_numbers), "数字组应排在药丸右侧"
+    assert all(tuple(d[3])[:3] == tuple(probe.ctx.ink_dim)[:3] for d in action_numbers), (
+        "四个数字应统一用次级灰"
+    )
+
+    # 操作栏是卡片最靠下的内容：药丸与数字之下不再有任何文字。
+    lower = [d for d in probe.draws if d[2] > max(rows)]
+    assert not lower, f"操作栏之下不该还有文字：{lower}"
+    assert hint_y > probe.image.height * 0.7, "操作栏应贴卡片底部"
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+def test_watermark_and_url_switches_remove_both_marks(
+    assets: dict[str, Any], theme: str, layout: str
+) -> None:
+    """关掉水印与链接开关后，任何皮肤任何布局都不许再画出署名或链接。"""
+    model = build_model(
+        make_result(
+            title="开关测试",
+            text="水印与链接都被配置关掉了。",
+            url="https://t.bilibili.com/1234567890",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+        show_watermark=False,
+        show_url=False,
+    )
+    probe = render_probe(model, width=800, theme_key=theme, layout_key=layout)
+
+    assert "Alice解析" not in probe.joined_text, f"{theme}/{layout} 仍画出了水印"
+    assert "bilibili.com" not in probe.joined_text, f"{theme}/{layout} 仍画出了链接"
 
 
 def test_bilibili_comments_use_native_heading_and_reply_meta(bili_model: Any) -> None:

@@ -226,10 +226,16 @@ def build_model(
     images: dict[str, Any],
     *,
     watermark: str = "",
+    show_watermark: bool = True,
+    show_url: bool = True,
     comment_max_chars: int = 180,
     max_media: int = 9,
 ) -> CardModel:
-    """由 ParseResult + 图片路径构建 CardModel。"""
+    """由 ParseResult + 图片路径构建 CardModel。
+
+    show_watermark / show_url 为 False 时直接把对应字段置空，让所有皮肤、
+    所有布局统一失去该元素——绘制层无需感知开关。
+    """
     extra = getattr(result, "extra", {}) or {}
     platform = getattr(result, "platform", None)
     platform_key = str(getattr(platform, "name", "") or "website").lower()
@@ -314,7 +320,7 @@ def build_model(
             avatars=images.get("comment_avatars") or {},
         ),
         quote=quote,
-        url=str(getattr(result, "url", "") or "").strip(),
-        watermark=str(watermark or "").strip(),
+        url=str(getattr(result, "url", "") or "").strip() if show_url else "",
+        watermark=str(watermark or "").strip() if show_watermark else "",
         total_media=total_media,
     )

@@ -366,6 +366,8 @@ class CardRenderConfig:
     cover_full_size: bool = False
     show_play_button: bool = False
     watermark: str = DEFAULT_CARD_WATERMARK
+    show_watermark: bool = True
+    show_url: bool = True
     include_hot_comments: bool = False
     hot_comment_max_chars: int = 180
 
@@ -796,6 +798,16 @@ class ConfigManager:
                 ),
                 watermark=self._parse_card_watermark(
                     card_render.get("watermark", DEFAULT_CARD_WATERMARK)
+                ),
+                show_watermark=self._parse_bool(
+                    card_render.get("show_watermark", True),
+                    True,
+                    "message.card_render.show_watermark",
+                ),
+                show_url=self._parse_bool(
+                    card_render.get("show_url", True),
+                    True,
+                    "message.card_render.show_url",
                 ),
                 include_hot_comments=self._parse_bool(
                     card_render.get("include_hot_comments", False),

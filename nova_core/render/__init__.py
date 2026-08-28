@@ -22,6 +22,8 @@ async def render_card(
     cover_full_size: bool = False,
     show_play_button: bool = False,
     watermark: str = "Nova解析",
+    show_watermark: bool = True,
+    show_url: bool = True,
     hot_comment_max_chars: int = 180,
 ) -> Optional[Path]:
     """渲染卡片并保存到 save_dir，成功返回文件路径，失败返回 None。
@@ -42,6 +44,8 @@ async def render_card(
             cover_full_size=cover_full_size,
             show_play_button=show_play_button,
             watermark=watermark,
+            show_watermark=show_watermark,
+            show_url=show_url,
             hot_comment_max_chars=hot_comment_max_chars,
         )
     except Exception as e:

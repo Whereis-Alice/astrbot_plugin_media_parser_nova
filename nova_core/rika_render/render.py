@@ -48,7 +48,7 @@ DEFAULT_WATERMARK_TAG = "Nova解析"
 
 #: 卡片样式版本：视觉变化时必须 +1，否则用户侧已缓存的旧卡片不会重新渲染。
 #: 19 = 全新 nova_core.card 设计系统（主题 / 布局 / 深浅色三者全部生效）。
-_CARD_STYLE_VERSION = "23"
+_CARD_STYLE_VERSION = "24"
 
 #: 布局与风格枚举（直接取自设计系统，避免两处枚举漂移）
 LAYOUT_NAMES: tuple[str, ...] = LAYOUT_KEYS
@@ -108,6 +108,8 @@ class ShareCardRenderer:
         cover_full_size: bool = False,
         show_play_button: bool = False,
         watermark: str = DEFAULT_WATERMARK_TAG,
+        show_watermark: bool = True,
+        show_url: bool = True,
         hot_comment_max_chars: int = 180,
     ) -> None:
         self.cache_dir = cache_dir
@@ -124,6 +126,8 @@ class ShareCardRenderer:
         self.show_play_button = bool(show_play_button)
         self.cover_full_size = bool(cover_full_size)
         self.watermark = (str(watermark or "").strip() or DEFAULT_WATERMARK_TAG)[:32]
+        self.show_watermark = bool(show_watermark)
+        self.show_url = bool(show_url)
         try:
             comment_limit = int(hot_comment_max_chars)
         except (TypeError, ValueError):
@@ -174,6 +178,8 @@ class ShareCardRenderer:
                 str(self.cover_full_size),
                 str(self.show_play_button),
                 self.watermark,
+                str(self.show_watermark),
+                str(self.show_url),
                 str(self.hot_comment_max_chars),
                 payload,
                 warnings_str,
@@ -272,6 +278,8 @@ class ShareCardRenderer:
             result,
             payload,
             watermark=self.watermark,
+            show_watermark=self.show_watermark,
+            show_url=self.show_url,
             comment_max_chars=self.hot_comment_max_chars,
         )
         image = render_card_image(

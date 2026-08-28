@@ -442,6 +442,8 @@ class BilibiliParser(BaseVideoParser):
         return {
             "username": str(member.get("uname", "") or ""),
             "uid": str(member.get("mid", "") or ""),
+            # 卡片里的评论头像取自这里；缺了它渲染层只能画首字母占位
+            "avatar_url": str(member.get("avatar", "") or "").strip(),
             "likes": likes,
             "message": str(content.get("message", "") or "").replace("\n", " ").strip(),
             "time": time_text,
@@ -666,7 +668,8 @@ class BilibiliParser(BaseVideoParser):
         result_links_set = set()
         seen_ids = set()
 
-        b23_pattern = r'https?://[Bb]23\.tv/[^\s<>"\'()]+'
+        # b23 短链的 slug 只可能是字母数字，用白名单避免把紧跟的中文吃进链接
+        b23_pattern = r"https?://[Bb]23\.tv/[0-9A-Za-z]+"
         b23_links = re.findall(b23_pattern, text, re.IGNORECASE)
         result_links_set.update(b23_links)
 

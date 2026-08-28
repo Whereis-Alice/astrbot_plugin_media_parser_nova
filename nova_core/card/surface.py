@@ -447,7 +447,7 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
     """绘制一枚极简线性图标，用于统计行 / 封面浮层。
 
     kind: play / danmaku / like / dislike / coin / star / share / comment / eye /
-          clock / back / more / sort / bolt / dot
+          clock / back / more / sort / bolt / person / dot
     全部为几何绘制（超采样 3x），不依赖 emoji 字体。
     """
     x0, y0, x1, y1 = (int(v) for v in box)
@@ -518,9 +518,23 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
     elif kind == "star":
         d.polygon(_star_points(big_w / 2.0, big_h * 0.54, big_w * 0.50, big_w * 0.21), fill=color)
     elif kind == "share":
-        d.arc((int(big_w * 0.04), int(big_h * 0.26), int(big_w * 0.96), int(big_h * 1.30)), 190, 350, fill=color, width=line)
-        d.line([px(0.52, 0.06), px(0.94, 0.32)], fill=color, width=line)
-        d.line([px(0.52, 0.58), px(0.94, 0.32)], fill=color, width=line)
+        # B 站「转发」：一条自左下上扬的曲线尾 + 右侧实心箭头。
+        # 早先版本用 arc + 两条斜线拼箭头，小尺寸下箭头会与弧线脱开、看着像坏图，
+        # 这里改成折线近似曲线 + 实心三角，15px 也能一眼认出是转发。
+        d.line(
+            [
+                px(0.04, 0.90),
+                px(0.11, 0.72),
+                px(0.21, 0.59),
+                px(0.35, 0.50),
+                px(0.50, 0.45),
+                px(0.66, 0.43),
+            ],
+            fill=color,
+            width=line,
+            joint="curve",
+        )
+        d.polygon([px(0.62, 0.16), px(0.99, 0.43), px(0.62, 0.70)], fill=color)
     elif kind == "eye":
         d.ellipse((0, int(big_h * 0.20), big_w - 1, int(big_h * 0.80)), outline=color, width=line)
         d.ellipse((int(big_w * 0.36), int(big_h * 0.38), int(big_w * 0.64), int(big_h * 0.62)), fill=color)
@@ -562,6 +576,18 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
     elif kind == "sort":
         for fy, fx in ((0.22, 0.92), (0.50, 0.70), (0.78, 0.48)):
             d.line([px(0.08, fy), px(fx, fy)], fill=color, width=line)
+    elif kind == "person":
+        # 默认头像的人形剪影：头 + 肩，纯几何、任何皮肤下都不会显得跳
+        d.ellipse(
+            (int(big_w * 0.31), int(big_h * 0.13), int(big_w * 0.69), int(big_h * 0.51)),
+            fill=color,
+        )
+        d.pieslice(
+            (int(big_w * 0.13), int(big_h * 0.57), int(big_w * 0.87), int(big_h * 1.32)),
+            180,
+            360,
+            fill=color,
+        )
     elif kind == "bolt":
         d.polygon(
             [

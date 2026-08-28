@@ -483,6 +483,13 @@ class WeiboParser(BaseVideoParser):
         return {
             "username": str(user.get("screen_name", "") or ""),
             "uid": str(user.get("id", "") or ""),
+            # 卡片评论区要画真头像；大图优先，退回普通尺寸
+            "avatar_url": str(
+                user.get("avatar_large")
+                or user.get("avatar_hd")
+                or user.get("profile_image_url")
+                or ""
+            ).strip(),
             "likes": likes,
             "message": message,
             "time": time_text,

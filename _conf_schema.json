@@ -342,10 +342,22 @@
                         "default": false
                     },
                     "watermark": {
-                        "description": "卡片右下角署名",
+                        "description": "卡片署名文案",
                         "type": "string",
-                        "hint": "留空使用 Nova解析；最多 32 个字符。",
+                        "hint": "留空使用 Nova解析；最多 32 个字符。显示位置由皮肤决定（哔哩哔哩皮肤在右上角，其余皮肤在页脚）。",
                         "default": "Nova解析"
+                    },
+                    "show_watermark": {
+                        "description": "显示卡片署名",
+                        "type": "bool",
+                        "hint": "关闭后所有皮肤都不再绘制署名水印。",
+                        "default": true
+                    },
+                    "show_url": {
+                        "description": "显示原文链接",
+                        "type": "bool",
+                        "hint": "关闭后所有皮肤都不再在卡片上绘制来源链接。",
+                        "default": true
                     },
                     "include_hot_comments": {
                         "description": "热评合并到卡片",

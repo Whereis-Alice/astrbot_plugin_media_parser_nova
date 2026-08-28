@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from . import surface
-from .model import CommentItem, MediaItem, QuoteItem
-from .palette import RGB, RGBA, alpha, darken, mix, readable_ink
+from .model import CommentItem, MediaItem, QuoteItem, compact_number
+from .palette import RGB, RGBA, alpha, darken, mix
 
 # ============================ 基类 ============================
 
@@ -337,6 +337,22 @@ class EyebrowBlock(Block):
             ctx.ink_muted,
         )
         right_limit = x + width - more_w - m.gap_md
+
+        # 来源链接与署名水印收在顶栏右上角：最小字号 + 中性灰，存在但不抢戏。
+        # 两者都可以在配置里单独关掉，关掉后 model 里对应字段为空串，这里自然不画。
+        credit_f = ctx.font(_credit_font_size(ctx))
+        credit = _corner_credit(ctx, credit_f, _credit_budget(width))
+        if credit:
+            credit_w = ctx.ts.width(credit, credit_f)
+            credit_lh = ctx.ts.line_height(credit_f, 1.0)
+            ctx.text(
+                layer,
+                (right_limit - credit_w, mid - credit_lh // 2),
+                credit,
+                credit_f,
+                ctx.ink_muted,
+            )
+            right_limit -= credit_w + m.gap_md
 
         # 顶栏正题只写来源站点名，等价于 B 站详情页的"返回 + 标题"；
         # 内容类型（图文/视频）已由正文与媒体区块本身表达，不再另贴标签。
@@ -1284,11 +1300,21 @@ class MediaBlock(Block):
 # ============================ 数据 ============================
 
 
-def _stat_value_number(value: str) -> float:
-    text = str(value or "").strip()
+def _parse_stat_number(value: str) -> float | None:
+    """把展示用的统计文案还原成数值，无法解析时返回 None。
+
+    统计值抵达绘制层时已经过格式化，可能是 `6,082`、`1.8万`、`2.3K`
+    等形态；调用方需要区分"真的是 0"和"根本没解析出来"，因此这里返回
+    Optional 而不是 0 兜底。
+    """
+    text = str(value or "").strip().replace(",", "").replace("，", "")
+    if not text:
+        return None
     mult = 1.0
     if text.endswith("万"):
         mult, text = 10000.0, text[:-1]
+    elif text.endswith("千"):
+        mult, text = 1000.0, text[:-1]
     elif text.endswith("亿"):
         mult, text = 100000000.0, text[:-1]
     elif text.lower().endswith("k"):
@@ -1298,7 +1324,12 @@ def _stat_value_number(value: str) -> float:
     try:
         return float(text) * mult
     except ValueError:
-        return 0.0
+        return None
+
+
+def _stat_value_number(value: str) -> float:
+    """`_parse_stat_number` 的 0 兜底版本，供排序 / 权重比较使用。"""
+    return _parse_stat_number(value) or 0.0
 
 
 @dataclass
@@ -1576,10 +1607,11 @@ class IpNoteBlock(Block):
 
 @dataclass
 class TabBarBlock(Block):
-    """哔哩哔哩动态详情页的页签条：选中的"评论 N"带粉色下划线，右邻"转发 M"。
+    """哔哩哔哩动态详情页的页签条：选中的"评论 N"带粉色下划线，右邻"赞和转发 M"。
 
-    两个页签各自只挂自己的数字；点赞不在这里出现，由底部操作栏负责，
-    避免"赞和转发"这类合并文案挂着单一数值造成歧义。
+    第二个页签严格复刻 B 站原版：文案固定为"赞和转发"，数值是点赞与转发
+    之和（截图里的 836 = 817 赞 + 19 转发）。任一侧数值缺失或无法解析时，
+    只累加能拿到的那一侧；两侧都拿不到才退回无数字的纯文案。
     """
 
     variant: str = "bili"
@@ -1594,9 +1626,21 @@ class TabBarBlock(Block):
         if not count and model.comments:
             count = str(len(model.comments))
         active = f"评论 {count}".strip() if count else "评论"
-        shares = _stat_value(ctx, ("share",))
-        rest = f"转发 {shares}".strip() if shares else "转发"
+        total = self._like_share_total(ctx)
+        rest = f"赞和转发 {total}" if total else "赞和转发"
         return active, rest
+
+    @staticmethod
+    def _like_share_total(ctx: Any) -> str:
+        """点赞 + 转发的合计，按 B 站的压缩数字样式输出。"""
+        parts = [
+            _parse_stat_number(_stat_value(ctx, (kind,)))
+            for kind in ("like", "share")
+        ]
+        numbers = [value for value in parts if value is not None]
+        if not numbers:
+            return ""
+        return compact_number(int(round(sum(numbers))))
 
     def _plan(self, ctx: Any, width: int) -> dict[str, Any]:
         cached = self._plans.get(width)
@@ -1796,7 +1840,13 @@ def _comment_avatar(
     name: str,
     path: Any = None,
 ) -> None:
-    """评论者头像：优先真实头像，缺失时用按昵称派生色相的首字占位。"""
+    """评论者头像：优先真实头像，缺失时退回低调的中性占位。
+
+    占位不再用高饱和品牌色圆底 + 白色首字——那种处理会让每条评论都顶着一枚
+    比头像本身更抢眼的色块，在任何皮肤下都出戏。改为与卡片表面同色系的中性
+    圆盘（按昵称在很窄的明度区间里微调，只为让相邻两条不至于完全一样）、
+    发丝描边与中性灰字，让它安静地退回背景；连首字都取不到时画人形剪影。
+    """
     if path is not None and surface.Image is not None:
         try:
             img = surface.open_image(path)
@@ -1812,22 +1862,37 @@ def _comment_avatar(
                 border_width=ctx.m.hairline,
             )
             return
-    text = name or "?"
-    seed = sum(ord(ch) for ch in text)
-    tint = mix(ctx.accent, ctx.pal.surface, 0.10 + (seed % 6) * 0.07)
+    text = str(name or "").strip()
+    seed = sum(ord(ch) for ch in text) if text else 0
+    # 明度区间刻意收得很窄：区分度够辨认相邻两条，又不足以形成视觉噪点
+    depth = 0.085 + (seed % 5) * 0.019
+    tint = mix(ctx.pal.surface, ctx.ink, depth)
     surface.panel(
         layer,
         (x, y, x + size, y + size),
         size // 2,
         fill=alpha(tint, 255),
+        border=alpha(ctx.pal.surface_border, 70),
+        border_width=ctx.m.hairline,
     )
-    font = ctx.font(max(9, int(size * 0.48)), bold=True)
+    initial = text[:1]
+    # isalnum() 对中日韩文字同样为真，emoji / 颜文字昵称才会走剪影分支
+    if not initial or not initial.isalnum():
+        inset = max(1, int(size * 0.19))
+        surface.glyph(
+            layer,
+            (x + inset, y + inset, x + size - inset, y + size - inset),
+            "person",
+            alpha(mix(tint, ctx.ink, 0.30), 255),
+        )
+        return
+    font = ctx.font(max(9, int(size * 0.44)), bold=True)
     ctx.text(
         layer,
         (x + size // 2, y + size // 2),
-        text[:1],
+        initial.upper(),
         font,
-        readable_ink(tint),
+        ctx.ink_muted,
         bold=True,
         anchor="mm",
     )
@@ -2075,6 +2140,53 @@ class CommentsBlock(Block):
 # ============================ 页脚 ============================
 
 
+def _bare_url(url: Any) -> str:
+    """去掉协议与 www. 前缀的链接，用于空间紧张的角落署名。"""
+    text = str(url or "").strip()
+    for prefix in ("https://", "http://"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if text.startswith("www."):
+        text = text[4:]
+    return text
+
+
+#: 角落署名行里链接与署名之间的分隔符
+_CREDIT_SEP = "  ·  "
+
+
+def _credit_font_size(ctx: Any) -> int:
+    """角落署名的字号：比脚注再小一档，肉眼可查但不参与视觉层级。"""
+    return max(9, int(round(ctx.m.f_caption * 0.92)))
+
+
+def _credit_budget(width: int) -> int:
+    """角落署名允许占用的最大横向宽度。"""
+    return max(64, int(width * 0.56))
+
+
+def _corner_credit(ctx: Any, font: Any, budget: int) -> str:
+    """把来源链接与署名压成一行角落文案：域名 · 署名。
+
+    两者各由配置开关（show_url / show_watermark）控制，关掉时 model 里对应字段
+    已是空串，这里自然省略。预算不足时优先保住署名，链接以省略号收尾；连 40px
+    都挤不出来就干脆不画链接，也绝不让它把版面撑破。
+    """
+    model = ctx.model
+    mark = str(model.watermark or "").strip()
+    mark_w = ctx.ts.width(mark, font) if mark else 0
+    bare = _bare_url(model.url)
+    pieces: list[str] = []
+    if bare:
+        url_budget = budget - mark_w - (ctx.ts.width(_CREDIT_SEP, font) if mark else 0)
+        if url_budget >= 40:
+            pieces.append(ctx.ts.ellipsize(bare, font, url_budget))
+    if mark:
+        pieces.append(mark)
+    return _CREDIT_SEP.join(pieces)
+
+
 def _url_flow(
     ctx: Any,
     url: str,
@@ -2143,47 +2255,7 @@ class FooterBlock(Block):
         mark_w = ctx.ts.tracked_width(mark, mark_f, mark_tracking) if mark else 0
 
         if self.variant == "bili":
-            # 底部操作栏：转发/评论/收藏/点赞 均分一行；链接与水印一起收进底部灰色药丸
-            icon = max(11, int(m.f_footer * 1.3))
-            action_row = max(ctx.ts.line_height(mark_f, 1.2), icon)
-            # 水印在这套皮肤里用常规字重，宽度要照常规字重量
-            mark_w = ctx.ts.tracked_width(mark, font, mark_tracking) if mark else 0
-            actions = [
-                (kinds[0], _stat_value(ctx, kinds))
-                for kinds in (("share",), ("comment",), ("star",), ("like",))
-            ]
-            actions = [pair for pair in actions if pair[1]]
-            pill_pad = max(m.gap_xs, m.unit)
-            pill_inner = max(40, width - pill_pad * 2)
-            url_lines = _url_flow(ctx, url, font, pill_inner, pill_inner, self.max_url_lines)
-            last_w = ctx.ts.width(url_lines[-1], font) if url_lines else 0
-            # 水印贴药丸右下角：与末行链接同排放得下就同排，否则自己占一行
-            mark_inline = bool(mark_w) and last_w + m.gap_md + mark_w <= pill_inner
-            pill_rows = max(1, len(url_lines)) + (1 if mark_w and not mark_inline else 0)
-            pill_h = pill_pad * 2 + row * pill_rows
-            head = m.gap_sm + 1 + m.gap_md
-            plan = {
-                "font": font,
-                "mark_f": mark_f,
-                "mark": mark,
-                "mark_w": mark_w,
-                "mark_tracking": mark_tracking,
-                "mark_inline": mark_inline,
-                "url_lines": url_lines,
-                "row": row,
-                "inner_w": pill_inner,
-                "offset_x": pill_pad,
-                "offset_y": head + action_row + m.gap_sm + pill_pad,
-                "icon": icon,
-                "action_row": action_row,
-                "actions": actions,
-                "pill_pad": pill_pad,
-                "pill_h": pill_h,
-                "head": head,
-                "height": head + action_row + m.gap_sm + pill_h,
-            }
-            self._plans[width] = plan
-            return plan
+            return self._plan_bili(ctx, width, font, row)
 
         if self.variant == "plate":
             inner_w = max(40, width - m.gap_sm * 2)
@@ -2224,54 +2296,153 @@ class FooterBlock(Block):
     def _measure(self, ctx: Any, width: int) -> int:
         return int(self._plan(ctx, width)["height"])
 
+    #: 底部操作栏的四组动作，顺序与 B 站客户端一致；solid 表示实心+品牌色
+    _BILI_ACTIONS: tuple[tuple[str, bool], ...] = (
+        ("share", False),
+        ("comment", False),
+        ("star", True),
+        ("like", True),
+    )
+
+    #: 评论输入框的 placeholder，照抄 B 站原版
+    _BILI_COMMENT_HINT = "点我发评论"
+
+    def _plan_bili(self, ctx: Any, width: int, font: Any, row: int) -> dict[str, Any]:
+        """哔哩哔哩底部操作栏的排版计算。
+
+        形态严格照 B 站客户端详情页最底部那条：左边一枚圆角"点我发评论"
+        输入药丸，右边四组"图标在上、数字在下、整组居中"的堆叠。链接与
+        水印已迁往顶栏右上角，这里不再承担它们，操作栏因此能干净地落在
+        卡片最底部。
+        """
+        m = ctx.m
+        icon = max(15, int(round(m.f_body * 1.32)))
+        num_f = ctx.font(max(10, int(round(m.f_caption * 1.02))))
+        num_row = ctx.ts.line_height(num_f, 1.0)
+        stack_gap = max(2, int(round(m.unit * 0.9)))
+        stack_h = icon + stack_gap + num_row
+
+        actions: list[dict[str, Any]] = []
+        for kind, solid in self._BILI_ACTIONS:
+            value = _stat_value(ctx, (kind,))
+            if not value:
+                continue
+            actions.append(
+                {
+                    "kind": kind,
+                    "value": value,
+                    "solid": solid,
+                    "col": max(icon, ctx.ts.width(value, num_f)),
+                }
+            )
+        act_gap = max(m.gap_md, int(round(m.unit * 6)))
+        actions_w = sum(item["col"] for item in actions)
+        if actions:
+            actions_w += act_gap * (len(actions) - 1)
+
+        hint_f = ctx.font(m.f_meta)
+        hint_row = ctx.ts.line_height(hint_f, 1.0)
+        pill_pad_y = max(m.gap_xs, int(round(m.unit * 2.2)))
+        pill_h = hint_row + pill_pad_y * 2
+        pill_pad_x = max(m.gap_sm, pill_h // 2)
+        # 药丸吃掉操作栏之外的全部剩余宽度，太窄时（超小卡片）整个让位
+        pill_w = width - actions_w - (act_gap if actions else 0)
+        hint_w = ctx.ts.width(self._BILI_COMMENT_HINT, hint_f)
+        pill_min = hint_w + pill_pad_x * 2
+        show_pill = pill_w >= pill_min
+        if not show_pill:
+            pill_w = 0
+
+        bar_h = max(stack_h, pill_h)
+        head = m.gap_sm + 1 + m.gap_md
+        plan = {
+            "font": font,
+            "mark": "",
+            "mark_w": 0,
+            "mark_f": font,
+            "mark_tracking": 0.0,
+            "url_lines": [],
+            "row": row,
+            "inner_w": max(40, width),
+            "offset_x": 0,
+            "offset_y": head,
+            "icon": icon,
+            "num_f": num_f,
+            "num_row": num_row,
+            "stack_gap": stack_gap,
+            "stack_h": stack_h,
+            "actions": actions,
+            "actions_w": actions_w,
+            "act_gap": act_gap,
+            "hint_f": hint_f,
+            "hint_row": hint_row,
+            "pill_w": pill_w,
+            "pill_h": pill_h,
+            "pill_pad_x": pill_pad_x,
+            "show_pill": show_pill,
+            "bar_h": bar_h,
+            "head": head,
+            "height": head + bar_h,
+        }
+        self._plans[width] = plan
+        return plan
+
     def _draw_bili(self, ctx: Any, layer: Any, x: int, y: int, width: int, plan: dict[str, Any]) -> None:
-        """哔哩哔哩底部：分割线 + 均分的数据栏 + 收着链接与水印的药丸。"""
+        """哔哩哔哩底部操作栏：发评论输入药丸 + 转发/评论/收藏/点赞 四组堆叠。"""
         m, pal = ctx.m, ctx.pal
-        row = plan["row"]
         surface.hairline(layer, x, y + m.gap_sm, x + width, ctx.hair)
         top = y + int(plan["head"])
-        action_row = int(plan["action_row"])
+        bar_h = int(plan["bar_h"])
 
-        icon = int(plan["icon"])
-        font = plan["font"]
-        actions = plan["actions"]
-        if actions:
-            # 数据栏按 B 站动态卡片的做法等分整宽，每格内部居中
-            gy = top + max(0, (action_row - icon) // 2)
-            tyy = top + max(0, (action_row - row) // 2)
-            slot = width / len(actions)
-            for index, (kind, value) in enumerate(actions):
-                item_w = icon + m.gap_2xs + ctx.ts.width(value, font)
-                left = int(x + slot * index + (slot - item_w) / 2)
-                left = max(x, min(left, x + width - item_w))
-                surface.glyph(layer, (left, gy, left + icon, gy + icon), kind, alpha(ctx.ink_muted, 255))
-                ctx.text(layer, (left + icon + m.gap_2xs, tyy), value, font, ctx.ink_muted)
-
-        pill_pad = int(plan["pill_pad"])
-        pill_h = int(plan["pill_h"])
-        pill_top = top + action_row + m.gap_sm
-        surface.panel(
-            layer,
-            (x, pill_top, x + width, pill_top + pill_h),
-            max(3, min(pill_h // 2, m.radius_panel)),
-            fill=alpha(pal.surface, 34 if pal.is_dark else 150),
-            border=ctx.hair,
-            border_width=m.hairline,
-        )
-        lines = plan["url_lines"]
-        for index, line in enumerate(lines):
-            ctx.text(layer, (x + pill_pad, pill_top + pill_pad + index * row), line, font, ctx.accent_alt_text)
-        if plan["mark"]:
-            # 水印是署名而不是重点：中性灰、不加粗，靠位置而不是颜色被认出来
-            mark_row = max(0, len(lines) - 1) if plan["mark_inline"] else len(lines)
+        if plan["show_pill"]:
+            pill_w, pill_h = int(plan["pill_w"]), int(plan["pill_h"])
+            pill_top = top + max(0, (bar_h - pill_h) // 2)
+            # 输入框是"可点击的空槽"，靠极浅的填充暗示可交互，不描边不上色
+            surface.panel(
+                layer,
+                (x, pill_top, x + pill_w, pill_top + pill_h),
+                pill_h // 2,
+                fill=alpha(mix(pal.surface, ctx.ink, 0.13 if pal.is_dark else 0.055), 255),
+            )
             ctx.text(
                 layer,
-                (x + width - pill_pad - plan["mark_w"], pill_top + pill_pad + mark_row * row),
-                plan["mark"],
-                plan["font"],
+                (
+                    x + int(plan["pill_pad_x"]),
+                    pill_top + max(0, (pill_h - int(plan["hint_row"])) // 2),
+                ),
+                self._BILI_COMMENT_HINT,
+                plan["hint_f"],
                 ctx.ink_muted,
-                tracking=plan["mark_tracking"],
             )
+
+        actions = plan["actions"]
+        if not actions:
+            return
+        icon = int(plan["icon"])
+        num_f = plan["num_f"]
+        stack_gap = int(plan["stack_gap"])
+        stack_h = int(plan["stack_h"])
+        stack_top = top + max(0, (bar_h - stack_h) // 2)
+        cursor = x + width - int(plan["actions_w"])
+        for index, item in enumerate(actions):
+            col = int(item["col"])
+            if index:
+                cursor += int(plan["act_gap"])
+            center = cursor + col / 2.0
+            # 收藏 / 点赞 用实心品牌色（对应原版"已互动"的观感），转发 / 评论走中性描边
+            tint = ctx.accent if item["solid"] else ctx.ink_muted
+            gx = int(round(center - icon / 2.0))
+            surface.glyph(layer, (gx, stack_top, gx + icon, stack_top + icon), item["kind"], alpha(tint, 255))
+            value = str(item["value"])
+            vw = ctx.ts.width(value, num_f)
+            ctx.text(
+                layer,
+                (int(round(center - vw / 2.0)), stack_top + icon + stack_gap),
+                value,
+                num_f,
+                ctx.ink_dim,
+            )
+            cursor += col
 
     def draw(self, ctx: Any, layer: Any, x: int, y: int, width: int) -> None:
         m = ctx.m
@@ -2429,6 +2600,22 @@ class ImmersiveHeroBlock(Block):
             _play_badge(ctx, layer, (x, y, x + width, y + height - plan["overlay_h"] // 2))
         if model.duration_text:
             _corner_tag(ctx, layer, (x, y + m.gap_lg + m.chip_h, x + width - m.pad + m.gap_xs, y + m.gap_lg + m.chip_h * 2), model.duration_text)
+
+        if ctx.theme.eyebrow == "bili_top":
+            # 沉浸布局吃掉了顶栏，而 B 站皮肤的链接与署名本来就挂在顶栏右上角。
+            # 这里把它补回 hero 右上角的压暗区（上方 scrim 保证可读），
+            # 免得这两条信息在 immersive + bilibili 的组合里凭空消失。
+            credit_f = ctx.font(_credit_font_size(ctx))
+            credit = _corner_credit(ctx, credit_f, _credit_budget(width))
+            if credit:
+                credit_w = ctx.ts.width(credit, credit_f)
+                ctx.text(
+                    layer,
+                    (x + width - m.pad - credit_w, y + m.gap_md),
+                    credit,
+                    credit_f,
+                    (226, 230, 240),
+                )
 
         inner_x = x + m.pad
         inner_w = width - m.pad * 2
