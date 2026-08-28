@@ -4,6 +4,7 @@
 样本按真实 player / next 响应裁剪，保留解析依赖的结构特征。
 """
 
+import asyncio
 import hashlib
 import unittest
 
@@ -11,6 +12,7 @@ from nova_core.parser.platform.youtube import (
     COOKIE_PLAYER_CLIENTS,
     DEFAULT_PLAYER_CLIENTS,
     INNERTUBE_CLIENTS,
+    METADATA_PLAYER_CLIENTS,
     YouTubeParser,
     build_sapisid_authorization,
     build_youtube_stats_line,
@@ -21,6 +23,7 @@ from nova_core.parser.platform.youtube import (
     extract_youtube_links,
     extract_youtube_owner,
     extract_youtube_publish_date,
+    extract_youtube_view_count,
     find_comment_continuation,
     parse_compact_number,
     parse_cookie_header,
@@ -29,8 +32,90 @@ from nova_core.parser.platform.youtube import (
     select_youtube_media,
     thumbnail_candidates,
 )
+from nova_core.parser.platform.youtube import _Deadline
 
 VID = "dQw4w9WgXcQ"
+
+
+def _gated_next_payload(with_accessibility: bool = True) -> dict:
+    """按被机器人门禁拦下的真实 next 响应裁剪出的样本。
+
+    特征：likeCountEntity 只剩空壳，点赞数只能从无障碍文案或
+    buttonViewModel.title 取；播放量只在 videoViewCountRenderer 里。
+    """
+    like_button = {
+        "iconName": "LIKE",
+        "title": "6.5K",
+    }
+    if with_accessibility:
+        like_button["accessibilityText"] = (
+            "like this video along with 6,550 other people"
+        )
+    return {
+        "frameworkUpdates": {
+            "entityBatchUpdate": {
+                "mutations": [
+                    {
+                        "payload": {
+                            "likeCountEntity": {
+                                "key": "unset_like_count_entity_key"
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "contents": {
+            "twoColumnWatchNextResults": {
+                "results": {
+                    "results": {
+                        "contents": [
+                            {
+                                "videoPrimaryInfoRenderer": {
+                                    "viewCount": {
+                                        "videoViewCountRenderer": {
+                                            "viewCount": {
+                                                "simpleText": (
+                                                    "238,963 views"
+                                                )
+                                            },
+                                            "shortViewCount": {
+                                                "simpleText": "238K views"
+                                            },
+                                            "originalViewCount": "0",
+                                        }
+                                    },
+                                    "videoActions": {
+                                        "menuRenderer": {
+                                            "topLevelButtons": [
+                                                {
+                                                    "segmentedLikeDislikeButtonViewModel": {
+                                                        "likeButtonViewModel": {
+                                                            "buttonViewModel": like_button
+                                                        },
+                                                        "dislikeButtonViewModel": {
+                                                            "buttonViewModel": {
+                                                                "iconName": (
+                                                                    "DISLIKE"
+                                                                ),
+                                                                "title": (
+                                                                    "Dislike"
+                                                                ),
+                                                            }
+                                                        },
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
 
 
 class ParseIdentityTest(unittest.TestCase):
@@ -430,6 +515,71 @@ class NextPayloadTest(unittest.TestCase):
 
     def test_like_count_missing_returns_zero(self):
         self.assertEqual(extract_youtube_like_count({}), 0)
+
+    def test_like_count_from_gated_next_payload(self):
+        """门禁视频只给空壳 likeCountEntity，精确值在无障碍文案里。"""
+        self.assertEqual(
+            extract_youtube_like_count(_gated_next_payload()), 6550
+        )
+
+    def test_like_count_from_button_view_model(self):
+        """连无障碍文案都没有时，退回新版 buttonViewModel 的 title。"""
+        payload = _gated_next_payload(with_accessibility=False)
+        self.assertEqual(extract_youtube_like_count(payload), 6500)
+
+    def test_like_count_ignores_dislike_button(self):
+        payload = {
+            "segmentedLikeDislikeButtonViewModel": {
+                "dislikeButtonViewModel": {
+                    "buttonViewModel": {
+                        "iconName": "DISLIKE",
+                        "title": "42",
+                    }
+                }
+            }
+        }
+        self.assertEqual(extract_youtube_like_count(payload), 0)
+
+    def test_like_count_prefers_like_button_scope(self):
+        """点赞按钮子树优先，外面的干扰文案不该被读到。"""
+        payload = {
+            "segmentedLikeDislikeButtonViewModel": {
+                "likeButtonViewModel": {
+                    "buttonViewModel": {
+                        "iconName": "LIKE",
+                        "title": "6.5K",
+                    }
+                }
+            },
+            "commentTeaser": {"accessibilityText": "111 likes"},
+        }
+        self.assertEqual(extract_youtube_like_count(payload), 6500)
+
+    def test_like_count_prefers_exact_number_over_compact(self):
+        payload = {
+            "likeCountEntity": {
+                "expandedLikeCountIfIndifferent": {"content": "19,355,277"},
+                "likeCountIfIndifferent": {"content": "19M"},
+            }
+        }
+        self.assertEqual(extract_youtube_like_count(payload), 19355277)
+
+    def test_view_count_from_next_payload(self):
+        self.assertEqual(
+            extract_youtube_view_count(_gated_next_payload()), 238963
+        )
+
+    def test_view_count_falls_back_to_short_text(self):
+        payload = {
+            "videoViewCountRenderer": {
+                "shortViewCount": {"simpleText": "238K views"},
+                "originalViewCount": "0",
+            }
+        }
+        self.assertEqual(extract_youtube_view_count(payload), 238000)
+
+    def test_view_count_missing_returns_zero(self):
+        self.assertEqual(extract_youtube_view_count({}), 0)
 
     def test_comment_count(self):
         payload = {
@@ -1012,3 +1162,88 @@ class CookieExpiryDetectionTest(unittest.TestCase):
     def test_client_chain_is_readable(self):
         parser = YouTubeParser(player_clients="ios,android_vr")
         self.assertEqual(parser._client_chain(), "ios > android_vr")
+
+
+class MetadataFallbackTest(unittest.TestCase):
+    """门禁吞掉 videoDetails 时的元数据兜底客户端。"""
+
+    DETAILS = {
+        "videoId": "2sm0UuaOm_s",
+        "title": "样本标题",
+        "author": "样本作者",
+        "lengthSeconds": "84",
+        "viewCount": "239339",
+    }
+
+    @staticmethod
+    def _run(parser, failures):
+        return asyncio.run(
+            parser._fetch_player_metadata(
+                None, "2sm0UuaOm_s", _Deadline(30.0), failures
+            )
+        )
+
+    def test_metadata_clients_are_registered(self):
+        self.assertTrue(METADATA_PLAYER_CLIENTS)
+        for key in METADATA_PLAYER_CLIENTS:
+            with self.subTest(client=key):
+                self.assertIn(key, INNERTUBE_CLIENTS)
+                # 元数据客户端只用来补字段，不参与取流。
+                self.assertFalse(INNERTUBE_CLIENTS[key].get("media", False))
+                self.assertNotIn(key, DEFAULT_PLAYER_CLIENTS)
+
+    def test_returns_first_payload_with_title(self):
+        parser = YouTubeParser()
+        calls = []
+
+        async def fake_post(session, endpoint, client_key, body, deadline):
+            calls.append((endpoint, client_key, body.get("videoId")))
+            return {"videoDetails": dict(self.DETAILS)}
+
+        parser._post_innertube = fake_post
+        failures = []
+        player = self._run(parser, failures)
+        self.assertEqual(player["videoDetails"]["lengthSeconds"], "84")
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            calls, [("player", METADATA_PLAYER_CLIENTS[0], "2sm0UuaOm_s")]
+        )
+
+    def test_missing_details_is_recorded_as_failure(self):
+        parser = YouTubeParser()
+
+        async def fake_post(session, endpoint, client_key, body, deadline):
+            return {"playabilityStatus": {"status": "LOGIN_REQUIRED"}}
+
+        parser._post_innertube = fake_post
+        failures = []
+        self.assertEqual(self._run(parser, failures), {})
+        self.assertEqual(len(failures), len(METADATA_PLAYER_CLIENTS))
+        self.assertIn("元数据", failures[0])
+
+    def test_exception_is_recorded_and_swallowed(self):
+        parser = YouTubeParser()
+
+        async def fake_post(session, endpoint, client_key, body, deadline):
+            raise RuntimeError("boom")
+
+        parser._post_innertube = fake_post
+        failures = []
+        self.assertEqual(self._run(parser, failures), {})
+        self.assertIn("RuntimeError: boom", failures[0])
+
+    def test_client_already_in_main_chain_is_skipped(self):
+        parser = YouTubeParser(
+            player_clients=",".join(METADATA_PLAYER_CLIENTS)
+        )
+        calls = []
+
+        async def fake_post(session, endpoint, client_key, body, deadline):
+            calls.append(client_key)
+            return {"videoDetails": dict(self.DETAILS)}
+
+        parser._post_innertube = fake_post
+        failures = []
+        self.assertEqual(self._run(parser, failures), {})
+        self.assertEqual(calls, [])
+        self.assertEqual(failures, [])

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 from astrbot.api.message_components import Image, Plain, Video
 
 from ..downloader.utils import strip_media_prefixes
+from ..parser.utils import format_duration_ms
 from ..logger import logger
 from ..message_text import split_message_text
 from ..metadata_visibility import text_metadata_field_enabled
@@ -152,8 +153,18 @@ def build_text_node(
     available_length_ms = metadata.get("available_length_ms")
     timelength_ms = metadata.get("timelength_ms")
     is_preview_only = metadata.get("is_preview_only")
+    # B站的 access_message 讲的是「可解析时长 / 全长」，YouTube 讲的是「为什么
+    # 拿不到流」。后者挂在「时长：」下面读起来完全不通，所以按有没有可解析时长
+    # 分流：带时长的仍用「时长」，纯限制说明改用中性的「提示」，并把真实时长
+    # 单独补一行，免得这一行把时长的位置占了却什么都没说。
     if access_status and access_status != "full" and access_message:
-        text_parts.append(f"时长：{access_message}")
+        if available_length_ms:
+            text_parts.append(f"时长：{access_message}")
+        else:
+            duration_text = format_duration_ms(timelength_ms)
+            if duration_text:
+                text_parts.append(f"时长：{duration_text}")
+            text_parts.append(f"提示：{access_message}")
     elif is_preview_only and available_length_ms:
         try:
             available_seconds = max(0, int(available_length_ms) // 1000)

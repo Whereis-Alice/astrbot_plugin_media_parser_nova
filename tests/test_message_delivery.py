@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 from astrbot.api.message_components import Image, Nodes, Plain, Reply
 
-from nova_core.message_adapter.node_builder import build_all_nodes
+from nova_core.message_adapter.node_builder import build_all_nodes, build_text_node
 from nova_core.message_adapter.sender import MessageSender
 
 
@@ -164,3 +164,42 @@ class MessageDeliveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextNodeAccessMessageTests(unittest.TestCase):
+    """限制说明的标签归属：B站讲时长，YouTube 讲原因。"""
+
+    GATE = "被 YouTube 机器人验证挡下，仅展示封面与信息"
+
+    def _text(self, **extra):
+        metadata = {"title": "样本标题", "platform": "youtube"}
+        metadata.update(extra)
+        node = build_text_node(metadata)
+        self.assertIsNotNone(node)
+        return node.text
+
+    def test_restriction_without_length_uses_hint_label(self):
+        text = self._text(
+            access_status="gated",
+            access_message=self.GATE,
+            timelength_ms=84000,
+        )
+        self.assertIn("时长：01:24", text)
+        self.assertIn("提示：" + self.GATE, text)
+        self.assertNotIn("时长：" + self.GATE, text)
+
+    def test_restriction_without_any_duration_omits_duration_line(self):
+        text = self._text(access_status="gated", access_message=self.GATE)
+        self.assertIn("提示：" + self.GATE, text)
+        self.assertNotIn("时长：", text)
+
+    def test_partial_access_keeps_duration_label(self):
+        message = "可解析 03:00 / 全长 10:00"
+        text = self._text(
+            access_status="preview",
+            access_message=message,
+            available_length_ms=180000,
+            timelength_ms=600000,
+        )
+        self.assertIn("时长：" + message, text)
+        self.assertNotIn("提示：", text)

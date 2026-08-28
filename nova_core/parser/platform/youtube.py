@@ -39,6 +39,7 @@ __all__ = [
     "COOKIE_PLAYER_CLIENTS",
     "DEFAULT_PLAYER_CLIENTS",
     "INNERTUBE_CLIENTS",
+    "METADATA_PLAYER_CLIENTS",
     "build_sapisid_authorization",
     "build_youtube_stats_line",
     "detect_youtube_login_state",
@@ -48,6 +49,7 @@ __all__ = [
     "extract_youtube_links",
     "extract_youtube_owner",
     "extract_youtube_publish_date",
+    "extract_youtube_view_count",
     "find_comment_continuation",
     "localize_relative_time",
     "parse_compact_number",
@@ -180,6 +182,24 @@ INNERTUBE_CLIENTS: Dict[str, Dict[str, Any]] = {
             "platform": "TV",
         },
     },
+    # TVHTML5_SIMPLY：实测在「Sign in to confirm you are not a bot」门禁下，
+    # 它是唯一仍然完整下发 videoDetails（标题/作者/时长/播放量）的客户端，
+    # 但 playabilityStatus=UNPLAYABLE、没有 streamingData，所以只做元数据兜底。
+    "tv_simply": {
+        "client_id": 75,
+        "media": False,
+        "cookies": True,
+        "user_agent": (
+            "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 "
+            "Safari/605.1.15"
+        ),
+        "context": {
+            "clientName": "TVHTML5_SIMPLY",
+            "clientVersion": "1.0",
+            "platform": "TV",
+        },
+    },
     "mweb": {
         "client_id": 2,
         "media": False,
@@ -219,6 +239,10 @@ COOKIE_PLAYER_CLIENTS: Tuple[str, ...] = (
     "tv",
     "web",
 )
+
+# 出流客户端全部拿不到 videoDetails 时，用这些客户端只捞元数据。
+# 它们不参与选流，只负责把标题/作者/时长/播放量补回来。
+METADATA_PLAYER_CLIENTS: Tuple[str, ...] = ("tv_simply",)
 
 # SAPISIDHASH 鉴权用到的 cookie 名，按优先级排列。
 _SAPISID_COOKIE_NAMES: Tuple[str, ...] = (
@@ -912,44 +936,122 @@ def extract_youtube_owner(payload: Any) -> Tuple[str, str, str]:
     return name, upscale_avatar_url(avatar), channel_id
 
 
-def extract_youtube_like_count(payload: Any) -> int:
-    """提取点赞数。
+# 点赞数无障碍文案的两种句式：老式 "6,550 likes"，以及 2026 年的
+# "like this video along with 6,550 other people"。
+_LIKE_TEXT_PATTERNS = (
+    re.compile(r"^\s*([\d.,]+\s*[KMB]?)\s+likes?\b", re.IGNORECASE),
+    re.compile(
+        r"along with\s+([\d.,]+\s*[KMB]?)\s+other\s+(?:people|person)",
+        re.IGNORECASE,
+    ),
+)
 
-    优先读结构化的 likeCountEntity，其次解析英文无障碍文案
-    （所以 next 请求固定用 hl=en），最后退回按钮文本。
+# 新版 buttonViewModel 用 iconName 区分点赞/点踩/分享。
+_LIKE_ICON_NAMES = frozenset({"LIKE", "LIKE_FILLED"})
+
+# likeCountEntity 里数字字段的优先级：精确整数 > 展开文案 > 压缩文案。
+_LIKE_ENTITY_KEYS = (
+    "likeCountIfIndifferentNumber",
+    "likeCountIfLikedNumber",
+    "expandedLikeCountIfIndifferent",
+    "expandedLikeCountIfLiked",
+    "likeCountIfIndifferent",
+    "likeCountIfLiked",
+)
+
+
+def _like_button_scopes(payload: Any) -> List[Any]:
+    """按「点赞按钮子树 → 整个 payload」的顺序给出搜索范围。
+
+    先在点赞按钮子树里找，避免把分享/订阅/评论的按钮文本误读成点赞数；
+    找不到子树（或子树里没有数字）时再退回全量搜索，保持对老结构兼容。
     """
-    for entity in _deep_iter(payload, "likeCountEntity"):
+    scopes: List[Any] = []
+    for key in (
+        "segmentedLikeDislikeButtonViewModel",
+        "segmentedLikeDislikeButtonRenderer",
+        "likeButtonViewModel",
+    ):
+        node = _deep_first(payload, key)
+        if node is None:
+            continue
+        if any(node is existing for existing in scopes):
+            continue
+        scopes.append(node)
+    if not any(payload is existing for existing in scopes):
+        scopes.append(payload)
+    return scopes
+
+
+def _like_count_in_scope(scope: Any) -> int:
+    """在给定子树里依次尝试四种点赞数来源。"""
+    for entity in _deep_iter(scope, "likeCountEntity"):
         if not isinstance(entity, dict):
             continue
-        for key in (
-            "likeCountIfIndifferentNumber",
-            "likeCountIfLikedNumber",
-            "likeCountIfIndifferent",
-            "likeCountIfLiked",
-        ):
+        for key in _LIKE_ENTITY_KEYS:
             value = parse_compact_number(_text_of(entity.get(key)))
             if value:
                 return value
 
-    like_text_re = re.compile(
-        r"^\s*([\d.,]+\s*[KMB]?)\s+likes?\b",
-        re.IGNORECASE,
-    )
-    for text in _deep_iter(payload, "accessibilityText"):
+    for text in _deep_iter(scope, "accessibilityText"):
         if not isinstance(text, str):
             continue
-        match = like_text_re.match(text)
-        if match:
+        for pattern in _LIKE_TEXT_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
             value = parse_compact_number(match.group(1))
             if value:
                 return value
 
-    for toggle in _deep_iter(payload, "toggleButtonRenderer"):
+    for toggle in _deep_iter(scope, "toggleButtonRenderer"):
         if not isinstance(toggle, dict):
             continue
         value = parse_compact_number(_text_of(toggle.get("defaultText")))
         if value:
             return value
+
+    for button in _deep_iter(scope, "buttonViewModel"):
+        if not isinstance(button, dict):
+            continue
+        icon = str(button.get("iconName") or "").strip().upper()
+        if icon not in _LIKE_ICON_NAMES:
+            continue
+        value = parse_compact_number(_text_of(button.get("title")))
+        if value:
+            return value
+    return 0
+
+
+def extract_youtube_like_count(payload: Any) -> int:
+    """提取点赞数。
+
+    2026 年的 next 响应有两种形态：likeCountEntity 被填充时直接读数字；
+    被机器人门禁拦下的视频只给一个空壳 entity
+    （{"key": "unset_like_count_entity_key"}），这时精确值只剩无障碍文案
+    （"like this video along with 6,550 other people"）和新版
+    buttonViewModel 的 title（"6.5K"）两个出处。所以 next 固定用 hl=en。
+    """
+    for scope in _like_button_scopes(payload):
+        value = _like_count_in_scope(scope)
+        if value:
+            return value
+    return 0
+
+
+def extract_youtube_view_count(payload: Any) -> int:
+    """提取播放量。
+
+    player 被门禁拦下时 videoDetails 整块缺失，viewCount 也就没了；但
+    next 端点即便在门禁下仍返回 videoViewCountRenderer，精确值可用。
+    """
+    for renderer in _deep_iter(payload, "videoViewCountRenderer"):
+        if not isinstance(renderer, dict):
+            continue
+        for key in ("viewCount", "originalViewCount", "shortViewCount"):
+            value = parse_compact_number(_text_of(renderer.get(key)))
+            if value:
+                return value
     return 0
 
 
@@ -1508,6 +1610,46 @@ class YouTubeParser(BaseVideoParser):
             best = (player, client_key)
         return best
 
+    async def _fetch_player_metadata(
+        self,
+        session: aiohttp.ClientSession,
+        video_id: str,
+        deadline: _Deadline,
+        failures: List[str],
+    ) -> Dict[str, Any]:
+        """只为补元数据而跑的 player 请求。
+
+        出流客户端被门禁挡下时会连 videoDetails 一起吞掉，卡片就只剩一个
+        标题（来自 oembed），时长、播放量全丢。TVHTML5_SIMPLY 在同样的门禁下
+        仍然完整下发 videoDetails，所以专门跑它一趟把这些字段捞回来。
+        返回第一个带 title 的响应，全失败时返回空 dict。
+        """
+        for client_key in METADATA_PLAYER_CLIENTS:
+            if client_key in self.player_clients:
+                # 已经在主链跑过且没成功，不重复烧预算。
+                continue
+            if deadline.expired():
+                failures.append(f"{client_key}(元数据) -> 跳过（总预算耗尽）")
+                break
+            body = self._innertube_body(client_key)
+            body["videoId"] = video_id
+            try:
+                player = await self._post_innertube(
+                    session, "player", client_key, body, deadline
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures.append(
+                    f"{client_key}(元数据) -> {type(exc).__name__}: {exc}"
+                )
+                continue
+            details = player.get("videoDetails")
+            if isinstance(details, dict) and details.get("title"):
+                return player
+            failures.append(f"{client_key}(元数据) -> 无 videoDetails")
+        return {}
+
     async def _fetch_watch_html(
         self,
         session: aiohttp.ClientSession,
@@ -1616,7 +1758,25 @@ class YouTubeParser(BaseVideoParser):
         details = details if isinstance(details, dict) else {}
         initial_data: Optional[Dict[str, Any]] = None
 
-        # 第 1 层兜底：Innertube 全线失败时抓 watch 页面内嵌 JSON。
+        # 第 1 层兜底：门禁吞掉 videoDetails 时，用元数据专用客户端补回
+        # 标题/作者/时长/播放量。playabilityStatus 仍沿用出流客户端的结果，
+        # 否则「被机器人验证挡下」会退化成含糊的「无法播放」。
+        if not details.get("title") and not deadline.expired():
+            meta_player = await self._fetch_player_metadata(
+                session, video_id, deadline, failures
+            )
+            meta_details = meta_player.get("videoDetails")
+            if isinstance(meta_details, dict) and meta_details.get("title"):
+                details = meta_details
+                player["videoDetails"] = meta_details
+                if not player.get("microformat") and meta_player.get(
+                    "microformat"
+                ):
+                    player["microformat"] = meta_player["microformat"]
+                if not player_client:
+                    player_client = "tv_simply"
+
+        # 第 2 层兜底：Innertube 全线失败时抓 watch 页面内嵌 JSON。
         if not details.get("title") and not deadline.expired():
             try:
                 html_player, initial_data = await self._fetch_watch_html(
@@ -1718,6 +1878,10 @@ class YouTubeParser(BaseVideoParser):
             channel_id = channel_id or owner_channel
             like_count = extract_youtube_like_count(next_payload)
             comment_count = extract_youtube_comment_count(next_payload)
+            if not view_count:
+                # player 被门禁拦下时 videoDetails 缺失，播放量只能从
+                # next 的 videoViewCountRenderer 里补。
+                view_count = extract_youtube_view_count(next_payload)
 
             if self.hot_comment_count > 0 and not deadline.expired():
                 token = find_comment_continuation(next_payload)

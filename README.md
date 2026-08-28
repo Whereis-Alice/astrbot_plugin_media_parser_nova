@@ -346,9 +346,11 @@ Nitter 抓取成功后就不会再去试 X 公开页（那条路线已经不返�
 YouTube 解析走官方 Innertube 接口，**不依赖 yt-dlp，也不依赖任何第三方镜像站或解析服务**。整条链路分三层，每层失败只降级、不中断：
 
 ```text
-① 元数据   oembed  ‖  Innertube player      并发；都失败 → 抓 watch 页内嵌 ytInitialPlayerResponse
+① 元数据   oembed ‖ Innertube player   并发
+           → 都拿不到 videoDetails 时补跑 TVHTML5_SIMPLY（门禁下它仍然下发完整字段）
+           → 仍然没有则抓 watch 页内嵌的 ytInitialPlayerResponse
 ② 媒体流   streamingData → dash → progressive → HLS → 仅视频轨
-③ 增强     Innertube next → 作者头像 / 点赞数 / 评论数 / 热评
+③ 增强     Innertube next → 作者头像 / 播放量 / 点赞数 / 评论数 / 热评
 ```
 
 支持的链接形态：`youtube.com/watch?v=`、`youtu.be/`、`/shorts/`、`/live/`、`/embed/`、`/v/`、`music.youtube.com`，以及分享用的 `/attribution_link?u=...`（会自动解包内层地址）。
@@ -430,7 +432,9 @@ YouTube 的 Cookie 之所以「特别容易失效」，绝大多数不是过期�
 
 ### 取不到视频流时
 
-机器人验证、会员限定、地区限制、年龄限制、私享视频、正在直播等情况下拿不到可下载的流。这时插件不会报错，而是退化成「封面 + 标题 + 作者 + 统计 + 热评」的卡片，并在卡片上标明原因（例如「被 YouTube 机器人验证挡下，仅展示封面与信息」）。标题、作者、发布时间、评论数和热评在这种状态下依然能取到。
+机器人验证、会员限定、地区限制、年龄限制、私享视频、正在直播等情况下拿不到可下载的流。这时插件不会报错，而是退化成「封面 + 标题 + 作者 + 时长 + 统计 + 热评」的卡片，并在卡片上标明原因（例如「被 YouTube 机器人验证挡下，仅展示封面与信息」）。
+
+**信息卡片是完整的**：门禁会把出流客户端的 `videoDetails` 整块吞掉，插件会自动补跑一个专门的元数据客户端（TVHTML5_SIMPLY），把标题、作者、时长、播放量捞回来；点赞数与评论数从 `next` 端点单独取。所以被拦下的视频依旧能出「👀 播放 / 👍 点赞 / 💬 评论」齐全的统计行和正确的时长，只是没有视频文件。
 
 后台日志里，完整的降级链走 DEBUG，正常解析在 INFO 留一行摘要（视频 ID、流类型、客户端、热评条数、耗时），方便排查是哪一层退化了。
 
