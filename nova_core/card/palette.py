@@ -455,6 +455,122 @@ BILIBILI_BLUE = hex_to_rgb("#00AEEC")
 BILIBILI_PINK = hex_to_rgb("#FB7299")
 
 
+# --- X（推特）x：仿 X 移动端贴文详情页 ---
+# 取色自 X 官方设计令牌：蓝 #1D9BF0 / 赞粉 #F91880 / 转推绿 #00BA7C
+# 深色为 X 的「熄灯」模式：页底纯黑 #000000、卡面 #16181C、分割线 #2F3336
+# 浅色页底纯白、卡面 #F7F9F9、分割线 #EFF3F4、次要文字 #536471
+
+X_LIGHT = _palette(
+    "light",
+    backdrop_a=hex_to_rgb("#FFFFFF"),
+    backdrop_b=hex_to_rgb("#F7F9F9"),
+    bloom=hex_to_rgb("#1D9BF0"),
+    bloom_alpha=0,
+    surface=hex_to_rgb("#FFFFFF"),
+    surface_alpha=255,
+    surface_border=hex_to_rgb("#EFF3F4"),
+    surface_border_alpha=255,
+    ink=hex_to_rgb("#0F1419"),
+    ink_dim=hex_to_rgb("#536471"),
+    ink_muted=hex_to_rgb("#8B98A5"),
+    hairline=hex_to_rgb("#EFF3F4"),
+    hairline_alpha=255,
+    media_mat=hex_to_rgb("#F7F9F9"),
+    media_edge=hex_to_rgb("#EFF3F4"),
+    media_edge_alpha=255,
+    grain_alpha=0,
+    shadow_alpha=22,
+    accent_ink=(255, 255, 255),
+    accent_wash=24,
+)
+
+X_DARK = _palette(
+    "dark",
+    backdrop_a=hex_to_rgb("#000000"),
+    backdrop_b=hex_to_rgb("#000000"),
+    bloom=hex_to_rgb("#1D9BF0"),
+    bloom_alpha=0,
+    surface=hex_to_rgb("#16181C"),
+    surface_alpha=255,
+    surface_border=hex_to_rgb("#2F3336"),
+    surface_border_alpha=255,
+    ink=hex_to_rgb("#E7E9EA"),
+    ink_dim=hex_to_rgb("#8B98A5"),
+    ink_muted=hex_to_rgb("#71767B"),
+    hairline=hex_to_rgb("#2F3336"),
+    hairline_alpha=255,
+    media_mat=hex_to_rgb("#0B0C0D"),
+    media_edge=hex_to_rgb("#2F3336"),
+    media_edge_alpha=255,
+    grain_alpha=0,
+    shadow_alpha=110,
+    accent_ink=(255, 255, 255),
+    accent_wash=30,
+)
+
+# X 品牌辅助色
+X_BLUE = hex_to_rgb("#1D9BF0")
+X_LIKE_PINK = hex_to_rgb("#F91880")
+X_REPOST_GREEN = hex_to_rgb("#00BA7C")
+
+# --- YouTube yt：仿 YouTube 观看页 ---
+# 深色为 YouTube 暗色主题：页底 #0F0F0F、卡面 #1F1F1F、分割线 #303030、
+# 次要文字 #AAAAAA；浅色页底纯白、卡面 #F9F9F9、分割线 #E5E5E5。
+# 强调红 #FF0033（播放按钮 / 已赞），链接蓝 #3EA6FF（暗色下的可点文字）。
+
+YOUTUBE_LIGHT = _palette(
+    "light",
+    backdrop_a=hex_to_rgb("#FFFFFF"),
+    backdrop_b=hex_to_rgb("#F9F9F9"),
+    bloom=hex_to_rgb("#FF0033"),
+    bloom_alpha=0,
+    surface=hex_to_rgb("#FFFFFF"),
+    surface_alpha=255,
+    surface_border=hex_to_rgb("#E5E5E5"),
+    surface_border_alpha=255,
+    ink=hex_to_rgb("#0F0F0F"),
+    ink_dim=hex_to_rgb("#606060"),
+    ink_muted=hex_to_rgb("#909090"),
+    hairline=hex_to_rgb("#E5E5E5"),
+    hairline_alpha=255,
+    media_mat=hex_to_rgb("#F2F2F2"),
+    media_edge=hex_to_rgb("#E5E5E5"),
+    media_edge_alpha=255,
+    grain_alpha=0,
+    shadow_alpha=20,
+    accent_ink=(255, 255, 255),
+    accent_wash=22,
+)
+
+YOUTUBE_DARK = _palette(
+    "dark",
+    backdrop_a=hex_to_rgb("#0F0F0F"),
+    backdrop_b=hex_to_rgb("#0F0F0F"),
+    bloom=hex_to_rgb("#FF0033"),
+    bloom_alpha=0,
+    surface=hex_to_rgb("#1F1F1F"),
+    surface_alpha=255,
+    surface_border=hex_to_rgb("#303030"),
+    surface_border_alpha=255,
+    ink=hex_to_rgb("#F1F1F1"),
+    ink_dim=hex_to_rgb("#AAAAAA"),
+    ink_muted=hex_to_rgb("#888888"),
+    hairline=hex_to_rgb("#303030"),
+    hairline_alpha=255,
+    media_mat=hex_to_rgb("#0B0B0B"),
+    media_edge=hex_to_rgb("#303030"),
+    media_edge_alpha=255,
+    grain_alpha=0,
+    shadow_alpha=120,
+    accent_ink=(255, 255, 255),
+    accent_wash=28,
+)
+
+# YouTube 品牌辅助色
+YOUTUBE_RED = hex_to_rgb("#FF0033")
+YOUTUBE_LINK_BLUE = hex_to_rgb("#3EA6FF")
+
+
 PALETTES: dict[str, dict[str, Palette]] = {
     "aurora": {"dark": AURORA_DARK, "light": AURORA_LIGHT},
     "broadsheet": {"dark": BROADSHEET_DARK, "light": BROADSHEET_LIGHT},
@@ -462,6 +578,8 @@ PALETTES: dict[str, dict[str, Palette]] = {
     "gallery": {"dark": GALLERY_DARK, "light": GALLERY_LIGHT},
     "nocturne": {"dark": NOCTURNE_DARK, "light": NOCTURNE_LIGHT},
     "bilibili": {"dark": BILIBILI_DARK, "light": BILIBILI_LIGHT},
+    "x": {"dark": X_DARK, "light": X_LIGHT},
+    "youtube": {"dark": YOUTUBE_DARK, "light": YOUTUBE_LIGHT},
     # 兼容旧键：任何配置里残留的 stream 都落到哔哩哔哩配色
     "stream": {"dark": BILIBILI_DARK, "light": BILIBILI_LIGHT},
 }

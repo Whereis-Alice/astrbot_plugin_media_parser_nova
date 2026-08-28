@@ -14,6 +14,7 @@ from nova_core.parser.platform.youtube import (
     YouTubeParser,
     build_sapisid_authorization,
     build_youtube_stats_line,
+    detect_youtube_login_state,
     extract_youtube_comment_count,
     extract_youtube_comments,
     extract_youtube_like_count,
@@ -919,3 +920,95 @@ class CookieAuthTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CookieExpiryDetectionTest(unittest.TestCase):
+    """Cookie 失效检测：responseContext.loggedOut → 登录态判定 → 待通知标记。"""
+
+    COOKIE = "SAPISID=secret; __Secure-3PAPISID=secret"
+
+    def test_reads_logged_out_flag_from_response_context(self):
+        payload = {
+            "responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}
+        }
+        self.assertIs(detect_youtube_login_state(payload), False)
+
+    def test_logged_out_false_means_authenticated(self):
+        payload = {
+            "responseContext": {"mainAppWebResponseContext": {"loggedOut": False}}
+        }
+        self.assertIs(detect_youtube_login_state(payload), True)
+
+    def test_accepts_string_flag_and_nested_placement(self):
+        self.assertIs(
+            detect_youtube_login_state(
+                {"contents": {"mainAppWebResponseContext": {"loggedOut": "true"}}}
+            ),
+            False,
+        )
+        self.assertIs(
+            detect_youtube_login_state(
+                {"contents": {"mainAppWebResponseContext": {"loggedOut": "FALSE"}}}
+            ),
+            True,
+        )
+
+    def test_returns_none_without_the_signal(self):
+        for payload in (None, {}, [], {"responseContext": {}}, "x", 3):
+            with self.subTest(payload=payload):
+                self.assertIsNone(detect_youtube_login_state(payload))
+        self.assertIsNone(
+            detect_youtube_login_state(
+                {"responseContext": {"mainAppWebResponseContext": {"loggedOut": 1}}}
+            )
+        )
+
+    def test_alert_is_pending_once_and_then_consumed(self):
+        parser = YouTubeParser(cookie=self.COOKIE, cookie_alert_enabled=True)
+        self.assertIsNone(parser.consume_cookie_alert())
+
+        parser._mark_cookie_alert("logged_out")
+        self.assertEqual(parser.consume_cookie_alert(), "logged_out")
+        self.assertIsNone(parser.consume_cookie_alert())
+
+    def test_alert_defaults_the_reason(self):
+        parser = YouTubeParser(cookie=self.COOKIE, cookie_alert_enabled=True)
+        parser._mark_cookie_alert("")
+        self.assertEqual(parser.consume_cookie_alert(), "cookie_expired")
+
+    def test_alert_stays_silent_when_disabled(self):
+        parser = YouTubeParser(cookie=self.COOKIE, cookie_alert_enabled=False)
+        parser._mark_cookie_alert("logged_out")
+        self.assertIsNone(parser.consume_cookie_alert())
+
+    def test_alert_stays_silent_without_authenticated_cookie(self):
+        # 没填 Cookie、或 Cookie 里缺 SAPISID 时谈不上"失效"，不该骚扰管理员。
+        for cookie in ("", "SID=abc"):
+            with self.subTest(cookie=cookie):
+                parser = YouTubeParser(cookie=cookie, cookie_alert_enabled=True)
+                parser._mark_cookie_alert("logged_out")
+                self.assertIsNone(parser.consume_cookie_alert())
+
+    def test_gate_advice_points_at_cookie_and_proxy(self):
+        advice = YouTubeParser._gate_advice("LOGIN_REQUIRED", False)
+        self.assertIn("youtube.cookie", advice)
+        self.assertIn("proxy.youtube", advice)
+
+        expired = YouTubeParser._gate_advice("OK", True)
+        self.assertIn("重新导出", expired)
+
+        self.assertEqual(YouTubeParser._gate_advice("OK", False), "")
+
+    def test_login_label_reflects_credential_state(self):
+        self.assertEqual(YouTubeParser()._login_label(False), "匿名")
+        self.assertIn(
+            "缺少 SAPISID",
+            YouTubeParser(cookie="SID=abc")._login_label(False),
+        )
+        authed = YouTubeParser(cookie=self.COOKIE)
+        self.assertEqual(authed._login_label(False), "cookie(已鉴权)")
+        self.assertEqual(authed._login_label(True), "cookie(已失效)")
+
+    def test_client_chain_is_readable(self):
+        parser = YouTubeParser(player_clients="ios,android_vr")
+        self.assertEqual(parser._client_chain(), "ios > android_vr")

@@ -472,8 +472,9 @@ def _star_points(cx: float, cy: float, outer: float, inner: float) -> list[tuple
 def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -> None:
     """绘制一枚极简线性图标，用于统计行 / 封面浮层。
 
-    kind: play / danmaku / like / dislike / coin / star / share / comment / eye /
-          clock / back / more / sort / bolt / person / dot
+    kind: play / danmaku / like / heart / dislike / coin / star / share / repost /
+          export / bookmark / comment / eye / clock / back / more / sort / check /
+          bolt / person / dot
     全部为几何绘制（超采样 3x），不依赖 emoji 字体。
     """
     x0, y0, x1, y1 = (int(v) for v in box)
@@ -536,6 +537,12 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
             radius=int(big_w * 0.06),
             fill=color,
         )
+    elif kind == "heart":
+        # X「喜欢」：实心心形（两个圆瓣 + 下收的三角）。like 是拇指，两者不能混用，
+        # X 的操作栏与回复迷你行都要心形，否则一眼就出戏。
+        d.ellipse((int(big_w * 0.02), int(big_h * 0.08), int(big_w * 0.52), int(big_h * 0.60)), fill=color)
+        d.ellipse((int(big_w * 0.48), int(big_h * 0.08), int(big_w * 0.98), int(big_h * 0.60)), fill=color)
+        d.polygon([px(0.04, 0.40), px(0.96, 0.40), px(0.50, 0.98)], fill=color)
     elif kind == "coin":
         d.ellipse((line // 2, line // 2, big_w - 1 - line // 2, big_h - 1 - line // 2), outline=color, width=line)
         d.line([px(0.50, 0.24), px(0.50, 0.76)], fill=color, width=line)
@@ -561,6 +568,28 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
             joint="curve",
         )
         d.polygon([px(0.62, 0.16), px(0.99, 0.43), px(0.62, 0.70)], fill=color)
+    elif kind == "repost":
+        # X「转帖」：上下两支反向箭头。原先画成「带拐角的回环 + 三角」，两条折线
+        # 的拐角与对面的箭头底边在 20px 下会糊成一个方块，完全认不出是转发；
+        # 改成互不相交的双向箭头后，12px 也一眼可辨。share 仍留给 B 站转发。
+        d.line([px(0.06, 0.32), px(0.74, 0.32)], fill=color, width=line)
+        d.polygon([px(0.70, 0.12), px(0.70, 0.52), px(0.98, 0.32)], fill=color)
+        d.line([px(0.94, 0.70), px(0.26, 0.70)], fill=color, width=line)
+        d.polygon([px(0.30, 0.50), px(0.30, 0.90), px(0.02, 0.70)], fill=color)
+    elif kind == "export":
+        # X「分享」：托盘 + 向上飞出的箭头（原版是 ↗ 出框的观感）
+        d.line(
+            [px(0.14, 0.46), px(0.14, 0.93), px(0.86, 0.93), px(0.86, 0.46)],
+            fill=color,
+            width=line,
+            joint="curve",
+        )
+        d.line([px(0.50, 0.68), px(0.50, 0.22)], fill=color, width=line)
+        d.polygon([px(0.33, 0.32), px(0.67, 0.32), px(0.50, 0.06)], fill=color)
+    elif kind == "bookmark":
+        # X「书签」：下缘开 V 的书签带
+        pts = [px(0.24, 0.08), px(0.76, 0.08), px(0.76, 0.94), px(0.50, 0.70), px(0.24, 0.94)]
+        d.line([*pts, pts[0]], fill=color, width=line, joint="curve")
     elif kind == "eye":
         d.ellipse((0, int(big_h * 0.20), big_w - 1, int(big_h * 0.80)), outline=color, width=line)
         d.ellipse((int(big_w * 0.36), int(big_h * 0.38), int(big_w * 0.64), int(big_h * 0.62)), fill=color)
@@ -614,6 +643,11 @@ def glyph(target: Any, box: tuple[int, int, int, int], kind: str, color: RGBA) -
             360,
             fill=color,
         )
+    elif kind == "check":
+        # 认证角标里的对勾（X / YouTube 都是勾，不是闪电）
+        thick = max(2, int(round(line * 1.35)))
+        d.line([px(0.20, 0.52), px(0.42, 0.74)], fill=color, width=thick)
+        d.line([px(0.42, 0.74), px(0.80, 0.28)], fill=color, width=thick)
     elif kind == "bolt":
         d.polygon(
             [

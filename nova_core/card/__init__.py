@@ -7,7 +7,7 @@
 * typeset  字体发现、换行、绘制
 * surface  Pillow 绘制原语（渐变、玻璃、噪点、圆角、阴影）
 * model    把解析结果归一为渲染数据模型
-* theme    主题配方（6 套）与布局预设（4 套）
+* theme    主题配方（8 套 + 跟随平台）与布局预设（4 套）
 * blocks   可测量、可组合的排版区块
 * engine   装配与渲染入口
 """
@@ -38,9 +38,11 @@ from .palette import (
     readable_ink,
 )
 from .theme import (
+    AUTO_THEME_KEY,
     LAYOUT_ALIASES,
     LAYOUT_KEYS,
     LAYOUTS,
+    PLATFORM_THEMES,
     THEME_ALIASES,
     THEME_KEYS,
     THEMES,
@@ -48,13 +50,16 @@ from .theme import (
     ThemeRecipe,
     get_layout,
     get_theme,
+    is_auto_theme,
     resolve_layout_key,
     resolve_mode,
     resolve_theme_key,
+    resolve_theme_key_for_platform,
 )
 from .typeset import TypeSetter, clean_text, discover_fonts, limit_chars
 
 __all__ = [
+    "AUTO_THEME_KEY",
     "BASE_WIDTH",
     "CardModel",
     "CommentItem",
@@ -66,6 +71,7 @@ __all__ = [
     "MediaItem",
     "Metrics",
     "PLATFORM_ACCENTS",
+    "PLATFORM_THEMES",
     "Palette",
     "QuoteItem",
     "RenderContext",
@@ -87,6 +93,7 @@ __all__ = [
     "get_palette",
     "get_theme",
     "hex_to_rgb",
+    "is_auto_theme",
     "limit_chars",
     "normalize_comments",
     "parse_stats",
@@ -96,4 +103,5 @@ __all__ = [
     "resolve_layout_key",
     "resolve_mode",
     "resolve_theme_key",
+    "resolve_theme_key_for_platform",
 ]

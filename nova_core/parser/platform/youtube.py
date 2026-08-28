@@ -41,6 +41,7 @@ __all__ = [
     "INNERTUBE_CLIENTS",
     "build_sapisid_authorization",
     "build_youtube_stats_line",
+    "detect_youtube_login_state",
     "extract_youtube_comments",
     "extract_youtube_comment_count",
     "extract_youtube_like_count",
@@ -240,6 +241,15 @@ _AUDIO_CODEC_RANK = (
     ("opus", 2),
     ("vorbis", 1),
     ("ec-3", 1),
+)
+
+# 需要登录/验证才能放行的门禁状态，命中后给出可操作建议。
+_GATED_STATUS_CODES = frozenset(
+    {
+        "LOGIN_REQUIRED",
+        "AGE_VERIFICATION_REQUIRED",
+        "CONTENT_CHECK_REQUIRED",
+    }
 )
 
 _PLAYABILITY_LABELS = {
@@ -679,6 +689,32 @@ def build_sapisid_authorization(
     ).hexdigest()
     return f"SAPISIDHASH {stamp}_{digest}"
 
+
+def detect_youtube_login_state(payload: Any) -> Optional[bool]:
+    """
+    从 Innertube 响应里读出「服务端是否认为本次请求已登录」。
+
+    Returns:
+        Optional[bool]: True=已登录，False=被当作未登录，None=响应里没有该信号。
+    """
+    if not isinstance(payload, dict):
+        return None
+    context = payload.get("responseContext")
+    node: Any = None
+    if isinstance(context, dict):
+        node = context.get("mainAppWebResponseContext")
+    if not isinstance(node, dict):
+        node = _deep_first(payload, "mainAppWebResponseContext")
+    if not isinstance(node, dict):
+        return None
+    logged_out = node.get("loggedOut")
+    if isinstance(logged_out, bool):
+        return not logged_out
+    if isinstance(logged_out, str):
+        lowered = logged_out.strip().lower()
+        if lowered in ("true", "false"):
+            return lowered == "false"
+    return None
 
 # ── 媒体流挑选 ────────────────────────────────────────────
 
@@ -1210,6 +1246,7 @@ class YouTubeParser(BaseVideoParser):
         hot_comment_count: int = 0,
         total_budget_seconds: float = 45.0,
         allow_dash: bool = True,
+        cookie_alert_enabled: bool = False,
     ):
         super().__init__("youtube")
         self.cookie = (cookie or "").strip()
@@ -1223,6 +1260,9 @@ class YouTubeParser(BaseVideoParser):
         self.hot_comment_count = max(0, _as_int(hot_comment_count))
         self.total_budget_seconds = max(8.0, float(total_budget_seconds or 45))
         self.allow_dash = bool(allow_dash)
+        self.cookie_alert_enabled = bool(cookie_alert_enabled)
+        self._cookie_alert_pending = False
+        self._cookie_alert_reason = ""
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         if self.cookie and not self.cookie_authenticated:
             logger.warning(
@@ -1230,6 +1270,53 @@ class YouTubeParser(BaseVideoParser):
                 "__Secure-3PAPISID，无法生成 SAPISIDHASH 鉴权头，"
                 "本次仍按匿名请求处理"
             )
+
+    _NA = "n/a"
+
+    def _client_chain(self) -> str:
+        """返回本次实际尝试的 Innertube 客户端链，便于定位门禁来源。"""
+        return " > ".join(self.player_clients) or self._NA
+
+    def _login_label(self, cookie_expired: bool) -> str:
+        """把当前登录态压缩成一个可读标签。"""
+        if not self.cookie:
+            return "匿名"
+        if not self.cookie_authenticated:
+            return "cookie(缺少 SAPISID，按匿名处理)"
+        if cookie_expired:
+            return "cookie(已失效)"
+        return "cookie(已鉴权)"
+
+    def _proxy_label(self) -> str:
+        """返回代理配置状态标签。"""
+        return "已配置" if self.proxy else "未配置"
+
+    @staticmethod
+    def _gate_advice(status_code: str, cookie_expired: bool) -> str:
+        """针对门禁类失败给出可操作建议，其余情况返回空串。"""
+        if status_code in _GATED_STATUS_CODES:
+            return (
+                "；处理建议: 在插件配置 youtube.cookie 填入有效的 YouTube 登录 "
+                "Cookie，或给 proxy.youtube 换一个住宅/家宽出口（机房 IP 极易被"
+                "要求人机验证）"
+            )
+        if cookie_expired:
+            return "；处理建议: 重新导出 YouTube Cookie（现有 Cookie 已失效）"
+        return ""
+
+    def consume_cookie_alert(self) -> Optional[str]:
+        """读取并消费一次待通知的 Cookie 失效原因。"""
+        if not self._cookie_alert_pending:
+            return None
+        self._cookie_alert_pending = False
+        return self._cookie_alert_reason or "cookie_expired"
+
+    def _mark_cookie_alert(self, reason: str) -> None:
+        """标记 Cookie 已失效，供插件侧决定是否私聊管理员。"""
+        if not self.cookie_alert_enabled or not self.cookie_authenticated:
+            return
+        self._cookie_alert_pending = True
+        self._cookie_alert_reason = reason or "cookie_expired"
 
     def _resolve_clients(self, raw: Any) -> Tuple[str, ...]:
         """规范化配置的客户端列表，并在配了 cookie 时追加鉴权客户端。"""
@@ -1620,6 +1707,8 @@ class YouTubeParser(BaseVideoParser):
             except Exception as exc:
                 failures.append(f"next -> {type(exc).__name__}: {exc}")
 
+        login_state = detect_youtube_login_state(next_payload)
+
         if next_payload:
             owner_name, owner_avatar, owner_channel = extract_youtube_owner(
                 next_payload
@@ -1717,11 +1806,48 @@ class YouTubeParser(BaseVideoParser):
         metadata["youtube_stream_kind"] = media_kind
         metadata["youtube_player_client"] = player_client
 
-        if failures:
-            logger.debug(
-                f"[youtube] 降级链: video_id={video_id}; "
-                + "; ".join(failures)
+        # 登录态诊断：cookie 被服务端当成未登录时必须显式告警，否则用户只会
+        # 看到一张「仅展示封面」的卡片，日志里却毫无线索。
+        cookie_expired = bool(
+            self.cookie_authenticated
+            and (login_state is False or status_code == "LOGIN_REQUIRED")
+        )
+        if cookie_expired:
+            reason = (
+                "player_login_required"
+                if status_code == "LOGIN_REQUIRED"
+                else "innertube_logged_out"
             )
+            self._mark_cookie_alert(reason)
+
+        chain = "; ".join(failures) if failures else "无"
+        diagnosis = ", ".join(
+            [
+                f"video_id={video_id}",
+                f"playability={status_code or self._NA}",
+                f"客户端={self._client_chain()}",
+                f"登录态={self._login_label(cookie_expired)}",
+                f"代理={self._proxy_label()}",
+            ]
+        )
+        if limit_warnings:
+            logger.warning(
+                f"[youtube] 未取到可下载视频流，已降级为封面卡片: "
+                f"{limit_warnings[0]}（{diagnosis}）"
+                f"{self._gate_advice(status_code, cookie_expired)}"
+                f"；降级链: {chain}"
+            )
+        else:
+            if cookie_expired:
+                logger.warning(
+                    f"[youtube] 当前 Cookie 已被服务端视为未登录，"
+                    f"随时可能触发机器人验证（{diagnosis}）"
+                    f"；处理建议: 重新导出 YouTube Cookie"
+                )
+            if failures:
+                logger.debug(
+                    f"[youtube] 降级链: video_id={video_id}; {chain}"
+                )
         logger.info(
             f"[youtube] 解析完成 video_id={video_id} "
             f"标题={title[:40]} 作者={author} "

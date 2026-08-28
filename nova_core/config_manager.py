@@ -126,6 +126,10 @@ CARD_SKIN_TELEMETRY = "telemetry"
 CARD_SKIN_GALLERY = "gallery"
 CARD_SKIN_NOCTURNE = "nocturne"
 CARD_SKIN_BILIBILI = "bilibili"
+CARD_SKIN_X = "x"
+CARD_SKIN_YOUTUBE = "youtube"
+#: 「跟随平台」哨兵：不是一套真皮肤，渲染时按来源站点现场挑仿站皮肤
+CARD_SKIN_AUTO = "auto"
 DEFAULT_CARD_SKIN = CARD_SKIN_AURORA
 CARD_SKINS: Dict[str, str] = {
     CARD_SKIN_AURORA: "极光",
@@ -134,6 +138,9 @@ CARD_SKINS: Dict[str, str] = {
     CARD_SKIN_GALLERY: "展陈",
     CARD_SKIN_NOCTURNE: "夜曲",
     CARD_SKIN_BILIBILI: "哔哩哔哩",
+    CARD_SKIN_X: "X（推特）",
+    CARD_SKIN_YOUTUBE: "YouTube",
+    CARD_SKIN_AUTO: "跟随平台",
 }
 
 # v1.4 及更早版本的公开常量名，指向对应的新皮肤，避免外部导入直接失效。
@@ -160,6 +167,8 @@ LEGACY_CARD_SKIN_VALUES: Dict[str, str] = {
     "档案海报": CARD_SKIN_GALLERY,
     "霓虹风格": CARD_SKIN_NOCTURNE,
     "b站卡片": CARD_SKIN_BILIBILI,
+    "推特卡片": CARD_SKIN_X,
+    "油管卡片": CARD_SKIN_YOUTUBE,
 }
 #: theme.LAYOUT_ALIASES 未收录的旧布局选项（v1.4 schema 里的“信息流”）。
 LEGACY_CARD_LAYOUT_VALUES: Dict[str, str] = {
@@ -521,6 +530,8 @@ class YouTubeConfig:
     player_clients: str = "ios,android_vr"
     total_budget_seconds: int = 45
     allow_dash: bool = True
+    notify_admin_on_cookie_expired: bool = True
+    cookie_alert_cooldown_minutes: int = 120
 
 
 @dataclass
@@ -567,6 +578,7 @@ class ConfigManager:
 
     def __init__(self, config: dict):
         self.bilibili_parser = None
+        self.youtube_parser = None
         if not isinstance(config, dict):
             logger.warning("插件根配置不是对象，已安全关闭解析并拒绝所有消息")
             config = {
@@ -1167,6 +1179,17 @@ class ConfigManager:
                 True,
                 "youtube.allow_dash",
             ),
+            notify_admin_on_cookie_expired=self._parse_bool(
+                youtube_raw.get("notify_admin_on_cookie_expired", True),
+                True,
+                "youtube.notify_admin_on_cookie_expired",
+            ),
+            cookie_alert_cooldown_minutes=max(
+                1,
+                self._parse_non_negative_int(
+                    youtube_raw.get("cookie_alert_cooldown_minutes", 120), 120
+                ),
+            ),
         )
 
         # --- proxy ---
@@ -1359,19 +1382,19 @@ class ConfigManager:
                 )
             )
         if self._enable_youtube:
-            parsers.append(
-                YouTubeParser(
-                    cookie=self.youtube.cookie,
-                    proxy=(
-                        proxy_addr if self.proxy.youtube_use_proxy else None
-                    ),
-                    max_height=self.youtube.max_height,
-                    player_clients=self.youtube.player_clients,
-                    hot_comment_count=youtube_hc,
-                    total_budget_seconds=self.youtube.total_budget_seconds,
-                    allow_dash=self.youtube.allow_dash,
-                )
+            self.youtube_parser = YouTubeParser(
+                cookie=self.youtube.cookie,
+                proxy=proxy_addr if self.proxy.youtube_use_proxy else None,
+                max_height=self.youtube.max_height,
+                player_clients=self.youtube.player_clients,
+                hot_comment_count=youtube_hc,
+                total_budget_seconds=self.youtube.total_budget_seconds,
+                allow_dash=self.youtube.allow_dash,
+                cookie_alert_enabled=(
+                    self.youtube.notify_admin_on_cookie_expired
+                ),
             )
+            parsers.append(self.youtube_parser)
 
         return parsers
 
@@ -1454,7 +1477,7 @@ class ConfigManager:
 
     @staticmethod
     def _parse_card_skin(value) -> str:
-        """把任意历史 / 中文 / 英文皮肤写法归一到 6 个皮肤 key 之一。"""
+        """把任意历史 / 中文 / 英文皮肤写法归一到 8 个皮肤 key 或 auto。"""
         raw = str(value or "").strip()
         if not raw:
             return DEFAULT_CARD_SKIN
@@ -1463,10 +1486,13 @@ class ConfigManager:
             return legacy
         try:
             # 延迟导入：渲染层位于配置层下游，模块级导入会形成循环依赖。
-            from .card.theme import resolve_theme_key
+            from .card.theme import is_auto_theme, resolve_theme_key
         except Exception:  # pragma: no cover - 渲染层不可用时退化为直通
             lowered = raw.lower()
             return lowered if lowered in CARD_SKINS else DEFAULT_CARD_SKIN
+        if is_auto_theme(raw):
+            # 「跟随平台」要原样留到渲染期，那时才知道链接来自哪个站点
+            return CARD_SKIN_AUTO
         return resolve_theme_key(raw)
 
     @staticmethod

@@ -2,7 +2,8 @@
 
 一套主题（skin）= 背景做法 + 装饰通道 + 面板风格 + 区块顺序 + 每个区块的变体。
 主题只描述怎么排，颜色一律来自 palette 模块，尺寸一律来自 metrics 模块，
-因此 theme(深/浅) x skin(6) x layout(4) 的 48 种组合都能真正生效。
+因此 theme(深/浅) x skin(8) x layout(4) 的 64 种组合都能真正生效。
+另有一个哨兵值 auto（跟随平台），渲染时按来源站点现场挑仿站皮肤。
 """
 
 from __future__ import annotations
@@ -294,6 +295,60 @@ BILIBILI = ThemeRecipe(
     ),
 )
 
+X = ThemeRecipe(
+    key="x",
+    label="X（推特）",
+    palette_key="x",
+    density="compact",
+    backdrop="plain",
+    ornament=(),
+    panel="card",
+    ornament_frame="none",
+    # X 单帖详情页与 B 站动态详情页是同一种结构（顶栏 / 身份 / 正文 / 图集 /
+    # 时间统计 / 页签 / 楼层评论 / 操作栏），所以复用同一批区块变体，只换基调。
+    eyebrow="bili_top",
+    identity="bili",
+    headline="bili_post",
+    body="bili",
+    media="bili",
+    stats="bili",
+    comments="bili",
+    footer="bili",
+    tracking_eyebrow=0.0,
+    headline_scale=1.0,
+    accent_source="fixed",
+    accent_fixed=hex_to_rgb("#1D9BF0"),
+    accent_adjust=False,          # 品牌蓝必须原样呈现
+    accent_alt=hex_to_rgb("#F91880"),  # 点赞粉：次级标记 / 页脚链接
+    radius_scale=1.0,             # X 的媒体大圆角与全药丸按钮
+    brand="",                     # X 不在卡面上重复画站点标志
+    order=(
+        "eyebrow",
+        "identity",
+        "headline",
+        "body",
+        "media",
+        "ipnote",
+        "tabbar",
+        "quote",
+        "warnings",
+        "comments",
+        "footer",
+    ),
+)
+
+#: YouTube 观看页：结构与 X / B 站的「详情页」同构，所以同样复用 bili_* 区块变体，
+#: 只把基调换成 YouTube 的中性灰阶 + 品牌红，chrome（操作栏药丸）由 blocks 按平台换件。
+YOUTUBE = replace(
+    X,
+    key="youtube",
+    label="YouTube",
+    palette_key="youtube",
+    accent_fixed=hex_to_rgb("#FF0033"),
+    accent_alt=hex_to_rgb("#3EA6FF"),
+    radius_scale=0.9,
+)
+
 
 THEMES: dict[str, ThemeRecipe] = {
     "aurora": AURORA,
@@ -302,6 +357,8 @@ THEMES: dict[str, ThemeRecipe] = {
     "gallery": GALLERY,
     "nocturne": NOCTURNE,
     "bilibili": BILIBILI,
+    "x": X,
+    "youtube": YOUTUBE,
 }
 
 THEME_KEYS: tuple[str, ...] = tuple(THEMES)
@@ -366,11 +423,26 @@ THEME_ALIASES: dict[str, str] = {
     "小电视": "bilibili",
     "b站风格": "bilibili",
     "bilibili风格": "bilibili",
+    "twitter": "x",
+    "tweet": "x",
+    "推特": "x",
+    "x（推特）": "x",
+    "x(推特)": "x",
+    "蓝鸟": "x",
+    "小蓝鸟": "x",
+    "twitter风格": "x",
+    "x风格": "x",
+    "推特风格": "x",
+    "yt": "youtube",
+    "油管": "youtube",
+    "油管风格": "youtube",
+    "youtube风格": "youtube",
+    "呦土笨": "youtube",
 }
 
 
 def resolve_theme_key(value: str | None) -> str:
-    """把任意历史 / 中文 / 英文写法归一到 6 个主题 key 之一。"""
+    """把任意历史 / 中文 / 英文写法归一到 8 个主题 key 之一。"""
     if not value:
         return "aurora"
     raw = str(value).strip()
@@ -386,6 +458,64 @@ def resolve_theme_key(value: str | None) -> str:
 
 def get_theme(value: str | None) -> ThemeRecipe:
     return THEMES[resolve_theme_key(value)]
+
+#: 「跟随平台」哨兵 key：不是一套真皮肤，渲染时按 model.platform_key 现场决定。
+AUTO_THEME_KEY = "auto"
+
+#: platform_key -> 仿站皮肤。没收录的平台一律回落到默认皮肤（极光）。
+PLATFORM_THEMES: dict[str, str] = {
+    "bilibili": "bilibili",
+    "acfun": "bilibili",
+    "weibo": "bilibili",
+    "xiaohongshu": "bilibili",
+    "xiaoheihe": "bilibili",
+    "nga": "bilibili",
+    "toutiao": "bilibili",
+    "xianyu": "bilibili",
+    "douyin": "bilibili",
+    "kuaishou": "bilibili",
+    "tiktok": "bilibili",
+    "youtube": "youtube",
+    "twitter": "x",
+    "x": "x",
+}
+
+#: 「跟随平台」的英文 / 中文写法
+AUTO_THEME_ALIASES: frozenset[str] = frozenset(
+    {
+        "auto",
+        "follow",
+        "platform",
+        "follow_platform",
+        "跟随平台",
+        "自动",
+        "自动跟随",
+        "随平台",
+        "平台自适应",
+    }
+)
+
+
+def is_auto_theme(value: str | None) -> bool:
+    """判断配置值是否表示「跟随平台」。"""
+    if not value:
+        return False
+    raw = str(value).strip()
+    return raw.lower() in AUTO_THEME_ALIASES or raw in AUTO_THEME_ALIASES
+
+
+def resolve_theme_key_for_platform(
+    value: str | None, platform_key: str | None
+) -> str:
+    """在 resolve_theme_key 之外多处理一件事：「跟随平台」。
+
+    只有配置成 auto 时才看 platform_key，否则行为与 :func:`resolve_theme_key`
+    完全一致——用户明确选了皮肤就绝不擅自替换。
+    """
+    if not is_auto_theme(value):
+        return resolve_theme_key(value)
+    key = str(platform_key or "").strip().lower()
+    return PLATFORM_THEMES.get(key, "aurora")
 
 
 # ============================ 布局预设 ============================

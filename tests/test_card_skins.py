@@ -17,9 +17,20 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from nova_core.card import LAYOUT_KEYS, THEME_KEYS, THEMES, build_model, normalize_comments
+from nova_core.card import (
+    AUTO_THEME_KEY,
+    LAYOUT_KEYS,
+    PLATFORM_THEMES,
+    THEME_KEYS,
+    THEMES,
+    build_model,
+    is_auto_theme,
+    normalize_comments,
+    resolve_theme_key_for_platform,
+)
 from nova_core.card import blocks as card_blocks
 from nova_core.card import engine as card_engine
+from nova_core.card import surface as card_surface
 from nova_core.card.typeset import TypeSetter
 from nova_core.rika_render.adapter import _split_author_label
 from nova_core.rika_render.data import Author, ParseResult, Platform
@@ -246,7 +257,16 @@ def test_legacy_shim_reexports_design_system_enums() -> None:
     """兼容 shim 的枚举必须直接来自设计系统，避免两处漂移。"""
     assert LAYOUT_NAMES == LAYOUT_KEYS == ("standard", "magazine", "immersive", "feed")
     assert SKIN_NAMES == THEME_KEYS
-    assert SKIN_NAMES == ("aurora", "broadsheet", "telemetry", "gallery", "nocturne", "bilibili")
+    assert SKIN_NAMES == (
+        "aurora",
+        "broadsheet",
+        "telemetry",
+        "gallery",
+        "nocturne",
+        "bilibili",
+        "x",
+        "youtube",
+    )
     assert DEFAULT_WATERMARK_TAG
 
 
@@ -301,7 +321,7 @@ def test_output_width_follows_the_request(rich_model: Any, width: int) -> None:
 def test_theme_and_layout_changes_produce_different_cards_and_cache_paths(
     assets: dict[str, Any], tmp_path: Path
 ) -> None:
-    """深浅 2 x 主题 6 x 布局 4 = 48 种组合必须张张不同，缓存路径也必须张张不同。
+    """深浅 2 x 主题 8 x 布局 4 = 64 种组合必须张张不同，缓存路径也必须张张不同。
 
     这条用例是旧断言「高级皮肤忽略主题与布局」的反转：新架构下三者都真正生效。
     """
@@ -331,7 +351,7 @@ def test_theme_and_layout_changes_produce_different_cards_and_cache_paths(
                 assert path not in cache_paths, f"{combo} 与 {cache_paths.get(path)} 缓存路径相同"
                 cache_paths[path] = combo
 
-    assert len(digests) == len(cache_paths) == 48
+    assert len(digests) == len(cache_paths) == 2 * len(THEME_KEYS) * len(LAYOUT_KEYS) == 64
 
 
 # ============================ 媒体编排 ============================
@@ -425,16 +445,20 @@ def test_wrap_keeps_short_ascii_words_intact(tmp_path: Path) -> None:
     assert "".join(renderer._wrap(long_url, font, max_width)) == long_url
 
 
-#: 除 bilibili 之外的皮肤：它们的页脚承载完整链接，bilibili 皮肤把链接收进顶栏。
-FOOTER_URL_THEME_KEYS = tuple(key for key in THEME_KEYS if key != "bilibili")
+#: 仿站皮肤：页脚是站点自己的操作栏，链接被收进顶栏右上角的署名行。
+SITE_THEME_KEYS = ("bilibili", "x", "youtube")
+
+#: 其余皮肤的页脚承载完整链接。
+FOOTER_URL_THEME_KEYS = tuple(key for key in THEME_KEYS if key not in SITE_THEME_KEYS)
 
 
 @pytest.mark.parametrize("layout", LAYOUT_KEYS)
 def test_footer_draws_protocol_query_and_fragment(assets: dict[str, Any], layout: str) -> None:
     """四种布局的页脚都要画出完整链接：协议、查询参数与片段一个字符都不许丢。
 
-    bilibili 皮肤是唯一例外：它仿的是 B 站详情页，链接被压进顶栏右上角的署名行，
-    行为由 :func:`test_bilibili_tucks_the_link_into_the_top_right_credit_line` 单独覆盖。
+    三套仿站皮肤（bilibili / x / youtube）是例外：它们仿的是站点详情页，链接被压进
+    顶栏右上角的署名行，行为由
+    :func:`test_bilibili_tucks_the_link_into_the_top_right_credit_line` 单独覆盖。
     """
     model = build_model(
         make_result(
@@ -867,3 +891,213 @@ def test_ledger_stats_keep_every_value_readable_in_narrow_columns(
 
     for value in values:
         assert value in probe.texts, f"{theme}@{width} 丢了统计值 {value}：{probe.texts}"
+
+
+# ============================ 仿站皮肤：X / YouTube ============================
+
+
+@pytest.fixture(scope="module")
+def x_model(assets: dict[str, Any]) -> Any:
+    """一条贴近 X 单帖页的样本：@handle + 浏览量 + 带头像回复 + emoji 统计行。"""
+    result = make_result(
+        title=None,
+        text="映画『プリキュアオールスターズ』本予告解禁！",
+        url="https://x.com/precure_movie/status/2092446937500860496",
+        platform="twitter",
+        display_name="推特",
+        author=("Pretty Cure Movie", "@precure_movie"),
+        extra={
+            "stats_line": (
+                "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 \u21a9\ufe0f 208 "
+                "\U0001f4ac 33 \U0001f440 12.3万 \U0001f4ad 4562"
+            ),
+            "hot_comments": [
+                {
+                    "username": "热评用户甲",
+                    "uid": "10001",
+                    "likes": 41,
+                    "time": "8月22日 江苏",
+                    "message": "第一条公开回复内容。",
+                },
+                {
+                    "username": "热评用户乙",
+                    "uid": "10002",
+                    "likes": 9,
+                    "time": "8月22日 北京",
+                    "message": "第二条公开回复内容。",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {
+            "avatar": assets["avatar"],
+            "hero": None,
+            "grid": [assets["wide"]],
+            "comment_avatars": {0: assets["avatar"], 1: assets["avatar"]},
+        },
+        watermark="Alice解析",
+    )
+
+
+@pytest.fixture(scope="module")
+def youtube_model(assets: dict[str, Any]) -> Any:
+    """一条 YouTube 观看页样本。"""
+    result = make_result(
+        title="如果 Ex-Aid 的主题曲被用在名侦探光之美少女里",
+        text=None,
+        url="https://youtu.be/2sm0UuaOm_s",
+        platform="youtube",
+        display_name="YouTube",
+        author=("コズまげch", "@kozumage"),
+        extra={
+            "stats_line": "\U0001f440 12.3万 \U0001f44d 8547 \U0001f4ac 453",
+            "hot_comments": [
+                {
+                    "username": "热评用户甲",
+                    "uid": "10001",
+                    "likes": 41,
+                    "time": "3天前",
+                    "message": "第一条公开评论内容。",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {
+            "avatar": assets["avatar"],
+            "hero": None,
+            "grid": [assets["wide"]],
+            "comment_avatars": {0: assets["avatar"]},
+        },
+        watermark="Alice解析",
+    )
+
+
+def test_auto_theme_follows_the_link_platform() -> None:
+    """"跟随平台"哨兵要能被识别，并按平台落到对应仿站皮肤；未收录平台退回极光。"""
+    assert is_auto_theme(AUTO_THEME_KEY)
+    assert is_auto_theme("跟随平台")
+    assert not is_auto_theme("bilibili")
+
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "bilibili") == "bilibili"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "twitter") == "x"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "x") == "x"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "youtube") == "youtube"
+    # 没有专属仿站皮肤的平台不能落到 THEMES 之外，也不能报错。
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "pixiv") == "aurora"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "") == "aurora"
+    # 用户明确选了皮肤时，平台一律不参与决策。
+    assert resolve_theme_key_for_platform("nocturne", "twitter") == "nocturne"
+    assert PLATFORM_THEMES["youtube"] in THEMES
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("heart", "check", "repost", "export", "bookmark", "comment", "sort", "play"),
+)
+def test_chrome_glyphs_actually_draw_something(kind: str) -> None:
+    """操作栏与角标用到的图标必须真的画出像素，别悄悄留一枚空白方块。"""
+    canvas = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+    card_surface.glyph(canvas, (2, 2, 22, 22), kind, (255, 255, 255, 255))
+
+    histogram = canvas.getchannel("A").histogram()
+    painted = sum(histogram[1:])
+    assert painted > 20, f"{kind} 图标几乎没画出东西（painted={painted}）"
+    # 图标不能糊成一整个实心块，否则 20px 下就是个方点。
+    assert painted < 24 * 24 * 0.85, f"{kind} 图标糊成实心块（painted={painted}）"
+
+
+def test_x_chrome_swaps_furniture_for_the_platform(x_model: Any) -> None:
+    """X 卡片的家具必须换成 X 自己的：@handle 副行、单条分隔线、"回复 / 相关"。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+    joined = probe.joined_text
+
+    # 身份副行给 @handle，而不是 B 站那样的发布时间。
+    assert "@precure_movie" in probe.texts
+    # 页签条退化成一条 hairline，不再画 B 站的"评论 N / 赞和转发 M"。
+    assert "赞和转发" not in joined, f"X 卡片不该出现 B 站页签：{probe.texts}"
+    assert "评论 33" not in probe.texts
+    # 评论区标题与排序入口用 X 的措辞。
+    assert "回复" in probe.texts
+    assert "相关" in probe.texts
+    assert "热门评论" not in joined
+    # 输入框占位与 B 站不同。
+    assert "发布你的回复" in probe.texts
+    assert "点我发评论" not in joined
+
+
+def test_x_chrome_time_row_leads_with_time_and_says_views(x_model: Any) -> None:
+    """X 的时间行是"时间 · N 查看"，"浏览"这种 B 站说法不能出现。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+
+    line = [t for t in probe.texts if "查看" in t]
+    assert line, f"X 卡片应有「N 查看」行：{probe.texts}"
+    assert "·" in line[0], f"时间应前置并用间隔点连接：{line[0]!r}"
+    assert line[0].split("·")[0].strip()[:2].isdigit(), f"时间没有前置：{line[0]!r}"
+    assert "浏览" not in probe.joined_text
+    assert "弹幕" not in probe.joined_text
+
+
+def test_x_cover_has_no_view_count_badge(x_model: Any) -> None:
+    """X 的图片不压播放量角标（那是 B 站的东西），数值只在时间行出现一次。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+
+    assert "12.3万" not in probe.texts, "封面角标不该单独画出播放量"
+
+
+def test_x_comments_use_inline_action_row(x_model: Any) -> None:
+    """X 的回复是"名字 · 时间"一行 + 正文下方的迷你操作行，不是右上角一枚赞。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+
+    assert "热评用户甲 · 8月22日 江苏" in probe.texts
+    assert not [t for t in probe.texts if t.endswith(" 回复")], (
+        f"X 回复不该再画 B 站的「时间 回复」行：{probe.texts}"
+    )
+
+
+def test_x_action_bar_spreads_across_the_content_row(x_model: Any) -> None:
+    """spread 操作栏要横向铺满一整行：首枚靠左、末枚不溢出右缘、数值从左到右递增。"""
+    width = 800
+    probe = render_probe(x_model, width=width, theme_key="auto", layout_key="feed")
+
+    # 操作栏画在整张卡片最靠下的位置，取每个数值最后一次绘制的 x。
+    wanted = ("33", "208", "361", "876")
+    spots: list[tuple[str, int]] = []
+    for value in wanted:
+        hits = [(x, y) for text, x, y, _ in probe.draws if text == value]
+        assert hits, f"操作栏丢了数值 {value}：{probe.texts}"
+        bottom = max(hits, key=lambda item: item[1])
+        spots.append((value, bottom[0]))
+
+    xs = [x for _, x in spots]
+    assert xs == sorted(xs), f"操作栏数值没有从左到右排开：{spots}"
+    assert xs[0] < width * 0.25, f"首枚动作没有贴左：{spots}"
+    assert xs[-1] < width * 0.95, f"末枚动作溢出了右缘：{spots}"
+    # 均匀铺满：相邻间距不能差出一倍以上。
+    gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+    assert min(gaps) > 0
+    assert max(gaps) <= min(gaps) * 2.2, f"操作栏间距不均匀：{gaps}"
+
+
+def test_youtube_chrome_uses_native_comment_wording(youtube_model: Any) -> None:
+    """YouTube 评论区说"评论 / 排序依据"，输入框说"添加评论…"。"""
+    probe = render_probe(youtube_model, width=800, theme_key="auto", layout_key="feed")
+
+    assert "评论" in probe.texts
+    assert "排序依据" in probe.texts
+    assert "添加评论…" in probe.texts
+    assert "热门评论" not in probe.joined_text
+    assert "按热度" not in probe.joined_text
+    assert "赞和转发" not in probe.joined_text
+
+
+def test_site_skins_keep_url_and_watermark_in_the_top_bar(x_model: Any) -> None:
+    """仿站皮肤把链接与署名收在顶栏右上角，底部让给原版操作栏。"""
+    for theme in SITE_THEME_KEYS:
+        probe = render_probe(x_model, width=800, theme_key=theme, layout_key="feed")
+        merged = [t for t in probe.texts if "Alice解析" in t]
+        assert merged, f"{theme} 没画出署名：{probe.texts}"
+        assert "x.com/precure_movie" in merged[0], f"{theme} 顶栏没合并原链接：{merged[0]!r}"

@@ -15,6 +15,7 @@ from .nova_core.config_manager import (
 from .nova_core.constants import Config
 from .nova_core.downloader import DownloadManager, create_public_only_connector
 from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistManager
+from .nova_core.interaction.platform.youtube import YouTubeCookieNoticeManager
 from .nova_core.logger import logger
 from .nova_core.message_adapter.archive_builder import (
     ArchiveSizeLimitError,
@@ -57,6 +58,7 @@ class MediaParserNovaPlugin(Star):
         parsers = cfg.create_parsers()
         self.parser_manager = ParserManager(parsers)
         self.bilibili_parser = cfg.bilibili_parser
+        self.youtube_parser = cfg.youtube_parser
         self.metadata_translator = MetadataTranslator(
             cfg.translation,
             self.context,
@@ -97,6 +99,17 @@ class MediaParserNovaPlugin(Star):
             request_cooldown_minutes=cfg.bilibili.admin_request_cooldown_minutes,
             command=cfg.bilibili.admin_cookie_update_command,
         )
+        self.youtube_cookie_notice = YouTubeCookieNoticeManager(
+            context=self.context,
+            admin_id=cfg.permission.admin_id,
+            enabled=(
+                self.youtube_parser is not None
+                and cfg.youtube.notify_admin_on_cookie_expired
+            ),
+            request_cooldown_minutes=(
+                cfg.youtube.cookie_alert_cooldown_minutes
+            ),
+        )
 
     async def initialize(self):
         """事件循环就绪后再启动后台清理任务（__init__ 阶段无运行中的事件循环）。"""
@@ -106,6 +119,7 @@ class MediaParserNovaPlugin(Star):
         await self._shutdown_expired_cache_cleanup()
         await self._shutdown_delayed_cleanups()
         await self.admin_cookie_assist.shutdown()
+        await self.youtube_cookie_notice.shutdown()
         await self.download_manager.shutdown()
         # 翻译客户端持有复用的 ClientSession，插件卸载/重载时必须显式关闭。
         try:
@@ -114,6 +128,19 @@ class MediaParserNovaPlugin(Star):
             self.logger.warning(f"关闭翻译 HTTP 会话失败: {exc!r}")
 
     # ── 内部辅助 ────────────────────────────────────────
+
+    def _trigger_youtube_cookie_notice_if_needed(self):
+        if not self.youtube_parser:
+            return
+        reason = self.youtube_parser.consume_cookie_alert()
+        if not reason:
+            return
+        self.logger.warning(
+            "[youtube] Cookie 失效: "
+            + YouTubeCookieNoticeManager.describe_reason(reason)
+            + "，请重新导出 YouTube Cookie"
+        )
+        self.youtube_cookie_notice.trigger_assist_request(reason)
 
     def _trigger_bilibili_cookie_assist_if_needed(self):
         if not self.bilibili_parser:
@@ -819,6 +846,7 @@ class MediaParserNovaPlugin(Star):
         self._start_expired_cache_cleanup()
         cfg = self.config_manager
         self.admin_cookie_assist.try_update_admin_origin(event)
+        self.youtube_cookie_notice.try_update_admin_origin(event)
 
         is_private = event.is_private_chat()
         sender_id = event.get_sender_id()
@@ -971,6 +999,7 @@ class MediaParserNovaPlugin(Star):
                     metadata_list,
                 )
             self._trigger_bilibili_cookie_assist_if_needed()
+            self._trigger_youtube_cookie_notice_if_needed()
             if not metadata_list:
                 if cfg.admin.debug_mode:
                     self.logger.debug("解析后未获得任何元数据")

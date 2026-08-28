@@ -2,12 +2,16 @@ import unittest
 from types import SimpleNamespace
 
 from nova_core.config_manager import (
+    CARD_SKIN_AUTO,
     CARD_SKIN_BILIBILI,
     CARD_SKIN_EDITORIAL,
     CARD_SKIN_NEON,
     CARD_SKIN_NOVA,
     CARD_SKIN_POSTER,
     CARD_SKIN_SIGNAL,
+    CARD_SKIN_X,
+    CARD_SKIN_YOUTUBE,
+    CARD_SKINS,
     TRANSLATION_OUTPUT_CARD_AND_TEXT,
     TRANSLATION_OUTPUT_CARD_ONLY,
     ConfigManager,
@@ -45,6 +49,34 @@ class ConfigAndTranslationTests(unittest.TestCase):
             CARD_SKIN_BILIBILI,
         )
         self.assertEqual(ConfigManager._parse_card_skin("未知皮肤"), CARD_SKIN_NOVA)
+
+    def test_site_skins_and_auto_sentinel_are_parsed(self):
+        """X / YouTube 仿站皮肤与「跟随平台」哨兵都要能从配置里认出来。"""
+        self.assertEqual(ConfigManager._parse_card_skin("推特卡片"), CARD_SKIN_X)
+        self.assertEqual(ConfigManager._parse_card_skin("X（推特）"), CARD_SKIN_X)
+        self.assertEqual(ConfigManager._parse_card_skin("油管卡片"), CARD_SKIN_YOUTUBE)
+        self.assertEqual(ConfigManager._parse_card_skin("YouTube"), CARD_SKIN_YOUTUBE)
+        for raw in ("跟随平台", "auto", "  AUTO  "):
+            with self.subTest(raw=raw):
+                self.assertEqual(ConfigManager._parse_card_skin(raw), CARD_SKIN_AUTO)
+        for key in (CARD_SKIN_X, CARD_SKIN_YOUTUBE, CARD_SKIN_AUTO):
+            self.assertIn(key, CARD_SKINS)
+
+    def test_youtube_cookie_alert_options_are_parsed(self):
+        config = ConfigManager(
+            {
+                "youtube": {
+                    "notify_admin_on_cookie_expired": False,
+                    "cookie_alert_cooldown_minutes": 30,
+                }
+            }
+        )
+        self.assertFalse(config.youtube.notify_admin_on_cookie_expired)
+        self.assertEqual(config.youtube.cookie_alert_cooldown_minutes, 30)
+
+        default = ConfigManager({})
+        self.assertTrue(default.youtube.notify_admin_on_cookie_expired)
+        self.assertEqual(default.youtube.cookie_alert_cooldown_minutes, 120)
 
     def test_card_and_platform_hot_comment_options_are_parsed(self):
         config = ConfigManager(

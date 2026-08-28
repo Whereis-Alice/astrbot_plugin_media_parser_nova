@@ -33,11 +33,12 @@ from .palette import (
     readable_ink,
 )
 from .theme import (
+    THEMES,
     LayoutPreset,
     ThemeRecipe,
     get_layout,
-    get_theme,
     resolve_mode,
+    resolve_theme_key_for_platform,
 )
 from .typeset import TypeSetter
 
@@ -434,7 +435,8 @@ def build_context(
     texts: list[str] | None = None,
 ) -> RenderContext:
     """构造渲染上下文（测试可直接用它断言文本与尺寸）。"""
-    theme = get_theme(theme_key)
+    # theme_key 可能是「跟随平台」哨兵，要结合来源站点才能定下真正的皮肤
+    theme = THEMES[resolve_theme_key_for_platform(theme_key, model.platform_key)]
     layout = get_layout(layout_key)
     mode = resolve_mode(mode)
     metrics = build_metrics(width, layout.density or theme.density)
