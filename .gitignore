@@ -164,3 +164,8 @@ cache/
 # 日志文件
 *.log
 logs/
+
+# AstrBot 运行时配置（含面板登录凭据 / 各类 token，绝不入库）
+data/cmd_config.json
+cmd_config.json
+**/cmd_config.json
