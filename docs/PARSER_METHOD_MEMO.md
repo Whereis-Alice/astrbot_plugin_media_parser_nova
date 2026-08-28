@@ -529,7 +529,123 @@ Pixiv 的代理开关同时覆盖 Web Ajax API 和 `i.pximg.net` 图片下载。
 
 单个作品依次请求元信息和分页接口；多个作品并发解析时由 `Config.PARSER_MAX_CONCURRENT` 限制，避免一条消息中的大量链接形成无界请求突发。
 
-## 十三、维护原则
+## 十三、YouTube
+
+支持能力：视频 / 图片（封面）/ 文本 / 热评
+
+YouTube 的稳定入口是 11 位视频 ID。所有形态的链接最终都归一到 `https://www.youtube.com/watch?v={id}`。
+
+```text
+youtu.be/{id} / watch?v={id} / shorts/{id} / live/{id} / embed/{id} / v/{id}
+/attribution_link?u=<被 urlencode 的内层链接>   ← 递归解包，限深
+  ↓
+video_id
+  ↓
+① 元数据层（并发，共享总预算）
+   oembed: https://www.youtube.com/oembed?url=...&format=json
+     └─ 标题、作者名、封面（无需任何鉴权，几乎不会失败）
+   Innertube player: POST /youtubei/v1/player?key={INNERTUBE_API_KEY}
+     └─ videoDetails（标题/作者/channelId/shortDescription/lengthSeconds/viewCount/isLive）
+     └─ streamingData（formats / adaptiveFormats / hlsManifestUrl）
+     └─ playabilityStatus（LOGIN_REQUIRED / AGE_VERIFICATION_REQUIRED / UNPLAYABLE / ERROR ...）
+   两者都拿不到标题时兜底：GET /watch?v={id} 抓内嵌 ytInitialPlayerResponse + ytInitialData
+  ↓
+② 媒体层  select_youtube_media(streamingData)
+   dash（adaptiveFormats 挑 video + audio）→ progressive（formats 单文件）
+   → HLS（hlsManifestUrl）→ 仅视频轨（无音频兜底）
+  ↓
+③ 增强层  POST /youtubei/v1/next（hl=en）
+   └─ 作者头像、点赞数、评论数、评论区 continuation token
+       └─ POST /youtubei/v1/next（带 token）→ 热评
+```
+
+### 客户端选择
+
+Innertube 的 `context.client` 决定了返回什么样的直链，这是整个 YouTube 解析里唯一真正关键的决策点：
+
+2026-08 在境外机房 IP 上对 11 个客户端 × 4 个视频做过一轮穷举实测，结果是**只有两个客户端真的能出流**：
+
+| client | clientName / 版本 | 匿名出流 | Cookie 鉴权 | 结论 |
+| --- | --- | --- | --- | --- |
+| `ios` | IOS 20.10.4 | ✅ 27 条 adaptive，最高 2160P，无 cipher | ❌ | 默认首选 |
+| `android_vr` | ANDROID_VR 1.62.27 | ✅ 26 adaptive + 1 progressive | ❌ | 默认备选 |
+| `tv` | TVHTML5 7.20250312.16.00 | ❌ UNPLAYABLE | ✅ | 配 Cookie 后追加 |
+| `web` | WEB 2.20250312.04.00 | ❌ UNPLAYABLE，有 title 无流 | ✅ | 配 Cookie 后追加；next / 评论固定用它 |
+| `mweb` | MWEB 2.20250311.03.00 | ❌ UNPLAYABLE | ✅ | 仅手动指定 |
+| `ios_music` | IOS_MUSIC 7.31.2 | ❌ LOGIN_REQUIRED | ❌ | 无用 |
+| `android` | ANDROID 19.44.38 | ❌ 请求直接被拒 | ❌ | 无用 |
+| `web_creator` | WEB_CREATOR 1.20250312 | ❌ LOGIN_REQUIRED | ✅ | 无用 |
+| `mediaconnect` | MEDIA_CONNECT_FRONTEND 0.1 | ❌ 请求直接被拒 | — | 无用 |
+| `tv_embed` | TVHTML5_SIMPLY_EMBEDDED_PLAYER 2.0 | ❌ ERROR「此应用或设备不再支持 YouTube」 | — | **已失效，别再用** |
+| `web_embed` | WEB_EMBEDDED_PLAYER 1.20250310 | ❌ ERROR | ✅ | 无用 |
+
+所以 `DEFAULT_PLAYER_CLIENTS` 只留 `ios` + `android_vr`。把注定 `UNPLAYABLE` 的客户端塞进默认链没有收益，只会吃掉时间预算——元数据兜底已经有 oembed 和 watch 页两条路，不需要 web 系客户端来补。
+
+历史坑：`tv` 一开始配的是 `TVHTML5_SIMPLY_EMBEDDED_PLAYER 2.0`（client_id 85 + `thirdParty.embedUrl`），这个组合现在硬报「此应用或设备不再支持 YouTube」，是彻底的死配置。换成 `TVHTML5 7.20250312.16.00`（client_id 7）后至少能鉴权，匿名仍然无流。
+
+web 系客户端的 `n` 参数需要执行播放器 JS 解扰才能解除限速；本项目不实现这一步（下载并运行远端 JS 既是安全风险也是长期维护负担）。带 `signatureCipher` / `cipher` 的流一律跳过，理由相同。
+
+### Cookie 鉴权：SAPISIDHASH 是必需的
+
+**只发 `Cookie` 头对 Innertube 无效**，服务端会把请求当匿名处理。这是一个很容易误判成「cookie 没用」的坑（本项目第一版就是这么写的，导致得出了错误结论）。正确做法是额外补三个头：
+
+```text
+Authorization: SAPISIDHASH {ts}_{sha1("{ts} {SAPISID} https://www.youtube.com")}
+X-Origin: https://www.youtube.com
+X-Goog-AuthUser: 0
+```
+
+`SAPISID` 按 `SAPISID` → `__Secure-3PAPISID` → `__Secure-1PAPISID` 的优先级从 Cookie 里取；一个都没有就返回空串、退回匿名并打警告。
+
+另一个约束：**原生移动客户端（IOS / ANDROID_VR）不接受鉴权**，给它们带 Cookie 没有收益且可能额外触发风控，所以 `INNERTUBE_CLIENTS` 里用 `cookies: bool` 标注了每个客户端是否可鉴权，`_innertube_headers()` 只对 `cookies=True` 的客户端下发登录态。相应地，配了可用 Cookie 时才把 `tv` / `web` 追加进尝试链（`COOKIE_PLAYER_CLIENTS`）。
+
+### 机器人门禁（LOGIN_REQUIRED）
+
+`playabilityStatus.status == "LOGIN_REQUIRED"`、`reason == "Sign in to confirm you are not a bot"`。特征：
+
+- **按视频触发，不是 IP 被封**。同一个会话里 `dQw4w9WgXcQ` 正常出 2160P，`aqz-KE-bpKQ` / `tPEE9ZwTmy0` / `lYBUbBu4W08` 全被拦。机房 IP 上命中率明显更高
+- 被拦的视频，watch 页 HTML 里 `ytInitialPlayerResponse` 存在但**没有 `adaptiveFormats`**，也没有 `signatureCipher`——不是签名问题，是服务端根本不下发流
+
+已实测确认**无效**的绕过手段（别再重复试）：
+
+| 手段 | 结果 |
+| --- | --- |
+| 换客户端（11 个全试） | 全部 LOGIN_REQUIRED / ERROR |
+| 换客户端版本号（android_vr 1.43.32 / 1.65.10） | 仍 LOGIN_REQUIRED |
+| 换 User-Agent（Cobalt / PlayStation UA 等） | 仍 LOGIN_REQUIRED |
+| `params=8AEB` / `params=CgIQBg` | 变成 ERROR，更糟 |
+| `X-Goog-Visitor-Id` + `context.client.visitorData` | 无变化 |
+| `X-Goog-Api-Format-Version: 2` | 无变化 |
+| watch 页 `bpctr=9999999999&has_verified=1` | 200 但页面里没有 `adaptiveFormats` |
+| 同一视频重试 4 次 | 稳定 LOGIN_REQUIRED，不是抖动 |
+
+有效手段只有两个：**带 SAPISIDHASH 的 Cookie**，或**换住宅代理出口**。剩下的路是 PO token（BotGuard 虚拟机），本项目明确不做。
+
+关键约束：**下载时的 User-Agent 必须与产出该直链的客户端 UA 一致**，否则 googlevideo 返回 403。因此 `video_headers` 的 UA 由 `player_client` 反查 `INNERTUBE_CLIENTS` 得到，而不是写死一个浏览器 UA。
+
+同理，googlevideo 直链与取流时的出口 IP 绑定，所以代理只有一个开关同时管解析与下载，不能拆成两个。
+
+### 时间预算
+
+三层共享一个 `_Deadline`（默认 45 秒），每个请求的超时都是 `min(单请求上限, 剩余预算)`。这样做的原因是分层各自超时会在最坏情况下线性叠加（元数据 15s + 5 个客户端各 10s + next 10s + comments 10s ≈ 85s）。预算耗尽时直接跳过尚未开始的增强步骤，交付已经拿到的字段。
+
+### 评论
+
+`next` 的评论区有两代结构，都要处理：
+
+- 新版：`frameworkUpdates.entityBatchUpdate.mutations[].payload.commentEntityPayload`，作者信息在 `author`，正文在 `properties.content.content`
+- 旧版：`commentThreadRenderer.comment.commentRenderer`，正文在 `contentText.runs`
+
+点赞数从 `next` 的无障碍文本里取（`"12,345 likes"`），因此请求固定带 `hl=en`：中文界面返回的是 `1.2万` 这类压缩写法，精度不可逆。
+
+### 注意点
+
+- 拿不到流不等于失败。会员限定、地区限制、年龄限制、私享、直播中都会走到 `playabilityStatus != OK`，此时映射成中文原因写进 `limit_warnings`，`video_urls` 留空、封面塞 `image_urls`，输出一张封面卡片
+- 封面按 `maxresdefault → sdefault → hqdefault → mqdefault → default` 顺序给候选组，让下载器逐个降级；oembed 返回的封面追加在末尾
+- 链接提取要裁掉尾部粘连的非 URL 字符（中文指令紧跟链接是群聊常态），否则视频 ID 会带上中文
+- `attribution_link` 解包必须校验内层 scheme / 用户名 / 密码 / 端口，否则等于给外部输入开了一个跳板
+
+## 十四、维护原则
 
 修改平台解析逻辑时，优先问这些问题：
 

@@ -21,6 +21,7 @@ from .parser.platform import (
     XianyuParser,
     XiaoheiheParser,
     XiaohongshuParser,
+    YouTubeParser,
 )
 from .translation.provider_defs import (
     LLM_PROVIDER_DEFAULTS,
@@ -52,6 +53,7 @@ PARSER_OUTPUT_KEYS = (
     "xiaoheihe",
     "twitter",
     "pixiv",
+    "youtube",
 )
 
 OUTPUT_MODE_DISABLED = "关闭"
@@ -347,6 +349,7 @@ class HotCommentConfig:
     xiaohongshu: bool = True
     twitter: bool = True
     xiaoheihe: bool = True
+    youtube: bool = True
     #: Twitter/X 热评的 Nitter 实例地址（逗号分隔可配多个），留空表示不使用。
     twitter_nitter_base_url: str = ""
 
@@ -487,6 +490,9 @@ class ProxyConfig:
     twitter_use_video_proxy: bool = True
     tiktok_use_proxy: bool = False
     pixiv_use_proxy: bool = False
+    #: YouTube 解析与下载共用同一开关：googlevideo 直链与出口 IP 绑定，
+    #: 解析出口与下载出口不一致会直接 403。
+    youtube_use_proxy: bool = False
 
 
 @dataclass
@@ -506,6 +512,15 @@ class BilibiliEnhancedConfig:
 @dataclass
 class PixivConfig:
     cookie: str = ""
+
+
+@dataclass
+class YouTubeConfig:
+    cookie: str = ""
+    max_height: int = 1080
+    player_clients: str = "ios,android_vr"
+    total_budget_seconds: int = 45
+    allow_dash: bool = True
 
 
 @dataclass
@@ -628,6 +643,7 @@ class ConfigManager:
         self._enable_xiaoheihe = self._parser_enabled("xiaoheihe")
         self._enable_twitter = self._parser_enabled("twitter")
         self._enable_pixiv = self._parser_enabled("pixiv")
+        self._enable_youtube = self._parser_enabled("youtube")
 
         # --- message ---
         message_raw = self._as_dict(config.get("message"))
@@ -757,6 +773,11 @@ class ConfigManager:
                     hot_comments.get("xiaoheihe", True),
                     True,
                     "message.hot_comments.xiaoheihe",
+                ),
+                youtube=self._parse_bool(
+                    hot_comments.get("youtube", True),
+                    True,
+                    "message.hot_comments.youtube",
                 ),
                 twitter_nitter_base_url=str(
                     hot_comments.get("twitter_nitter_base_url", "") or ""
@@ -1124,6 +1145,30 @@ class ConfigManager:
             cookie=str(pixiv_raw.get("cookie", "") or "").strip(),
         )
 
+        # --- youtube ---
+        youtube_raw = self._as_dict(config.get("youtube"))
+        self.youtube = YouTubeConfig(
+            cookie=str(youtube_raw.get("cookie", "") or "").strip(),
+            max_height=self._parse_youtube_max_height(
+                youtube_raw.get("max_height", "1080")
+            ),
+            player_clients=str(
+                youtube_raw.get("player_clients", "")
+                or "ios,android_vr"
+            ).strip(),
+            total_budget_seconds=max(
+                8,
+                self._parse_non_negative_int(
+                    youtube_raw.get("total_budget_seconds", 45), 45
+                ),
+            ),
+            allow_dash=self._parse_bool(
+                youtube_raw.get("allow_dash", True),
+                True,
+                "youtube.allow_dash",
+            ),
+        )
+
         # --- proxy ---
         proxy_raw = self._as_dict(config.get("proxy"))
         twitter_proxy = self._as_dict(proxy_raw.get("twitter"))
@@ -1158,6 +1203,11 @@ class ConfigManager:
                 proxy_raw.get("pixiv", False),
                 False,
                 "proxy.pixiv",
+            ),
+            youtube_use_proxy=self._parse_bool(
+                proxy_raw.get("youtube", False),
+                False,
+                "proxy.youtube",
             ),
         )
 
@@ -1239,6 +1289,10 @@ class ConfigManager:
             self.message.hot_comments.xiaoheihe,
             "xiaoheihe",
         )
+        youtube_hc = self._effective_hot_comment_count(
+            self.message.hot_comments.youtube,
+            "youtube",
+        )
         proxy_addr = self.proxy.address or None
 
         if self._enable_bilibili:
@@ -1302,6 +1356,20 @@ class ConfigManager:
                 PixivParser(
                     cookie=self.pixiv.cookie,
                     proxy=proxy_addr if self.proxy.pixiv_use_proxy else None,
+                )
+            )
+        if self._enable_youtube:
+            parsers.append(
+                YouTubeParser(
+                    cookie=self.youtube.cookie,
+                    proxy=(
+                        proxy_addr if self.proxy.youtube_use_proxy else None
+                    ),
+                    max_height=self.youtube.max_height,
+                    player_clients=self.youtube.player_clients,
+                    hot_comment_count=youtube_hc,
+                    total_budget_seconds=self.youtube.total_budget_seconds,
+                    allow_dash=self.youtube.allow_dash,
                 )
             )
 
@@ -1479,6 +1547,21 @@ class ConfigManager:
             return max(0, int(value))
         except (OverflowError, TypeError, ValueError):
             return max(0, int(default))
+
+    @staticmethod
+    def _parse_youtube_max_height(value) -> int:
+        """把 YouTube 画质上限配置转成像素高度，0 表示不限制。"""
+        if isinstance(value, str):
+            text = value.strip()
+            if not text or text in {"不限制", "0", "auto", "原画"}:
+                return 0
+            digits = "".join(ch for ch in text if ch.isdigit())
+            value = digits or 1080
+        try:
+            height = int(value)
+        except (OverflowError, TypeError, ValueError):
+            return 1080
+        return height if height > 0 else 0
 
     @staticmethod
     def _coerce_bool(value: Any) -> Optional[bool]:

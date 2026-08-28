@@ -18,6 +18,7 @@
 - 支持标题、正文和热评翻译；译文可以只用于卡片，也可以同时用于普通文本
 - 支持把已获取的热评直接合并到同一张卡片中
 - 支持 B 站 Cookie、高画质解析和管理员协助扫码更新
+- YouTube 走官方 Innertube 接口三层降级解析，不依赖 yt-dlp 与第三方镜像站
 - 支持媒体缓存、媒体中转和 ZIP 归档
 - 对下载大小、解析频率、缓存清理和公网 URL 做了限制与兜底
 
@@ -36,6 +37,7 @@
 | 小黑盒 | 视频、图片、文本；BBS 帖子热评 | `xiaoheihe.cn/app/topic`、`xiaoheihe.cn/app/bbs/link` |
 | Twitter/X | 视频、图片、文本；热评与互动统计需配置 Nitter | `twitter.com/.../status/...`、`x.com/.../status/...` |
 | Pixiv | 插画、漫画多页图片、文本 | `pixiv.net/artworks/...`、`pixiv.net/i/...` |
+| YouTube | 视频、封面、文本、热评与统计 | `youtu.be/...`、`youtube.com/watch`、`youtube.com/shorts/...` |
 
 平台页面结构、登录状态、地区限制和风控策略会变化，因此“支持平台”不代表每条链接在任何网络环境下都一定可访问。
 
@@ -249,13 +251,15 @@ Docker 环境请确保该目录对 AstrBot 和协议端的权限、挂载关系�
 
 ### 代理
 
-TikTok、Twitter/X、Pixiv、小黑盒等平台可能受到地区或网络限制。可以在“代理设置”中填写 HTTP 或 SOCKS5 代理，并按平台开启解析或媒体下载代理。
+TikTok、Twitter/X、Pixiv、YouTube、小黑盒等平台可能受到地区或网络限制。可以在“代理设置”中填写 HTTP 或 SOCKS5 代理，并按平台开启解析或媒体下载代理。
+
+YouTube 是例外：它只有一个开关，同时管解析和下载，原因见下方 [YouTube 说明](#youtube-说明)。
 
 ### ffmpeg
 
 以下功能可能需要系统安装 `ffmpeg`：
 
-- DASH 音视频合并
+- DASH 音视频合并（B 站高画质、YouTube 1080P 及以上）
 - M3U8 封装
 - 视频仅发送封面时截取首帧
 
@@ -300,6 +304,78 @@ http://127.0.0.1:8585
 - FxTwitter 与 GraphQL 都拿不到作者头像时的头像兜底（自动升级到 `_400x400` 清晰度）
 
 Nitter 抓取成功后就不会再去试 X 公开页（那条路线已经不返回回复数据，白等只会拖慢解析）。只有 Nitter 全部失败或未配置时才回落到 X 公开页，并在失败后按 1 小时冷却给一条 INFO 引导；正文、图片、视频解析不受任何影响。
+
+## YouTube 说明
+
+YouTube 解析走官方 Innertube 接口，**不依赖 yt-dlp，也不依赖任何第三方镜像站或解析服务**。整条链路分三层，每层失败只降级、不中断：
+
+```text
+① 元数据   oembed  ‖  Innertube player      并发；都失败 → 抓 watch 页内嵌 ytInitialPlayerResponse
+② 媒体流   streamingData → dash → progressive → HLS → 仅视频轨
+③ 增强     Innertube next → 作者头像 / 点赞数 / 评论数 / 热评
+```
+
+支持的链接形态：`youtube.com/watch?v=`、`youtu.be/`、`/shorts/`、`/live/`、`/embed/`、`/v/`、`music.youtube.com`，以及分享用的 `/attribution_link?u=...`（会自动解包内层地址）。
+
+### 配置项
+
+在「YouTube 设置」中：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| 画质上限 | 1080 | 按视频高度限制。选“不限制”会尽量取最高画质，但体积可能超出发送上限 |
+| 允许 dash 分离流 | 开 | 音视频分离流 + ffmpeg 合并，才能拿到 1080P 及以上。没装 ffmpeg 请关闭 |
+| Innertube 客户端顺序 | `ios,android_vr` | 逗号分隔，按顺序试到拿到可下载的流为止 |
+| 单次解析总时间预算 | 45 秒 | 三层**共享**这一个预算，而不是每层各自超时 |
+| Cookie | 空 | 公开视频不需要。填入登录 Cookie 可绕过机器人验证、解析年龄限制内容 |
+
+热评开关在「消息输出 → 附加内容：热评 → YouTube」，默认开启。
+
+### 为什么默认只有两个客户端
+
+实测（2026-08，对 11 个 Innertube 客户端逐一验证）的结论是：**匿名状态下只有 `ios` 和 `android_vr` 会真正返回可直连的 `adaptiveFormats`**，其余客户端一律 `UNPLAYABLE` 或 `LOGIN_REQUIRED`，连一条流都拿不到。
+
+| 客户端 | 匿名出流 | 支持 Cookie 鉴权 | 用途 |
+| --- | --- | --- | --- |
+| `ios` | ✅ 最高 2160P，无签名挑战 | ❌ | 默认首选 |
+| `android_vr` | ✅ 最高 2160P，无签名挑战 | ❌ | 默认备选 |
+| `tv` | ❌ | ✅ | 配了 Cookie 后自动追加 |
+| `web` | ❌ | ✅ | 配了 Cookie 后自动追加；同时用于 next / 评论端点 |
+| `mweb` | ❌ | ✅ | 仅手动指定时使用 |
+
+所以默认顺序里不再放注定失败的客户端——它们只会白白消耗时间预算。这两个原生客户端返回的直链还有一个好处：不带限速挑战参数，也不带 `signatureCipher`，无需在本地执行 YouTube 的播放器 JS 就能全速下载。
+
+带 `signatureCipher` 的流会被直接跳过：还原它需要下载并运行播放器 JS，维护成本高且随时会被改，而靠客户端选择已经能拿到干净直链。
+
+### 「Sign in to confirm you are not a bot」
+
+一部分视频会被 YouTube 的机器人门禁拦下，`playabilityStatus` 返回 `LOGIN_REQUIRED`。这是**按视频**触发的（同一台机器上有的视频正常、有的被拦），机房 / VPS 出口 IP 上尤其常见。
+
+实测已经排除的无效手段，不必再试：
+
+- 换客户端、换客户端版本号、换 User-Agent（11 个客户端全军覆没）
+- `params=8AEB` / `params=CgIQBg` 等播放参数
+- `X-Goog-Visitor-Id` + `context.client.visitorData`
+- watch 页加 `bpctr=9999999999&has_verified=1`（页面里干脆没有 `adaptiveFormats`）
+
+真正有效的两条路：
+
+1. **填 Cookie**。注意 Cookie 必须包含 `SAPISID` 或 `__Secure-3PAPISID` —— 只发 `Cookie` 头 Innertube 会当匿名请求处理，插件会额外算出 `Authorization: SAPISIDHASH` 才算真正登录。填写后会自动把 `tv`、`web` 这两个支持鉴权的客户端追加到尝试链末尾。Cookie 里找不到 `SAPISID` 时会在日志里给出警告并退回匿名。
+2. **走住宅代理**（`代理设置 → YouTube`）。门禁很大程度上看出口 IP 的信誉。
+
+插件**不实现** PO token 与播放器 JS 签名还原：前者要跑一整套 BotGuard 虚拟机、后者随时被改，两者都会把这个解析器变成需要持续追着上游改的负担，也都要在服务器上执行 YouTube 下发的代码。被门禁挡下时，插件会退化成封面卡片而不是报错（见下）。
+
+账号风控提醒：用于填 Cookie 的账号有被限制的风险，建议用小号。
+
+### 代理只有一个开关
+
+`代理设置 → YouTube` 这一个开关同时控制解析请求和媒体下载。googlevideo 直链与取流时的出口 IP 绑定，如果解析走代理、下载走直连（或反过来），下载必定 403。因此这里不像其他平台那样拆成「解析代理」「下载代理」两项。
+
+### 取不到视频流时
+
+机器人验证、会员限定、地区限制、年龄限制、私享视频、正在直播等情况下拿不到可下载的流。这时插件不会报错，而是退化成「封面 + 标题 + 作者 + 统计 + 热评」的卡片，并在卡片上标明原因（例如「被 YouTube 机器人验证挡下，仅展示封面与信息」）。标题、作者、发布时间、评论数和热评在这种状态下依然能取到。
+
+后台日志里，完整的降级链走 DEBUG，正常解析在 INFO 留一行摘要（视频 ID、流类型、客户端、热评条数、耗时），方便排查是哪一层退化了。
 
 ## 小黑盒热评说明
 

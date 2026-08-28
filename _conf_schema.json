@@ -124,6 +124,17 @@
                     "仅富媒体"
                 ],
                 "default": "全部发送"
+            },
+            "youtube": {
+                "description": "YouTube",
+                "type": "string",
+                "options": [
+                    "关闭",
+                    "全部发送",
+                    "仅文本",
+                    "仅富媒体"
+                ],
+                "default": "全部发送"
             }
         }
     },
@@ -415,6 +426,12 @@
                         "description": "小黑盒",
                         "type": "bool",
                         "hint": "仅对小黑盒 BBS 帖子生效；使用帖子详情接口返回的热门评论，不影响游戏详情页。",
+                        "default": true
+                    },
+                    "youtube": {
+                        "description": "YouTube",
+                        "type": "bool",
+                        "hint": "通过 YouTube 官方 next 接口读取评论区置顶/热门评论，同时补齐点赞数与频道头像；接口不返回时会自动跳过。",
                         "default": true
                     },
                     "twitter_nitter_base_url": {
@@ -898,6 +915,52 @@
             }
         }
     },
+    "youtube": {
+        "description": "YouTube 设置",
+        "type": "object",
+        "hint": "解析走 YouTube 官方 Innertube 接口，不依赖 yt-dlp。dash 分离流需要服务器安装 ffmpeg（与 B 站共用同一依赖）；取不到可下载的流时会自动退化成封面卡片而不是报错。机房 IP 上较容易撞到 YouTube 的机器人门禁，建议配合下面的 Cookie 或住宅代理使用。",
+        "items": {
+            "max_height": {
+                "description": "画质上限",
+                "type": "string",
+                "options": [
+                    "不限制",
+                    "2160",
+                    "1440",
+                    "1080",
+                    "720",
+                    "480",
+                    "360"
+                ],
+                "hint": "按视频高度限制，单位像素。选“不限制”会尽量取最高画质，但文件体积可能超出发送上限。",
+                "default": "1080"
+            },
+            "allow_dash": {
+                "description": "允许 dash 分离流（需要 ffmpeg）",
+                "type": "bool",
+                "hint": "开启后优先选择音视频分离流并用 ffmpeg 合并，可拿到 1080P 及以上画质。服务器没装 ffmpeg 请关闭，届时只使用 360P/720P 的单文件流。",
+                "default": true
+            },
+            "player_clients": {
+                "description": "Innertube 客户端顺序",
+                "type": "string",
+                "hint": "逗号分隔，按顺序尝试直到拿到可下载的流。可选：ios、android_vr、tv、mweb、web。实测只有 ios 与 android_vr 在匿名状态下能真正返回可直连的媒体流，所以默认只跑这两个；tv/mweb/web 匿名时一律拿不到流，仅在填写了下面的 Cookie 后才有意义（tv、web 会被自动追加，无需手填）。除非某个客户端被针对性封禁，否则保持默认。",
+                "default": "ios,android_vr"
+            },
+            "total_budget_seconds": {
+                "description": "单次解析总时间预算（秒）",
+                "type": "int",
+                "hint": "整条解析链（元数据、媒体流、头像/点赞/热评）共享这一个预算，而不是每层各自超时，避免最坏情况叠加成分钟级。预算用尽时会跳过尚未完成的增强步骤，只发已拿到的信息。",
+                "default": 45
+            },
+            "cookie": {
+                "description": "YouTube Cookie",
+                "type": "string",
+                "hint": "留空即可解析公开视频。部分视频会被 YouTube 的「Sign in to confirm you are not a bot」门禁挡住（机房 IP 尤其常见），此时只能出封面卡片；填入登录后的完整 Cookie（必须包含 SAPISID 或 __Secure-3PAPISID，否则鉴权无效）可绕过门禁并解析年龄限制内容，填写后会自动追加 tv、web 两个支持鉴权的客户端。仅本地使用，不要公开分享；账号有被风控的风险，建议用小号。",
+                "default": ""
+            }
+        }
+    },
     "proxy": {
         "description": "代理设置",
         "type": "object",
@@ -925,6 +988,12 @@
                 "description": "Pixiv 解析与图片下载使用代理",
                 "type": "bool",
                 "hint": "需要先填写“代理地址”。",
+                "default": false
+            },
+            "youtube": {
+                "description": "YouTube 解析与下载使用代理",
+                "type": "bool",
+                "hint": "需要先填写“代理地址”。YouTube 的视频直链与出口 IP 绑定，解析和下载必须走同一出口，所以这里只有一个总开关。国内网络环境基本必须开启。",
                 "default": false
             },
             "twitter": {

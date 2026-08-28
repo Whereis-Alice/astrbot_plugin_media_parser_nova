@@ -2,6 +2,37 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.8.0 (2026-08-28)
+
+### 新增平台：YouTube
+
+- 支持 `youtube.com/watch`、`youtu.be`、`/shorts/`、`/live/`、`/embed/`、`/v/` 以及 `music.youtube.com`，同时解包分享用的 `/attribution_link?u=...` 嵌套链接
+- 走 YouTube 官方 Innertube 接口，**不依赖 yt-dlp、不依赖第三方镜像站**。整条链路是三层降级：
+  - 元数据层：`oembed` 与 Innertube `player` 并发请求，两边互相补字段；都失败时兜底抓 watch 页面内嵌的 `ytInitialPlayerResponse`
+  - 媒体层：从 `streamingData` 挑流，优先级 dash 分离流 → progressive 单文件 → HLS → 仅视频轨
+  - 增强层：`next` 端点补作者头像、点赞数、评论数与热评
+- Innertube 客户端默认只跑 `ios,android_vr`。对 11 个客户端逐一实测后确认：**匿名状态下只有这两个会真正返回可直连的 `adaptiveFormats`**（最高 2160P、无签名挑战），`tv` / `mweb` / `web` / `web_creator` / `ios_music` / `mediaconnect` 等一律 `UNPLAYABLE` 或 `LOGIN_REQUIRED`，一条流都拿不到，放进默认链只会白烧时间预算。顺序仍可在配置里调整
+- **Cookie 鉴权按 Innertube 的真实要求实现**：只发 `Cookie` 头是无效的，服务端会当匿名请求处理。现在会从 Cookie 里取 `SAPISID` / `__Secure-3PAPISID` 算出 `Authorization: SAPISIDHASH <ts>_<sha1(ts SAPISID origin)>`，并补 `X-Origin`、`X-Goog-AuthUser`；Cookie 里找不到可用字段时给出警告并退回匿名。原生移动客户端（IOS / ANDROID_VR）会忽略甚至拒绝鉴权，因此**只对声明支持 Cookie 的客户端**下发登录态
+- 配置了 Cookie 后会自动把 `tv`、`web` 这两个支持鉴权的客户端追加到尝试链末尾，不需要手动改客户端顺序
+- 下载请求头的 User-Agent 会跟产出该直链的客户端保持一致，否则 googlevideo 会直接 403
+- 新增配置节「YouTube 设置」：画质上限、是否允许 dash（需要 ffmpeg）、客户端顺序、单次解析总时间预算、Cookie
+- 热评开关（消息输出 → 附加内容：热评 → YouTube）默认开启，兼容新版 `commentEntityPayload` 与旧版 `commentRenderer` 两种评论结构
+- 统计行为 `👀 播放 / 👍 点赞 / 💬 评论`，点赞数固定用 `hl=en` 请求以便从无障碍文本里稳定取到精确值（而不是 `1.2万` 这种压缩写法）
+
+### YouTube 的设计取舍
+
+- **单一时间预算**：元数据、媒体流、头像/点赞/热评三层共享一个总预算（默认 45 秒），而不是每层各自超时。此前其他平台踩过的坑是每层 10~20 秒叠起来最坏情况能到分钟级；现在预算用尽就跳过剩余增强步骤，只发已经拿到的信息
+- **代理单开关**：`代理 → YouTube` 一个开关同时管解析请求和媒体下载。googlevideo 直链与取流时的出口 IP 绑定，解析走代理、下载走直连必定 403，所以不拆成两个开关
+- **不实现签名还原，也不实现 PO token**：带 `signatureCipher` / `cipher` 的流直接跳过。还原签名要下载并执行 YouTube 的播放器 JS，PO token 要跑一整套 BotGuard 虚拟机——两者都得在服务器上执行 YouTube 下发的代码，且随时被上游改动打断，不适合作为一个聊天插件的长期依赖
+- **机器人门禁只能退化，不强行绕**：部分视频返回 `LOGIN_REQUIRED`（「Sign in to confirm you are not a bot」），这是按视频触发、机房 IP 上尤其常见。已实测排除的无效手段全部记录在 README 与 `docs/PARSER_METHOD_MEMO.md` 里（换客户端 / 换版本号 / 换 UA / `params=8AEB` / `visitorData` / `bpctr=9999999999&has_verified=1`），避免以后重复踩。真正有效的只有填 Cookie 或换住宅代理出口
+- **失败退化而非报错**：会员限定、地区限制、年龄限制、私享、直播中等取不到流的情况，退化成「封面 + 标题 + 作者 + 统计」的卡片，并在卡片上说明原因，而不是抛错让整条消息失败
+- 降级链细节写 DEBUG 日志，群里只发结论；正常解析在 INFO 留一行摘要（视频 ID、流类型、客户端、热评数、耗时）
+
+### 修复
+
+- 链接提取的尾部裁剪补到 YouTube：`https://youtu.be/xxxx媒体解析` 这类链接紧贴中文的消息此前会把中文当成视频 ID 的一部分（和 v1.7.3 修的 b23 短链是同一类问题）
+- `parse_youtube_identity` 解包 `attribution_link` 时校验 scheme / 用户名 / 密码 / 端口，避免被构造成 SSRF 跳板
+
 ## v1.7.3 (2026-08-28)
 
 ### 修复

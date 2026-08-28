@@ -21,6 +21,7 @@
 - 小黑盒：支持 视频 / 图片 / 文本；覆盖游戏详情页和 BBS/link 帖子。
 - Twitter/X：支持 视频 / 图片 / 文本；优先 FxTwitter/FxEmbed，服务不可用时回退 Guest GraphQL。
 - Pixiv：支持 图片 / 文本；覆盖插画和漫画作品页、多页原图候选、Cookie 访问限制与解析/图片代理。
+- YouTube：支持 视频 / 图片 / 文本 / 热评；走官方 Innertube（player / next）三层降级，多客户端取流、共享时间预算、取不到流时退化为封面卡片。
 
 ### 1.2 核心模块结构
 
@@ -44,6 +45,7 @@ astrbot_plugin_media_parser_nova/
     │   │   └── bilibili/auth.py     # BilibiliAuthRuntime，Cookie 校验与扫码登录
     │   └── platform/                # 各平台解析器
     │       ├── pixiv.py             # Pixiv 插画/漫画解析器
+    │       ├── youtube.py           # YouTube Innertube 解析器（三层降级）
     │       ├── xianyu.py            # 闲鱼商品页解析器
     │       └── toutiao.py           # 今日头条文章/微头条/视频解析器
     ├── downloader/
@@ -163,9 +165,10 @@ cache/runtime_manager/bilibili/cookie.json
 - `PermissionConfig`：管理员、白名单、黑名单，提供 `check()`。
 - `DownloadConfig`：大小限制、缓存目录、缓存可用性、下载并发。
 - `ParseRateLimitConfig`：同链接/同用户解析频率限制、时间窗和持久化记录文件。
-- `ProxyConfig`：全局代理、TikTok、小黑盒、Twitter/X、Pixiv 代理开关。
+- `ProxyConfig`：全局代理、TikTok、小黑盒、Twitter/X、Pixiv、YouTube 代理开关。
 - `BilibiliEnhancedConfig`：Cookie、最高画质、运行时文件、管理员协助登录与主动更新指令。
 - `PixivConfig`：Pixiv Web Ajax API 使用的可选 Cookie。
+- `YouTubeConfig`：画质上限、是否允许 dash 分离流、Innertube 客户端顺序、单次解析总时间预算、可选 Cookie。
 - `MediaRelayConfig`：文件 Token 中转开关、回调地址、TTL。
 - `TranslationConfig`：翻译开关、翻译范围、目标语言、AstrBot 内置或自定义大模型配置。输入/输出上限固定为 4000，超时固定为 60 秒，随机性固定为 0。
 - `AdminConfig`：清理关键词和 debug 模式。
@@ -521,6 +524,8 @@ error
 
 Pixiv 解析器还会附加 `pixiv_illust_id`、`pixiv_user_id`、`pixiv_x_restrict`、`pixiv_ai_type`、`pixiv_sanity_level` 和 `pixiv_page_count`，用于保留作品访问限制与分页信息。
 
+YouTube 解析器附加 `youtube_video_id`、`youtube_channel_id`、`youtube_stream_kind`（dash / progressive / hls / video_only / none）和 `youtube_player_client`，用于排查取流走到了哪一层降级。
+
 下载层回填：
 
 ```text
@@ -589,6 +594,7 @@ proxy.address
 proxy.tiktok
 proxy.xiaoheihe_video
 proxy.pixiv
+proxy.youtube
 proxy.twitter.parse
 proxy.twitter.image
 proxy.twitter.video
@@ -600,6 +606,7 @@ proxy.twitter.video
 - `XiaoheiheParser`：视频代理。
 - `TwitterParser`：Twitter/X 解析、图片、视频代理。
 - `PixivParser`：Pixiv Web Ajax API 解析和图片下载共用同一代理开关。
+- `YouTubeParser`：Innertube 解析与 googlevideo 直链下载共用同一代理开关（直链与出口 IP 绑定，拆开必然 403）。
 
 解析结果写入：
 
