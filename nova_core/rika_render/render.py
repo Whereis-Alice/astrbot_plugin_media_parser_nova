@@ -349,6 +349,7 @@ class ShareCardRenderer:
                     "username": clean_text(str(item.get("username") or "未知用户")),
                     "uid": clean_text(str(item.get("uid") or "")),
                     "likes": item.get("likes", 0),
+                    "likes_text": clean_text(str(item.get("likes_text") or "")),
                     "time": clean_text(str(item.get("time") or "")),
                     "message": message,
                 }

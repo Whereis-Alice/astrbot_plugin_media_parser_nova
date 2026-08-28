@@ -295,6 +295,23 @@ def drop_shadow(
     return layer.filter(ImageFilter.GaussianBlur(max(1, blur)))
 
 
+def _composite_clipped(target: Any, patch: Any, x: int, y: int) -> None:
+    """把小图层合成到目标图上，自动裁掉越界部分。"""
+    tw, th = target.size
+    px, py = 0, 0
+    if x < 0:
+        px, x = -x, 0
+    if y < 0:
+        py, y = -y, 0
+    cw = min(patch.width - px, tw - x)
+    ch = min(patch.height - py, th - y)
+    if cw <= 0 or ch <= 0:
+        return
+    if (px, py, cw, ch) != (0, 0, patch.width, patch.height):
+        patch = patch.crop((px, py, px + cw, py + ch))
+    target.alpha_composite(patch, (x, y))
+
+
 def panel(
     target: Any,
     box: tuple[int, int, int, int],
@@ -323,16 +340,25 @@ def panel(
         region.putalpha(rounded_mask(region.size, radius))
         target.alpha_composite(region, (x0, y0))
     if fill or border:
-        layer = Image.new("RGBA", target.size, (0, 0, 0, 0))
-        d = ImageDraw.Draw(layer)
-        d.rounded_rectangle(
-            (x0, y0, x1, y1),
-            radius=radius,
+        # 圆角与描边在 4 倍尺寸上画完再缩回来。1 倍直接画 rounded_rectangle 会
+        # 在每一个圆角与每一条描边上留下阶梯状锯齿，卡片上到处都是圆角面板，
+        # 这层锯齿正是整体"发糙、不够精致"的来源。顺带只申请面板大小的画布，
+        # 不再每次都开一张整卡尺寸的图层。
+        pw, ph = x1 - x0 + 1, y1 - y0 + 1
+        scale = 4 if radius > 0 else 1
+        if pw * ph * scale * scale > 24_000_000:
+            scale = 1
+        patch = Image.new("RGBA", (pw * scale, ph * scale), (0, 0, 0, 0))
+        ImageDraw.Draw(patch).rounded_rectangle(
+            (0, 0, pw * scale - 1, ph * scale - 1),
+            radius=radius * scale,
             fill=fill,
             outline=border,
-            width=max(1, border_width) if border else 0,
+            width=max(1, border_width * scale) if border else 0,
         )
-        target.alpha_composite(layer)
+        if scale > 1:
+            patch = patch.resize((pw, ph), LANCZOS)
+        _composite_clipped(target, patch, x0, y0)
 
 
 def hairline(target: Any, x0: int, y: int, x1: int, color: RGBA, *, width: int = 1, dash: int = 0) -> None:
@@ -706,11 +732,19 @@ def blur_backdrop_fit(image: Any, box_w: int, box_h: int, blur: int = 18, dim: i
 
 
 def circle_image(image: Any, size: int) -> Any:
+    """裁成圆形头像。
+
+    遮罩在 4 倍尺寸上画好再 LANCZOS 缩回来：直接按 1 倍画椭圆会留下硬锯齿，
+    头像越小越明显——那是头像"看着糙"的主因之一。
+    """
     size = max(2, int(size))
     src = cover_fit(image, size, size)
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
-    src.putalpha(mask)
+    scale = 4
+    big = Image.new("L", (size * scale, size * scale), 0)
+    ImageDraw.Draw(big).ellipse(
+        (0, 0, size * scale - 1, size * scale - 1), fill=255
+    )
+    src.putalpha(big.resize((size, size), LANCZOS))
     return src
 
 

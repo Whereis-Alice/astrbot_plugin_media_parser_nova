@@ -635,10 +635,10 @@ def test_bilibili_tabbar_falls_back_to_the_single_available_count(
     assert "赞和转发 361" in probe.texts
 
 
-def test_bilibili_tabbar_label_stays_bare_without_any_count(
+def test_bilibili_tabbar_hides_secondary_without_any_count(
     assets: dict[str, Any],
 ) -> None:
-    """点赞与转发都拿不到时，页签只写标签，绝不吐出 0。"""
+    """点赞与转发都拿不到时整枚次级页签隐藏：既不吐 0，也不留一个光标签。"""
     model = build_model(
         make_result(
             title=None,
@@ -652,8 +652,65 @@ def test_bilibili_tabbar_label_stays_bare_without_any_count(
     )
     probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
 
-    assert "赞和转发" in probe.texts, f"标签本身要在：{probe.texts}"
-    assert "赞和转发 0" not in probe.texts
+    assert "评论 33" in probe.texts
+    assert not [t for t in probe.texts if t.startswith("赞和转发")], (
+        f"无数值时不该留下光标签：{probe.texts}"
+    )
+
+
+def test_youtube_chrome_replaces_bilibili_specific_furniture(
+    assets: dict[str, Any],
+) -> None:
+    """哔哩哔哩皮肤套到 YouTube 上时，chrome 必须换件。
+
+    皮肤只定基调（粉色强调 + 详情页骨架），"赞和转发"这个页签和"点我发评论"
+    这个 placeholder 是 B 站自己的说法，YouTube 观看页压根没有页签、输入框写的是
+    "添加评论…"。硬贴过去就是截图里那种出戏的样子。
+    """
+    model = build_model(
+        make_result(
+            title="如果 Ex-Aid 的主题曲被用在名侦探光之美少女里",
+            text=None,
+            platform="youtube",
+            display_name="YouTube",
+            extra={"stats_line": "\U0001f440 12.3\u4e07 \U0001f44d 8547 \U0001f4ac 453"},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "评论 453" in probe.texts
+    assert not [t for t in probe.texts if t.startswith("赞和转发")], (
+        f"YouTube 没有\u300c赞和转发\u300d这一说：{probe.texts}"
+    )
+    assert "点我发评论" not in probe.texts
+    assert "添加评论…" in probe.texts
+    # 操作栏换成 YouTube 的药丸组：点赞数 + 分享 / 保存 两枚带文案的按钮。
+    assert "8547" in probe.texts
+    assert "分享" in probe.texts
+    assert "保存" in probe.texts
+
+
+def test_youtube_corner_credit_uses_the_short_link(assets: dict[str, Any]) -> None:
+    """角落署名把 youtube.com/watch?v=... 折成等价的 youtu.be 短链，省出横向预算。"""
+    model = build_model(
+        make_result(
+            title="标题",
+            text=None,
+            platform="youtube",
+            display_name="YouTube",
+            url="https://www.youtube.com/watch?v=2sm0UuaOm_s",
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    credits = [d for d in probe.draws if "Alice解析" in d[0]]
+    assert len(credits) == 1, f"署名应只画一次：{credits}"
+    assert "youtu.be/2sm0UuaOm_s" in credits[0][0]
+    assert "watch?v=" not in credits[0][0]
 
 
 def test_bilibili_topbar_keeps_only_source_title(assets: dict[str, Any]) -> None:

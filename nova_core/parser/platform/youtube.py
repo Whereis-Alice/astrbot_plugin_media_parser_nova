@@ -48,12 +48,14 @@ __all__ = [
     "extract_youtube_owner",
     "extract_youtube_publish_date",
     "find_comment_continuation",
+    "localize_relative_time",
     "parse_compact_number",
     "parse_cookie_header",
     "parse_watch_html",
     "parse_youtube_identity",
     "select_youtube_media",
     "thumbnail_candidates",
+    "upscale_avatar_url",
 ]
 
 
@@ -513,6 +515,77 @@ def _parse_english_date(text: Any) -> str:
         return ""
 
 
+# next 端点固定 hl=en，评论时间会回英文相对文案（"3 days ago"、
+# "1 month ago (edited)"、"Streamed 2 weeks ago"）。卡片是中文界面，
+# 直接透出会中英混排，所以在解析层就地本地化。
+_REL_TIME_RE = re.compile(
+    r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s+ago",
+    re.IGNORECASE,
+)
+_REL_TIME_UNITS = {
+    "second": "秒",
+    "minute": "分钟",
+    "hour": "小时",
+    "day": "天",
+    "week": "周",
+    "month": "个月",
+    "year": "年",
+}
+
+
+def localize_relative_time(text: Any) -> str:
+    """把英文相对时间转成中文；无法识别时原样返回。"""
+    if not isinstance(text, str):
+        return ""
+    raw = text.strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    edited = "(edited)" in lowered or "edited" == lowered.rsplit(" ", 1)[-1]
+    match = _REL_TIME_RE.search(raw)
+    if match:
+        unit = _REL_TIME_UNITS.get(match.group(2).lower())
+        if not unit:
+            return raw
+        result = f"{int(match.group(1))}{unit}前"
+    elif "just now" in lowered or lowered in {"now", "moments ago"}:
+        result = "刚刚"
+    else:
+        parsed = _parse_english_date(raw)
+        if parsed:
+            return parsed
+        return raw
+    if "streamed" in lowered:
+        result = "直播于" + result
+    elif "premiered" in lowered:
+        result = "首播于" + result
+    if edited:
+        result += "（已编辑）"
+    return result
+
+
+# Google 头像直链把尺寸写在 URL 里（=s48-c-k-c0x00ffffff-no-rj）。
+# Innertube 默认只给 48px，放进卡片会明显发虚，这里统一抬到 176px。
+_AVATAR_S_RE = re.compile(r"=s\d+", re.IGNORECASE)
+_AVATAR_WH_RE = re.compile(r"=w\d+-h\d+", re.IGNORECASE)
+
+
+def upscale_avatar_url(url: Any, size: int = 176) -> str:
+    """把 Google 头像直链的尺寸参数抬到更高分辨率。"""
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    text = url.strip()
+    if text.startswith("//"):
+        text = "https:" + text
+    if "googleusercontent.com" not in text and "ggpht.com" not in text:
+        return text
+    size = max(48, min(900, int(size)))
+    if _AVATAR_WH_RE.search(text):
+        return _AVATAR_WH_RE.sub(f"=w{size}-h{size}", text, count=1)
+    if _AVATAR_S_RE.search(text):
+        return _AVATAR_S_RE.sub(f"=s{size}", text, count=1)
+    return text
+
 def _parse_iso_date(raw: Any) -> str:
     """解析 ISO8601 时间串，输出 YYYY-MM-DD[ HH:MM]。"""
     if not isinstance(raw, str) or not raw.strip():
@@ -800,7 +873,7 @@ def extract_youtube_owner(payload: Any) -> Tuple[str, str, str]:
             channel_id = browse
     if not avatar:
         avatar = _best_thumbnail(_deep_first(payload, "avatar"))
-    return name, avatar, channel_id
+    return name, upscale_avatar_url(avatar), channel_id
 
 
 def extract_youtube_like_count(payload: Any) -> int:
@@ -914,6 +987,57 @@ def find_comment_continuation(payload: Any) -> str:
     return ""
 
 
+def _accessibility_label(node: Any) -> str:
+    """取出 Innertube 结构里的无障碍文案（常带精确数值）。"""
+    if isinstance(node, str):
+        return node.strip()
+    if not isinstance(node, dict):
+        return ""
+    accessibility = node.get("accessibility")
+    if isinstance(accessibility, dict):
+        data = accessibility.get("accessibilityData")
+        if isinstance(data, dict):
+            label = data.get("label")
+            if isinstance(label, str) and label.strip():
+                return label.strip()
+    label = node.get("accessibilityText")
+    return label.strip() if isinstance(label, str) else ""
+
+
+_EXACT_COUNT_RE = re.compile(r"(\d[\d,]*)(?![\d,.])\s*([KMBkmb万千亿億])?")
+
+
+def _exact_count(text: Any) -> Optional[int]:
+    """只在文案给的是完整数字（1,100 / 1100）时返回精确值。"""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    match = _EXACT_COUNT_RE.search(text)
+    if not match or match.group(2):
+        return None
+    digits = match.group(1).replace(",", "")
+    if not digits:
+        return None
+    try:
+        return max(0, int(digits))
+    except ValueError:
+        return None
+
+
+def _comment_likes(compact: Any, a11y: Any) -> Tuple[int, str]:
+    """返回 (点赞数, 原始压缩文案)。
+
+    YouTube 的评论点赞只给压缩值（"1.1K"），把它换算成 1100 再显示是假精度：
+    三条 1.1K~1.19K 的热评会一模一样都写成 1100。所以只有无障碍文案给出完整
+    数字时才用精确值，否则把 YouTube 自己的压缩文案原样透给卡片。
+    """
+    exact = _exact_count(_accessibility_label(a11y) or (a11y if isinstance(a11y, str) else ""))
+    compact_text = _text_of(compact)
+    if exact is not None:
+        return exact, ""
+    value = parse_compact_number(compact_text)
+    display = compact_text if re.search(r"[KMBkmb万千亿億]", compact_text) else ""
+    return value, display
+
 def _comment_from_entity(entity: Any) -> Optional[Dict[str, Any]]:
     """解析新版 commentEntityPayload 结构。"""
     if not isinstance(entity, dict):
@@ -928,20 +1052,20 @@ def _comment_from_entity(entity: Any) -> Optional[Dict[str, Any]]:
     author = author if isinstance(author, dict) else {}
     toolbar = entity.get("toolbar")
     toolbar = toolbar if isinstance(toolbar, dict) else {}
-    likes = parse_compact_number(
-        toolbar.get("likeCountNotliked") or toolbar.get("likeCountLiked") or 0
+    likes, likes_text = _comment_likes(
+        toolbar.get("likeCountNotliked") or toolbar.get("likeCountLiked"),
+        toolbar.get("likeCountA11y"),
     )
-    avatar = author.get("avatarThumbnailUrl")
-    if isinstance(avatar, str) and avatar.startswith("//"):
-        avatar = "https:" + avatar
+    avatar = upscale_avatar_url(author.get("avatarThumbnailUrl"))
     return {
         "comment_id": str(properties.get("commentId") or ""),
         "username": _text_of(author.get("displayName")),
         "uid": str(author.get("channelId") or ""),
         "likes": likes,
-        "time": _text_of(properties.get("publishedTime")),
+        "likes_text": likes_text,
+        "time": localize_relative_time(_text_of(properties.get("publishedTime"))),
         "message": message,
-        "avatar_url": avatar if isinstance(avatar, str) else "",
+        "avatar_url": avatar,
     }
 
 
@@ -952,19 +1076,24 @@ def _comment_from_renderer(renderer: Any) -> Optional[Dict[str, Any]]:
     message = _text_of(renderer.get("contentText"))
     if not message:
         return None
-    likes = parse_compact_number(
-        renderer.get("voteCount") if isinstance(
-            renderer.get("voteCount"), (int, float)
-        ) else _text_of(renderer.get("voteCount"))
+    vote = renderer.get("voteCount")
+    likes, likes_text = _comment_likes(
+        vote if isinstance(vote, (int, float)) else _text_of(vote),
+        _accessibility_label(vote),
     )
     return {
         "comment_id": str(renderer.get("commentId") or ""),
         "username": _text_of(renderer.get("authorText")),
         "uid": str(renderer.get("authorExternalChannelId") or ""),
         "likes": likes,
-        "time": _text_of(renderer.get("publishedTimeText")),
+        "likes_text": likes_text,
+        "time": localize_relative_time(
+            _text_of(renderer.get("publishedTimeText"))
+        ),
         "message": message,
-        "avatar_url": _best_thumbnail(renderer.get("authorThumbnail")),
+        "avatar_url": upscale_avatar_url(
+            _best_thumbnail(renderer.get("authorThumbnail"))
+        ),
     }
 
 
@@ -1524,7 +1653,7 @@ class YouTubeParser(BaseVideoParser):
                     failures.append("comments -> 未找到评论区 continuation")
 
         if not avatar_url:
-            avatar_url = self._extract_avatar_url(player)
+            avatar_url = upscale_avatar_url(self._extract_avatar_url(player))
 
         # 无可下载流时退化为封面卡片，并说明原因。
         limit_warnings: List[str] = []

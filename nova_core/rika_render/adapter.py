@@ -281,6 +281,9 @@ def build_parse_result(
                         ).strip(),
                         "uid": str(item.get("uid") or "").strip(),
                         "likes": item.get("likes", 0),
+                        # 平台只给压缩值（YouTube 的 "1.1K"）时原样带过去，
+                        # 避免卡片把 1.1K 显示成假精确的 1100
+                        "likes_text": str(item.get("likes_text") or "").strip(),
                         "time": str(item.get("time") or "").strip(),
                         "message": message,
                         "avatar_url": avatar_urls[0] if avatar_urls else "",

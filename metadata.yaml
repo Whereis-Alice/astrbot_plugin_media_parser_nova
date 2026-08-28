@@ -8,7 +8,7 @@ desc: |
 
   ## 特色
 
-  - 卡片渲染：6 套皮肤 × 深浅配色 × 4 种布局共 48 种版式，自动多图编排和可配置署名
+  - 卡片渲染：6 套皮肤 × 深浅配色 × 4 种布局共 48 种版式，页签条与操作栏等界面家具按平台换件，自动多图编排和可配置署名
   - 卡片模式统一控制卡片与文本的发送关系
   - 标题、正文和热评可选翻译；热评可只显示在卡片中
   - Twitter/X 热评与互动统计可通过自建 Nitter 实例获取；小黑盒 BBS 热评按平台能力获取
@@ -16,7 +16,7 @@ desc: |
   - B站 Cookie 高画质解析与管理员协助登录
   - YouTube 三层降级解析：Innertube 多客户端取流、封面兜底、热评与统计
   - 媒体中转、消息聚合和 ZIP 导出
-version: v1.8.0
+version: v1.8.1
 astrbot_version: ">=4.25.0"
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova

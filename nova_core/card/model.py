@@ -77,9 +77,14 @@ def format_ts(ts: int | None) -> str | None:
     if ts is None:
         return None
     try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        parsed = datetime.fromtimestamp(ts)
     except (OverflowError, OSError, ValueError):
         return None
+    # 只有日期精度的来源（YouTube 的 publishDate 只到天）会正好落在本地零点，
+    # 补一个 00:00 出来属于凭空造精度，这里只写日期。
+    if parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0:
+        return parsed.strftime("%Y-%m-%d")
+    return parsed.strftime("%Y-%m-%d %H:%M")
 
 
 def compact_number(value: Any) -> str:
@@ -212,7 +217,9 @@ def normalize_comments(
             CommentItem(
                 username=clean_text(str(entry.get("username") or "未知用户")) or "未知用户",
                 uid=clean_text(str(entry.get("uid") or "")),
-                likes=compact_number(entry.get("likes", 0)),
+                # 平台自己给的压缩文案优先（YouTube 只给 "1.1K"，换算成 1100 是假精度）
+                likes=clean_text(str(entry.get("likes_text") or ""))
+                or compact_number(entry.get("likes", 0)),
                 time=clean_text(str(entry.get("time") or "")),
                 message=message,
                 avatar=Path(str(avatar_path)) if avatar_path else None,

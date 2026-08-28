@@ -177,6 +177,165 @@ def _stat_pairs(ctx: Any, kinds: Sequence[str]) -> list[tuple[str, str]]:
     return picked
 
 
+# ============================ 平台 chrome ============================
+
+
+@dataclass(frozen=True)
+class ChromeAction:
+    """底部操作栏里的一个动作。
+
+    :param kind: :func:`surface.glyph` 的图标种类。
+    :param stats: 数值取自哪些统计种类（按顺序取第一个有值的）。
+    :param label: 拿不到数值时显示的文字（"分享" / "保存"）。为空串表示
+        这个动作在没有数值时直接隐藏——B 站操作栏就是纯数字，没有文案。
+    :param solid: 是否用品牌色实心图标（对应客户端里"已互动"的观感）。
+    """
+
+    kind: str
+    stats: tuple[str, ...] = ()
+    label: str = ""
+    solid: bool = False
+
+    def resolve_stats(self) -> tuple[str, ...]:
+        return self.stats or (self.kind,)
+
+
+#: 操作栏三种画法：
+#:
+#: - ``stack``：图标在上、数字在下、整组居中（哔哩哔哩客户端）
+#: - ``pill``：圆角药丸包住"图标 + 文字"（YouTube 观看页）
+#: - ``inline``：图标与数字同行排开，不加底（X / Twitter）
+ACTION_STYLES: tuple[str, ...] = ("stack", "pill", "inline")
+
+
+@dataclass(frozen=True)
+class ChromeProfile:
+    """页签条与底部操作栏的平台差异。
+
+    皮肤只负责基调（配色、字重、圆角、留白）。但"评论 N / 赞和转发 M"这类
+    页签文案、底部操作栏的动作集和输入框 placeholder 是各家客户端自己的
+    语言：B 站说"赞和转发"和"点我发评论"，YouTube 观看页压根没有页签、
+    操作栏是"👍 / 👎 / 分享 / 保存"，X 说"发布你的回复"。把 B 站那一套硬贴
+    到别的平台上会立刻出戏，所以 chrome 按 ``model.platform_key`` 换件。
+
+    :param secondary_tab: 页签条右侧那一枚，``(文案, 求和的统计种类)``；
+        ``None`` 表示该平台没有第二个页签，整枚隐藏。
+    :param actions: 底部操作栏的动作序列，顺序照该平台客户端。
+    :param action_style: 操作栏画法，见 :data:`ACTION_STYLES`。
+    :param comment_hint: 底部评论输入框的 placeholder；空串表示不画输入框。
+    """
+
+    secondary_tab: tuple[str, tuple[str, ...]] | None
+    actions: tuple[ChromeAction, ...]
+    comment_hint: str
+    action_style: str = "stack"
+
+
+#: 中文社交动态（B 站 / 微博 / 小红书…）的通用 chrome，也是未知平台的兜底。
+#: 形态严格照 B 站客户端详情页最底部那条：纯数字，没有文案。
+CHROME_FEED = ChromeProfile(
+    secondary_tab=("赞和转发", ("like", "share")),
+    actions=(
+        ChromeAction("share"),
+        ChromeAction("comment"),
+        ChromeAction("star", solid=True),
+        ChromeAction("like", solid=True),
+    ),
+    comment_hint="点我发评论",
+    action_style="stack",
+)
+
+#: YouTube 观看页：没有页签；操作栏是一排圆角药丸 👍 / 👎 / 分享 / 保存，
+#: 后两枚即使没有数值也带文案（原版就是这样）。
+CHROME_YOUTUBE = ChromeProfile(
+    secondary_tab=None,
+    actions=(
+        ChromeAction("like", solid=True),
+        ChromeAction("dislike"),
+        ChromeAction("share", stats=(), label="分享"),
+        ChromeAction("star", label="保存"),
+    ),
+    comment_hint="添加评论…",
+    action_style="pill",
+)
+
+#: X（Twitter）单帖页：右侧页签用"查看"（浏览量）；操作栏 回复 / 转帖 / 喜欢 / 书签，
+#: 图标与数字同行、不加底。
+CHROME_X = ChromeProfile(
+    secondary_tab=("查看", ("play",)),
+    actions=(
+        ChromeAction("comment"),
+        ChromeAction("share"),
+        ChromeAction("like", solid=True),
+        ChromeAction("star"),
+    ),
+    comment_hint="发布你的回复",
+    action_style="inline",
+)
+
+#: 竖屏短视频（抖音 / 快手 / TikTok）：无页签，操作栏点赞在前
+CHROME_SHORTS = ChromeProfile(
+    secondary_tab=None,
+    actions=(
+        ChromeAction("like", solid=True),
+        ChromeAction("comment"),
+        ChromeAction("star", solid=True),
+        ChromeAction("share"),
+    ),
+    comment_hint="说点什么…",
+    action_style="stack",
+)
+
+#: Pixiv 作品页：无页签，操作栏 喜欢 / 收藏 / 浏览
+CHROME_PIXIV = ChromeProfile(
+    secondary_tab=None,
+    actions=(
+        ChromeAction("like", solid=True),
+        ChromeAction("star", solid=True),
+        ChromeAction("play"),
+    ),
+    comment_hint="留下评论…",
+    action_style="inline",
+)
+
+#: platform_key -> chrome
+CHROME_BY_PLATFORM: dict[str, ChromeProfile] = {
+    "bilibili": CHROME_FEED,
+    "acfun": CHROME_FEED,
+    "weibo": CHROME_FEED,
+    "xiaohongshu": CHROME_FEED,
+    "xiaoheihe": CHROME_FEED,
+    "nga": CHROME_FEED,
+    "toutiao": CHROME_FEED,
+    "xianyu": CHROME_FEED,
+    "youtube": CHROME_YOUTUBE,
+    "twitter": CHROME_X,
+    "x": CHROME_X,
+    "douyin": CHROME_SHORTS,
+    "kuaishou": CHROME_SHORTS,
+    "tiktok": CHROME_SHORTS,
+    "pixiv": CHROME_PIXIV,
+}
+
+
+def _chrome(ctx: Any) -> ChromeProfile:
+    """当前卡片该用哪套 chrome。"""
+    key = str(getattr(ctx.model, "platform_key", "") or "").strip().lower()
+    return CHROME_BY_PLATFORM.get(key, CHROME_FEED)
+
+
+def _sum_stats(ctx: Any, kinds: Sequence[str]) -> str:
+    """把若干统计种类的数值相加，按压缩数字样式输出；全都取不到则空串。"""
+    numbers = [
+        value
+        for value in (_parse_stat_number(_stat_value(ctx, (kind,))) for kind in kinds)
+        if value is not None
+    ]
+    if not numbers:
+        return ""
+    return compact_number(int(round(sum(numbers))))
+
+
 #: 正文里要走强调色的行内元素：@提及 与裸链接（话题 #...# 单独处理）
 _MENTION_RE = re.compile(r"@[^\s#@，。！？、；：,.!?;:]{1,24}|https?://[^\s]+")
 
@@ -1607,11 +1766,12 @@ class IpNoteBlock(Block):
 
 @dataclass
 class TabBarBlock(Block):
-    """哔哩哔哩动态详情页的页签条：选中的"评论 N"带粉色下划线，右邻"赞和转发 M"。
+    """社交详情页的页签条：选中的"评论 N"带品牌色下划线，右邻一枚次级页签。
 
-    第二个页签严格复刻 B 站原版：文案固定为"赞和转发"，数值是点赞与转发
-    之和（截图里的 836 = 817 赞 + 19 转发）。任一侧数值缺失或无法解析时，
-    只累加能拿到的那一侧；两侧都拿不到才退回无数字的纯文案。
+    次级页签由平台 chrome 决定（见 :class:`ChromeProfile`）：B 站是"赞和转发 M"，
+    M 为点赞与转发之和（817 赞 + 19 转发 = 836）；X 是"查看 N"。任一侧数值缺失
+    时只累加拿得到的那一侧。**数值完全取不到，或平台本来就没有第二个页签
+    （YouTube 观看页）时整枚隐藏**——留一个光标签比不画更出戏。
     """
 
     variant: str = "bili"
@@ -1626,21 +1786,17 @@ class TabBarBlock(Block):
         if not count and model.comments:
             count = str(len(model.comments))
         active = f"评论 {count}".strip() if count else "评论"
-        total = self._like_share_total(ctx)
-        rest = f"赞和转发 {total}" if total else "赞和转发"
-        return active, rest
+        return active, self._secondary(ctx)
 
     @staticmethod
-    def _like_share_total(ctx: Any) -> str:
-        """点赞 + 转发的合计，按 B 站的压缩数字样式输出。"""
-        parts = [
-            _parse_stat_number(_stat_value(ctx, (kind,)))
-            for kind in ("like", "share")
-        ]
-        numbers = [value for value in parts if value is not None]
-        if not numbers:
+    def _secondary(ctx: Any) -> str:
+        """次级页签文案，按平台 chrome 取；无值即空串（不画）。"""
+        spec = _chrome(ctx).secondary_tab
+        if spec is None:
             return ""
-        return compact_number(int(round(sum(numbers))))
+        label, kinds = spec
+        total = _sum_stats(ctx, kinds)
+        return f"{label} {total}" if total else ""
 
     def _plan(self, ctx: Any, width: int) -> dict[str, Any]:
         cached = self._plans.get(width)
@@ -1678,7 +1834,7 @@ class TabBarBlock(Block):
             fill=alpha(ctx.accent, 255),
         )
         cursor = x + aw + m.gap_xl
-        if cursor + ctx.ts.width(rest, plan["rest_f"]) <= x + width:
+        if rest and cursor + ctx.ts.width(rest, plan["rest_f"]) <= x + width:
             ctx.text(layer, (cursor, y), rest, plan["rest_f"], ctx.ink_muted)
         surface.hairline(layer, x, under_y + rule + m.gap_sm, x + width, ctx.hair)
 
@@ -2140,8 +2296,17 @@ class CommentsBlock(Block):
 # ============================ 页脚 ============================
 
 
+#: youtube.com/watch?v=XXX 形态的链接，角落署名里压成 youtu.be/XXX
+_YT_WATCH_RE = re.compile(r"^(?:m\.|music\.)?youtube\.com/watch\?(?:.*&)?v=([\w-]{6,})", re.I)
+
+
 def _bare_url(url: Any) -> str:
-    """去掉协议与 www. 前缀的链接，用于空间紧张的角落署名。"""
+    """去掉协议与 www. 前缀的链接，用于空间紧张的角落署名。
+
+    顺手把 YouTube 观看链接折成官方短链形态：角落署名的横向预算只有卡片宽度的
+    一半多一点，``youtube.com/watch?v=2sm0UuaOm_s`` 常常刚好把标题挤没，而
+    ``youtu.be/2sm0UuaOm_s`` 等价、可点、还短一截。
+    """
     text = str(url or "").strip()
     for prefix in ("https://", "http://"):
         if text.startswith(prefix):
@@ -2149,6 +2314,9 @@ def _bare_url(url: Any) -> str:
             break
     if text.startswith("www."):
         text = text[4:]
+    matched = _YT_WATCH_RE.match(text)
+    if matched:
+        return f"youtu.be/{matched.group(1)}"
     return text
 
 
@@ -2296,64 +2464,77 @@ class FooterBlock(Block):
     def _measure(self, ctx: Any, width: int) -> int:
         return int(self._plan(ctx, width)["height"])
 
-    #: 底部操作栏的四组动作，顺序与 B 站客户端一致；solid 表示实心+品牌色
-    _BILI_ACTIONS: tuple[tuple[str, bool], ...] = (
-        ("share", False),
-        ("comment", False),
-        ("star", True),
-        ("like", True),
-    )
-
-    #: 评论输入框的 placeholder，照抄 B 站原版
-    _BILI_COMMENT_HINT = "点我发评论"
-
     def _plan_bili(self, ctx: Any, width: int, font: Any, row: int) -> dict[str, Any]:
-        """哔哩哔哩底部操作栏的排版计算。
+        """底部操作栏的排版计算，按平台 chrome 换件。
 
-        形态严格照 B 站客户端详情页最底部那条：左边一枚圆角"点我发评论"
-        输入药丸，右边四组"图标在上、数字在下、整组居中"的堆叠。链接与
-        水印已迁往顶栏右上角，这里不再承担它们，操作栏因此能干净地落在
-        卡片最底部。
+        左边一枚圆角输入药丸（placeholder 由 chrome 给），右边一排动作。动作的
+        画法有三种（stack / pill / inline，见 :data:`ACTION_STYLES`），共用同一套
+        右对齐几何，所以窄卡片上的让位逻辑只需要写一遍。链接与水印已迁往顶栏
+        右上角，这里不再承担它们，操作栏因此能干净地落在卡片最底部。
         """
         m = ctx.m
+        chrome = _chrome(ctx)
+        style = chrome.action_style
         icon = max(15, int(round(m.f_body * 1.32)))
         num_f = ctx.font(max(10, int(round(m.f_caption * 1.02))))
         num_row = ctx.ts.line_height(num_f, 1.0)
         stack_gap = max(2, int(round(m.unit * 0.9)))
-        stack_h = icon + stack_gap + num_row
+
+        # 药丸内的图标与文字间距，以及药丸的上下留白
+        pad_in = max(m.gap_2xs, int(round(m.unit * 1.6)))
+        pill_pad_y = max(3, int(round(m.unit * 1.9)))
+        act_pill_h = icon + pill_pad_y * 2
+        act_pill_pad_x = max(m.gap_xs, int(round(act_pill_h * 0.34)))
 
         actions: list[dict[str, Any]] = []
-        for kind, solid in self._BILI_ACTIONS:
-            value = _stat_value(ctx, (kind,))
-            if not value:
+        for action in chrome.actions:
+            value = _stat_value(ctx, action.resolve_stats()) if action.resolve_stats() else ""
+            text = value or action.label
+            if not text and not action.label:
                 continue
+            text_w = ctx.ts.width(text, num_f) if text else 0
+            if style == "stack":
+                # B 站：图标在上、数字在下，没有数字就不画这一组
+                if not value:
+                    continue
+                col, item_h = max(icon, text_w), icon + stack_gap + num_row
+            elif style == "pill":
+                inner = icon + ((pad_in + text_w) if text else 0)
+                col, item_h = inner + act_pill_pad_x * 2, act_pill_h
+            else:  # inline
+                col = icon + ((pad_in + text_w) if text else 0)
+                item_h = max(icon, num_row)
             actions.append(
                 {
-                    "kind": kind,
-                    "value": value,
-                    "solid": solid,
-                    "col": max(icon, ctx.ts.width(value, num_f)),
+                    "kind": action.kind,
+                    "text": text,
+                    "solid": action.solid,
+                    "col": col,
+                    "text_w": text_w,
+                    "height": item_h,
                 }
             )
-        act_gap = max(m.gap_md, int(round(m.unit * 6)))
-        actions_w = sum(item["col"] for item in actions)
+
+        act_gap = max(m.gap_xs, int(round(m.unit * (6 if style == "stack" else 2.6))))
+        actions_w = sum(int(item["col"]) for item in actions)
         if actions:
             actions_w += act_gap * (len(actions) - 1)
+        stack_h = max([int(item["height"]) for item in actions], default=icon)
 
+        hint = chrome.comment_hint
         hint_f = ctx.font(m.f_meta)
         hint_row = ctx.ts.line_height(hint_f, 1.0)
-        pill_pad_y = max(m.gap_xs, int(round(m.unit * 2.2)))
-        pill_h = hint_row + pill_pad_y * 2
+        pill_pad_y2 = max(m.gap_xs, int(round(m.unit * 2.2)))
+        pill_h = hint_row + pill_pad_y2 * 2
         pill_pad_x = max(m.gap_sm, pill_h // 2)
         # 药丸吃掉操作栏之外的全部剩余宽度，太窄时（超小卡片）整个让位
         pill_w = width - actions_w - (act_gap if actions else 0)
-        hint_w = ctx.ts.width(self._BILI_COMMENT_HINT, hint_f)
-        pill_min = hint_w + pill_pad_x * 2
-        show_pill = pill_w >= pill_min
+        hint_w = ctx.ts.width(hint, hint_f) if hint else 0
+        show_pill = bool(hint) and pill_w >= hint_w + pill_pad_x * 2
         if not show_pill:
             pill_w = 0
 
-        bar_h = max(stack_h, pill_h)
+        bar_h = max(stack_h, pill_h if show_pill else 0)
         head = m.gap_sm + 1 + m.gap_md
         plan = {
             "font": font,
@@ -2366,14 +2547,19 @@ class FooterBlock(Block):
             "inner_w": max(40, width),
             "offset_x": 0,
             "offset_y": head,
+            "style": style,
             "icon": icon,
             "num_f": num_f,
             "num_row": num_row,
             "stack_gap": stack_gap,
             "stack_h": stack_h,
+            "pad_in": pad_in,
+            "act_pill_h": act_pill_h,
+            "act_pill_pad_x": act_pill_pad_x,
             "actions": actions,
             "actions_w": actions_w,
             "act_gap": act_gap,
+            "hint": hint,
             "hint_f": hint_f,
             "hint_row": hint_row,
             "pill_w": pill_w,
@@ -2387,8 +2573,70 @@ class FooterBlock(Block):
         self._plans[width] = plan
         return plan
 
+    def _draw_action(
+        self,
+        ctx: Any,
+        layer: Any,
+        item: dict[str, Any],
+        left: int,
+        top: int,
+        plan: dict[str, Any],
+        bar_h: int,
+    ) -> None:
+        """画一个动作。三种画法共用"给定左上角 + 列宽"的契约。"""
+        pal = ctx.pal
+        style = plan["style"]
+        icon = int(plan["icon"])
+        col = int(item["col"])
+        num_f = plan["num_f"]
+        text = str(item["text"])
+        # 实心=品牌色（对应原版"已互动"的观感），其余走中性
+        tint = ctx.accent if item["solid"] else ctx.ink_muted
+        text_ink = ctx.accent_text if item["solid"] else ctx.ink_dim
+
+        if style == "stack":
+            stack_h = icon + int(plan["stack_gap"]) + int(plan["num_row"])
+            y0 = top + max(0, (bar_h - stack_h) // 2)
+            gx = int(round(left + col / 2.0 - icon / 2.0))
+            surface.glyph(layer, (gx, y0, gx + icon, y0 + icon), item["kind"], alpha(tint, 255))
+            tw = int(item["text_w"])
+            ctx.text(
+                layer,
+                (int(round(left + col / 2.0 - tw / 2.0)), y0 + icon + int(plan["stack_gap"])),
+                text,
+                num_f,
+                ctx.ink_dim,
+            )
+            return
+
+        if style == "pill":
+            pill_h = int(plan["act_pill_h"])
+            y0 = top + max(0, (bar_h - pill_h) // 2)
+            surface.panel(
+                layer,
+                (left, y0, left + col, y0 + pill_h),
+                pill_h // 2,
+                fill=alpha(mix(pal.surface, ctx.ink, 0.14 if pal.is_dark else 0.07), 255),
+            )
+            gx = left + int(plan["act_pill_pad_x"])
+            gy = y0 + (pill_h - icon) // 2
+            surface.glyph(layer, (gx, gy, gx + icon, gy + icon), item["kind"], alpha(tint, 255))
+            if text:
+                ty = y0 + max(0, (pill_h - int(plan["num_row"])) // 2)
+                ctx.text(layer, (gx + icon + int(plan["pad_in"]), ty), text, num_f, text_ink)
+            return
+
+        # inline：图标与文字同行，不加底
+        row_h = max(icon, int(plan["num_row"]))
+        y0 = top + max(0, (bar_h - row_h) // 2)
+        gy = y0 + (row_h - icon) // 2
+        surface.glyph(layer, (left, gy, left + icon, gy + icon), item["kind"], alpha(tint, 255))
+        if text:
+            ty = y0 + max(0, (row_h - int(plan["num_row"])) // 2)
+            ctx.text(layer, (left + icon + int(plan["pad_in"]), ty), text, num_f, text_ink)
+
     def _draw_bili(self, ctx: Any, layer: Any, x: int, y: int, width: int, plan: dict[str, Any]) -> None:
-        """哔哩哔哩底部操作栏：发评论输入药丸 + 转发/评论/收藏/点赞 四组堆叠。"""
+        """底部操作栏：评论输入药丸 + 平台自己的那排动作。"""
         m, pal = ctx.m, ctx.pal
         surface.hairline(layer, x, y + m.gap_sm, x + width, ctx.hair)
         top = y + int(plan["head"])
@@ -2410,7 +2658,7 @@ class FooterBlock(Block):
                     x + int(plan["pill_pad_x"]),
                     pill_top + max(0, (pill_h - int(plan["hint_row"])) // 2),
                 ),
-                self._BILI_COMMENT_HINT,
+                str(plan["hint"]),
                 plan["hint_f"],
                 ctx.ink_muted,
             )
@@ -2418,31 +2666,12 @@ class FooterBlock(Block):
         actions = plan["actions"]
         if not actions:
             return
-        icon = int(plan["icon"])
-        num_f = plan["num_f"]
-        stack_gap = int(plan["stack_gap"])
-        stack_h = int(plan["stack_h"])
-        stack_top = top + max(0, (bar_h - stack_h) // 2)
         cursor = x + width - int(plan["actions_w"])
         for index, item in enumerate(actions):
-            col = int(item["col"])
             if index:
                 cursor += int(plan["act_gap"])
-            center = cursor + col / 2.0
-            # 收藏 / 点赞 用实心品牌色（对应原版"已互动"的观感），转发 / 评论走中性描边
-            tint = ctx.accent if item["solid"] else ctx.ink_muted
-            gx = int(round(center - icon / 2.0))
-            surface.glyph(layer, (gx, stack_top, gx + icon, stack_top + icon), item["kind"], alpha(tint, 255))
-            value = str(item["value"])
-            vw = ctx.ts.width(value, num_f)
-            ctx.text(
-                layer,
-                (int(round(center - vw / 2.0)), stack_top + icon + stack_gap),
-                value,
-                num_f,
-                ctx.ink_dim,
-            )
-            cursor += col
+            self._draw_action(ctx, layer, item, cursor, top, plan, bar_h)
+            cursor += int(item["col"])
 
     def draw(self, ctx: Any, layer: Any, x: int, y: int, width: int) -> None:
         m = ctx.m
