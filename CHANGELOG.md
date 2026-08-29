@@ -2,6 +2,17 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.10.1 (2026-08-29)
+
+yt-dlp 兜底上线到生产后，实测确实解开了那条一直只出封面的视频（`dash` 1080p，`137+140-drc`），顺手修掉两处在真机上才暴露的问题。
+
+### 修复
+
+- **日志里的 yt-dlp 版本号永远是「未知版本」**：2026.08 起 yt-dlp 不再在包顶层导出 `__version__`（只剩 `yt_dlp.version` 子模块里有），只 `getattr` 顶层会拿到空串。现在读不到就回落到子模块，日志摘要能正常显示 `yt-dlp 2026.08.19`——这条只影响可观测性，不影响取流，但排查时「版本未知」会把人往错的方向带
+- **Cookie jar 写入加固**：
+  - 传进来的 Cookie 不再假定已经是请求头形态，落盘前统一走一次 `normalize_cookie_input`。此前若把整段 cookies.txt（或被 WebUI 压成一行的版本）直接交给兜底层，整段文本会被当成**一个** Cookie 名写进 jar，yt-dlp 只报一句 `skipping cookie file entry due to invalid length` 然后按匿名请求，最终以「Sign in to confirm you’re not a bot」结束——现象和 Cookie 失效一模一样，极难分辨
+  - 名或值里含空白或分号的条目会直接撕开 Netscape 的制表符分隔行，现在按行丢弃并在 DEBUG 记下被丢的项；若整份 Cookie 一条都不可用，就不写文件、按匿名处理
+
 ## v1.10.0 (2026-08-29)
 
 ### YouTube：疑难视频不再只有一张封面

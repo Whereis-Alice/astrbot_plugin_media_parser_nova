@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -1832,6 +1834,46 @@ class YtDlpEnvironmentTest(unittest.TestCase):
         self.assertEqual(JS_RUNTIME_PREFERENCE[0], "deno")
         self.assertIn("node", JS_RUNTIME_PREFERENCE)
 
+    def test_version_prefers_top_level_attribute(self):
+        package = types.ModuleType("yt_dlp")
+        package.__version__ = "2026.09.01"
+        self.assertEqual(ytdlp_runtime._ytdlp_version(package), "2026.09.01")
+
+    def test_version_falls_back_to_version_submodule(self):
+        # 2026.08 起 yt-dlp 包顶层不再导出 __version__，只剩子模块里有。
+        package = types.ModuleType("yt_dlp")
+        submodule = types.ModuleType("yt_dlp.version")
+        submodule.__version__ = "2026.08.19"
+        with mock.patch.dict(
+            sys.modules, {"yt_dlp": package, "yt_dlp.version": submodule}
+        ):
+            self.assertEqual(
+                ytdlp_runtime._ytdlp_version(package), "2026.08.19"
+            )
+
+    def test_version_absent_everywhere_reads_empty(self):
+        package = types.ModuleType("yt_dlp")
+        submodule = types.ModuleType("yt_dlp.version")
+        with mock.patch.dict(
+            sys.modules, {"yt_dlp": package, "yt_dlp.version": submodule}
+        ):
+            self.assertEqual(ytdlp_runtime._ytdlp_version(package), "")
+
+    def test_probe_reports_version_from_submodule(self):
+        package = types.ModuleType("yt_dlp")
+        submodule = types.ModuleType("yt_dlp.version")
+        submodule.__version__ = "2026.08.19"
+        with mock.patch.dict(
+            sys.modules, {"yt_dlp": package, "yt_dlp.version": submodule}
+        ), mock.patch.object(
+            ytdlp_runtime,
+            "_probe_js_runtime",
+            lambda preference: ("node", "22.22.2", True),
+        ), mock.patch.object(ytdlp_runtime, "_probe_ejs", lambda: True):
+            env = ytdlp_runtime._probe_uncached("")
+        self.assertTrue(env.ready)
+        self.assertIn("yt-dlp 2026.08.19", env.summary())
+
 
 def _ytdlp_fmt(**kwargs) -> dict:
     """裁剪自真实 extract_info 的 formats 条目。"""
@@ -2068,6 +2110,50 @@ class YtDlpCookieJarTest(unittest.TestCase):
         self.resolver._ensure_cookie_jar(self.HEADER, 1)
         leftovers = [n for n in os.listdir(self.tmp) if n.endswith(".tmp")]
         self.assertEqual(leftovers, [])
+
+    def _jar_rows(self, path):
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        return [line.split("\t") for line in lines if not line.startswith("#")]
+
+    def test_raw_cookies_txt_text_is_normalized_first(self):
+        # 配置里可能直接是浏览器扩展导出的整段 cookies.txt；若不规范化，
+        # 整段文本会被当成一个 Cookie 名写进 jar，yt-dlp 整行丢弃。
+        raw = "\n".join(
+            [
+                "# Netscape HTTP Cookie File",
+                "\t".join(
+                    [".youtube.com", "TRUE", "/", "TRUE", "1822555660",
+                     "SAPISID", "abc"]
+                ),
+                "\t".join(
+                    [".youtube.com", "TRUE", "/", "TRUE", "1822555660",
+                     "__Secure-3PSID", "def"]
+                ),
+            ]
+        )
+        rows = self._jar_rows(self.resolver._ensure_cookie_jar(raw, 1))
+        self.assertEqual([row[5] for row in rows], ["SAPISID", "__Secure-3PSID"])
+        self.assertEqual([row[6] for row in rows], ["abc", "def"])
+
+    def test_collapsed_cookies_txt_paste_is_normalized_first(self):
+        # AstrBot WebUI 的单行输入框会把换行压成空格。
+        raw = (
+            "# Netscape HTTP Cookie File .youtube.com TRUE / TRUE 1822555660 "
+            "SAPISID abc .youtube.com TRUE / TRUE 1822555660 "
+            "__Secure-3PSID def"
+        )
+        rows = self._jar_rows(self.resolver._ensure_cookie_jar(raw, 1))
+        self.assertEqual([row[5] for row in rows], ["SAPISID", "__Secure-3PSID"])
+
+    def test_entries_with_whitespace_are_dropped(self):
+        header = "SAPISID=abc; BROKEN=a b; bad name=x; __Secure-3PSID=def"
+        rows = self._jar_rows(self.resolver._ensure_cookie_jar(header, 1))
+        self.assertEqual([row[5] for row in rows], ["SAPISID", "__Secure-3PSID"])
+
+    def test_all_entries_unusable_writes_nothing(self):
+        self.assertEqual(self.resolver._ensure_cookie_jar("BROKEN=a b", 1), "")
+        self.assertEqual(os.listdir(self.tmp), [])
 
 
 class YtDlpOptionsTest(unittest.TestCase):

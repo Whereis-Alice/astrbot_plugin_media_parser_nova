@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from ....logger import logger
-from .cookie import parse_cookie_header
+from .cookie import normalize_cookie_input, parse_cookie_header
 
 
 __all__ = [
@@ -61,6 +62,9 @@ _COOKIE_JAR_NAME = "ytdlp_cookies.txt"
 # Netscape jar 每行都要一个过期时间。YouTube 的登录凭据由 Cookie 运行时
 # 负责轮换，这里统一给远期时间，免得 yt-dlp 把会话 Cookie 当成已过期丢弃。
 _JAR_EXPIRY = 2147483647
+# Netscape jar 是制表符分隔的行式格式：名或值里混进空白或分号会直接把
+# 该行结构撕开，yt-dlp 会整行丢弃（日志里只有一句 invalid length）。
+_JAR_UNSAFE = re.compile(r"[\s;]")
 
 # 编解码器优先级与 Innertube 侧保持一致：avc1/mp4a 兼容性最好，ffmpeg 能
 # 直接 copy 合流。
@@ -214,6 +218,22 @@ def _probe_js_runtime(preference: str = "") -> Tuple[str, str, bool]:
     return "", "", True
 
 
+def _ytdlp_version(module: Any) -> str:
+    """读出 yt-dlp 版本号。
+
+    2026.08 起包顶层不再导出 `__version__`，只有 `yt_dlp.version` 子模块里
+    还有；只 getattr 顶层会拿到空串，日志里表现为「yt-dlp 未知版本」。
+    """
+    version = str(getattr(module, "__version__", "") or "").strip()
+    if version:
+        return version
+    try:
+        from yt_dlp.version import __version__ as packaged
+    except Exception:
+        return ""
+    return str(packaged or "").strip()
+
+
 def _probe_ejs() -> bool:
     """yt-dlp-ejs 能 import 就视为求解脚本已就绪。"""
     try:
@@ -229,7 +249,7 @@ def _probe_uncached(preference: str) -> YtDlpEnvironment:
         import yt_dlp
     except Exception:
         return YtDlpEnvironment(problems=("未安装 yt-dlp",))
-    version = str(getattr(yt_dlp, "__version__", "") or "")
+    version = _ytdlp_version(yt_dlp)
     runtime_name, runtime_version, ejs_arch = _probe_js_runtime(preference)
     ejs_available = _probe_ejs() if ejs_arch else False
     problems: List[str] = []
@@ -369,7 +389,10 @@ class YtDlpStreamResolver:
         用 Cookie 运行时的 revision 做缓存键：只有真的发生过轮换才重写文件，
         免得每次解析都做一次磁盘写。
         """
-        header = (cookie_header or "").strip()
+        # 调用方通常给的是已规范化的 Cookie 头，但配置里也可能是整段
+        # cookies.txt（WebUI 会把换行压成空格）。这里再兜一次，避免把一整
+        # 段文本当成单个 Cookie 名写进 jar。
+        header = normalize_cookie_input(cookie_header)
         if not header:
             return ""
         token = (_as_int(revision), len(header))
@@ -386,7 +409,11 @@ class YtDlpStreamResolver:
             "# Netscape HTTP Cookie File",
             "# 由 Nova 插件依当前 YouTube 登录态生成，供 yt-dlp 兜底使用。",
         ]
+        dropped: List[str] = []
         for name, value in cookies.items():
+            if _JAR_UNSAFE.search(name) or _JAR_UNSAFE.search(value):
+                dropped.append(name)
+                continue
             lines.append(
                 "\t".join(
                     [
@@ -399,6 +426,14 @@ class YtDlpStreamResolver:
                         value,
                     ]
                 )
+            )
+        if len(lines) <= 2:
+            logger.debug("[youtube] yt-dlp Cookie jar 无可用条目，按匿名处理")
+            return ""
+        if dropped:
+            logger.debug(
+                "[youtube] yt-dlp Cookie jar 跳过 "
+                f"{len(dropped)} 项含空白/分号的条目: {', '.join(dropped)}"
             )
         text = "\n".join(lines) + "\n"
         path = self._write_jar(text)
