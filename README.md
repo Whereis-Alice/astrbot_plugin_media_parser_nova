@@ -423,8 +423,13 @@ YouTube 解析走官方 Innertube 接口，**不依赖 yt-dlp，也不依赖任�
 
 1. 开一个**无痕 / 隐私窗口**，登录准备当小号用的 Google 账号。
 2. **在同一个标签页**跳转到 `https://www.youtube.com/robots.txt`。这一步让页面停在一个不会自己发后台请求、也不会刷新令牌的静态页上。
-3. 用浏览器扩展 **Get cookies.txt LOCALLY**（注意选「LOCALLY」那个，纯本地导出、不回传服务器）导出当前站点的 Cookie。
-4. 把导出内容填进「YouTube 设置 → Cookie」。确认里面含有 `SAPISID` 或 `__Secure-3PAPISID`，否则 Innertube 会把请求当匿名处理。
+3. 用浏览器扩展 **Get cookies.txt LOCALLY**（注意选「LOCALLY」那个，纯本地导出、不回传服务器）导出当前站点的 Cookie。Edge 用户注意：Edge 加载项商店里没有这个扩展，可以在 Edge 里打开 Chrome 应用店并允许「来自其他商店的扩展」，或者用商店里的 **Cookie-Editor** 代替。
+4. 把导出内容整段填进「YouTube 设置 → Cookie」。**三种格式都能直接粘**，插件会自动认出来并转换：
+   - `cookies.txt`（Netscape 格式，`Get cookies.txt LOCALLY` 的产物，含制表符的多行文本）
+   - 扩展导出的 **JSON 数组**（`Cookie-Editor` / `EditThisCookie` 的默认格式）
+   - `a=1; b=2` 形式的 **Cookie 请求头**（浏览器开发者工具里直接抄的那种）
+   
+   唯一的硬要求是里面得含有 `SAPISID` 或 `__Secure-3PAPISID`，否则 Innertube 会把请求当匿名处理（日志里会给出警告）。
 5. **直接关掉整个无痕窗口，绝对不要点登出。** 点一次登出，刚导出的这份 Cookie 会立刻作废。
 
 #### 第二层：让插件自动跟进轮换（默认开启）

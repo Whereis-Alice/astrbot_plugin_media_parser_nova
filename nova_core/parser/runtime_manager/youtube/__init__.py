@@ -7,6 +7,7 @@ from .cookie import (
     YouTubeCookieRuntime,
     build_sapisid_authorization,
     collect_set_cookie_headers,
+    normalize_cookie_input,
     parse_cookie_header,
 )
 
@@ -18,5 +19,6 @@ __all__ = [
     "YouTubeCookieRuntime",
     "build_sapisid_authorization",
     "collect_set_cookie_headers",
+    "normalize_cookie_input",
     "parse_cookie_header",
 ]

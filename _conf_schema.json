@@ -971,7 +971,7 @@
             "cookie": {
                 "description": "YouTube Cookie",
                 "type": "string",
-                "hint": "留空即可解析公开视频。部分视频会被 YouTube 的「Sign in to confirm you are not a bot」门禁挡住（机房 IP 尤其常见），此时只能出封面卡片；填入登录后的完整 Cookie（必须包含 SAPISID 或 __Secure-3PAPISID，否则鉴权无效）可绕过门禁并解析年龄限制内容，填写后会自动追加 tv、web 两个支持鉴权的客户端。导出时建议用无痕窗口登录小号，导出完成后直接关掉整个窗口（不要点登出），这样会话不会被服务端作废。仅本地使用，不要公开分享；账号有被风控的风险，建议用小号。",
+                "hint": "留空即可解析公开视频。部分视频会被 YouTube 的「Sign in to confirm you are not a bot」门禁挡住（机房 IP 尤其常见），此时只能出封面卡片；填入登录后的完整 Cookie（必须包含 SAPISID 或 __Secure-3PAPISID，否则鉴权无效）可绕过门禁并解析年龄限制内容，填写后会自动追加 tv、web 两个支持鉴权的客户端。三种格式都可以直接整段粘贴：cookies.txt（Netscape 格式，Get cookies.txt LOCALLY 的产物）、扩展导出的 JSON 数组（Cookie-Editor / EditThisCookie）、或 a=1; b=2 形式的 Cookie 请求头，插件会自动识别并转换。导出时建议用无痕窗口登录小号，导出完成后直接关掉整个窗口（不要点登出），这样会话不会被服务端作废。仅本地使用，不要公开分享；账号有被风控的风险，建议用小号。",
                 "default": ""
             },
             "cookie_auto_refresh": {

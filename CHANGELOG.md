@@ -2,6 +2,28 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.9.1 (2026-08-29)
+
+### 修复：按 README 的步骤导出 Cookie，粘进配置却不生效
+
+上一版让 Cookie 能自动跟进轮换，但 README 推荐的导出工具 `Get cookies.txt LOCALLY` 产出的是 **Netscape 格式的 cookies.txt**（多行、制表符分隔），而配置项此前只认 `a=1; b=2` 形式的 Cookie 请求头。照着文档做的人会把 cookies.txt 整段粘进去，然后插件解析出一堆无意义的键、找不到 `SAPISID`、静默退回匿名请求——日志里只有一句「找不到 SAPISID」，很难联想到是格式问题。文档指着一条走不通的路，这算插件的 bug。
+
+- **`youtube.cookie` 现在三种格式都收**，粘进去自动识别并转换成请求头：
+  - `cookies.txt`（Netscape 格式，`Get cookies.txt LOCALLY` 的产物；兼容 `#HttpOnly_` 前缀行、注释行，以及被编辑器把制表符换成空格的情况）
+  - 扩展导出的 **JSON 数组**（`Cookie-Editor` / `EditThisCookie` 的默认格式，也兼容外层包一个 `cookies` 键的变体）
+  - `a=1; b=2` 形式的 **Cookie 请求头**（原有格式，逐字节原样保留，既有配置不受影响）
+- 粘贴时带进来的换行、BOM 和多余空白会被折叠掉，不再需要手动把多行拼成一行
+- 归一化发生在配置解析阶段，因此 SAPISIDHASH 鉴权、轮换吸收与落盘指纹全都基于转换后的结果，行为一致
+
+### 文档
+
+- README 导出步骤补上三种可粘格式的说明，并注明 **Edge 加载项商店里没有 `Get cookies.txt LOCALLY`**：可以在 Edge 里打开 Chrome 应用店并允许「来自其他商店的扩展」，或改用商店里的 `Cookie-Editor`
+- 配置项 `youtube.cookie` 的面板提示同步说明可粘格式
+
+### 测试
+
+- 新增 12 个用例：请求头原样返回、空值 / 空白 / BOM、多行粘贴折叠、Netscape 三种变体（注释行、`#HttpOnly_` 前缀、空值行、空格代替制表符）、JSON 数组与 `cookies` 包裹变体、JSON 里无名条目跳过、坏 JSON 回退按请求头处理，以及归一化结果能正常驱动 SAPISIDHASH 鉴权
+- 全量 354 passed + 82 subtests
 ## v1.9.0 (2026-08-29)
 
 ### 让 YouTube Cookie 从「隔几天就得重导」变成长期免维护

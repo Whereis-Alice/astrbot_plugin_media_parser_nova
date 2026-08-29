@@ -23,6 +23,7 @@ from .parser.platform import (
     XiaohongshuParser,
     YouTubeParser,
 )
+from .parser.runtime_manager.youtube import normalize_cookie_input
 from .translation.provider_defs import (
     LLM_PROVIDER_DEFAULTS,
     LLM_PROVIDER_OPTIONS,
@@ -1167,8 +1168,12 @@ class ConfigManager:
             True,
             "youtube.cookie_auto_refresh",
         )
+        # 用户可能直接粘 cookies.txt 或扩展导出的 JSON，统一成 Cookie 请求头。
+        youtube_cookie = normalize_cookie_input(
+            str(youtube_raw.get("cookie", "") or "")
+        )
         self.youtube = YouTubeConfig(
-            cookie=str(youtube_raw.get("cookie", "") or "").strip(),
+            cookie=youtube_cookie,
             max_height=self._parse_youtube_max_height(
                 youtube_raw.get("max_height", "1080")
             ),
@@ -1208,7 +1213,7 @@ class ConfigManager:
             cookie_runtime_file=self._build_youtube_cookie_runtime_file(
                 cache_dir,
                 enabled=bool(
-                    youtube_raw.get("cookie")
+                    youtube_cookie
                     and cache_dir_available
                     and youtube_cookie_auto_refresh
                 ),

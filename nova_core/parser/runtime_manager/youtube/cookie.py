@@ -45,6 +45,7 @@ __all__ = [
     "YouTubeCookieRuntime",
     "build_sapisid_authorization",
     "collect_set_cookie_headers",
+    "normalize_cookie_input",
     "parse_cookie_header",
 ]
 
@@ -99,6 +100,8 @@ ROTATING_COOKIE_NAMES: Tuple[str, ...] = (
 _ACCEPTED_COOKIE_NAMES = frozenset(IDENTITY_COOKIE_NAMES + ROTATING_COOKIE_NAMES)
 
 # 服务端删除 Cookie 时惯用的占位值；照抄进罐子等于自己把登录态清掉。
+_HTTPONLY_PREFIX = "#HttpOnly_"
+
 _DELETION_VALUES = frozenset(
     ("", "EXPIRED", "DELETED", "expired", "deleted", "null", "undefined")
 )
@@ -123,6 +126,88 @@ def parse_cookie_header(cookie: str) -> Dict[str, str]:
             continue
         jar[name] = value.strip()
     return jar
+
+
+def _cookies_from_netscape(text: str) -> Dict[str, str]:
+    """解析 cookies.txt（Netscape 格式）文本，取出 name/value。"""
+    jar: Dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            # "#HttpOnly_" 是合法数据行的前缀，其余 # 开头的都是注释。
+            if not line.startswith(_HTTPONLY_PREFIX):
+                continue
+            line = line[len(_HTTPONLY_PREFIX):]
+        fields = line.split("\t")
+        if len(fields) < 6:
+            # 有些编辑器会把制表符换成空格，退回按空白切分。
+            fields = line.split()
+        if len(fields) < 6:
+            continue
+        name = fields[5].strip()
+        if not name:
+            continue
+        jar[name] = fields[6].strip() if len(fields) > 6 else ""
+    return jar
+
+
+def _cookies_from_json(text: str) -> Dict[str, str]:
+    """解析 Cookie-Editor / EditThisCookie 这类扩展导出的 JSON。"""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if isinstance(data, dict):
+        nested = data.get("cookies")
+        if isinstance(nested, (list, dict)):
+            data = nested
+    if isinstance(data, dict):
+        jar: Dict[str, str] = {}
+        for key, value in data.items():
+            name = str(key).strip()
+            if name and not isinstance(value, (list, dict)):
+                jar[name] = str(value if value is not None else "")
+        return jar
+    if not isinstance(data, list):
+        return {}
+    jar = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        value = item.get("value", "")
+        jar[name] = str(value if value is not None else "")
+    return jar
+
+
+def normalize_cookie_input(raw: str) -> str:
+    """把用户可能填进配置的各种 Cookie 形态统一成 Cookie 请求头。
+
+    浏览器扩展导出的东西五花八门：`Get cookies.txt LOCALLY` 给的是
+    Netscape 格式的 cookies.txt，`Cookie-Editor` 默认给 JSON 数组，只有少
+    数扩展直接给 "a=1; b=2" 的请求头。此前插件只认最后一种，粘错格式会
+    静默退回匿名请求（日志里只有一句找不到 SAPISID），排查成本很高。
+
+    现在三种格式都收，统一转成请求头字符串；已经是请求头的原样返回（只
+    折叠掉粘贴时带进来的换行与多余空白），保证不会破坏既有配置。
+    """
+    text = (raw or "").strip().lstrip("\ufeff").strip()
+    if not text:
+        return ""
+    jar: Dict[str, str] = {}
+    if text[:1] in ("[", "{"):
+        jar = _cookies_from_json(text)
+    if not jar and ("\t" in text or _HTTPONLY_PREFIX in text or "# Netscape" in text):
+        jar = _cookies_from_netscape(text)
+    if not jar and "\n" in text and "=" not in text.split("\n", 1)[0]:
+        jar = _cookies_from_netscape(text)
+    if jar:
+        return "; ".join(f"{name}={value}" for name, value in jar.items())
+    return " ".join(text.split())
 
 
 def build_sapisid_authorization(
