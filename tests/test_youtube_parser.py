@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from nova_core.parser.platform.youtube import (
     COOKIE_PLAYER_CLIENTS,
@@ -38,10 +39,17 @@ from nova_core.parser.platform.youtube import (
 )
 from nova_core.parser.platform.youtube import _Deadline
 from nova_core.parser.runtime_manager.youtube import (
+    JS_RUNTIME_PREFERENCE,
     YouTubeCookieRuntime,
+    YtDlpEnvironment,
+    YtDlpStream,
+    YtDlpStreamResolver,
     collect_set_cookie_headers,
     normalize_cookie_input,
+    probe_ytdlp_environment,
+    reset_ytdlp_environment_cache,
 )
+from nova_core.parser.runtime_manager.youtube import ytdlp as ytdlp_runtime
 
 VID = "dQw4w9WgXcQ"
 
@@ -849,6 +857,46 @@ class ParserWiringTest(unittest.TestCase):
     def test_max_height_normalized(self):
         self.assertEqual(YouTubeParser(max_height=-5).max_height, 0)
         self.assertEqual(YouTubeParser(max_height=720).max_height, 720)
+
+    # ── yt-dlp 兜底相关参数 ──────────────────────────────
+
+    def test_ytdlp_timeout_has_floor(self):
+        self.assertEqual(YouTubeParser(ytdlp_timeout=3).ytdlp_timeout, 10)
+        self.assertEqual(YouTubeParser(ytdlp_timeout=0).ytdlp_timeout, 60)
+        self.assertEqual(YouTubeParser(ytdlp_timeout=120).ytdlp_timeout, 120)
+
+    def test_ytdlp_js_runtime_falls_back_to_auto(self):
+        for raw in ("", "   ", None):
+            with self.subTest(raw=raw):
+                parser = YouTubeParser(ytdlp_js_runtime=raw)
+                self.assertEqual(parser.ytdlp_js_runtime, "auto")
+        self.assertEqual(
+            YouTubeParser(ytdlp_js_runtime=" node ").ytdlp_js_runtime, "node"
+        )
+
+    def test_ytdlp_resolver_absent_when_disabled(self):
+        parser = YouTubeParser(ytdlp_fallback=False)
+        self.assertIsNone(parser._ytdlp_resolver())
+        # 关掉兜底时降级告警要提示用户存在这个开关。
+        self.assertIn("ytdlp_fallback", parser._ytdlp_advice())
+
+    def test_ytdlp_resolver_inherits_stream_preferences(self):
+        parser = YouTubeParser(
+            max_height=720,
+            allow_dash=False,
+            proxy="http://127.0.0.1:7890",
+            ytdlp_timeout=90,
+            ytdlp_js_runtime="node",
+        )
+        resolver = parser._ytdlp_resolver()
+        self.assertIsNotNone(resolver)
+        self.assertEqual(resolver.max_height, 720)
+        self.assertFalse(resolver.allow_dash)
+        self.assertEqual(resolver.proxy, "http://127.0.0.1:7890")
+        self.assertEqual(resolver.timeout, 90.0)
+        self.assertEqual(resolver.js_runtime, "node")
+        # 惰性构造应当复用同一个实例（探测缓存与 Cookie jar 都挂在上面）。
+        self.assertIs(parser._ytdlp_resolver(), resolver)
 
 
 class PublishDateTest(unittest.TestCase):
@@ -1697,3 +1745,465 @@ class CookieInputNormalizationTest(unittest.TestCase):
     def test_comment_only_text_yields_no_cookies(self):
         raw = " ".join((self.COLLAPSED_HEAD, "# nothing useful here"))
         self.assertEqual(parse_cookie_header(normalize_cookie_input(raw)), {})
+
+# ── yt-dlp 兜底运行时 ─────────────────────────────────────
+#
+# YouTube 现在给 Web 端下发的基本都是 SABR 流与带签名挑战的流，Innertube
+# 直取路径拿不到直链，只能借 yt-dlp 执行播放器 JS 兜底。这一组测试全部离线
+# 进行：环境探测被 mock，extract_info 用裁剪过的真实结构替代。
+
+
+def _ytdlp_env(**kwargs) -> YtDlpEnvironment:
+    """构造一个三件套齐全的环境快照，按需覆盖字段。"""
+    base = {
+        "available": True,
+        "version": "2026.08.20",
+        "needs_js_runtime": True,
+        "ejs_available": True,
+        "runtime_name": "node",
+        "runtime_version": "22.22.2",
+    }
+    base.update(kwargs)
+    return YtDlpEnvironment(**base)
+
+
+class YtDlpEnvironmentTest(unittest.TestCase):
+    """环境探测快照：ready 判定、日志摘要与处理建议。"""
+
+    def tearDown(self):
+        reset_ytdlp_environment_cache()
+
+    def test_missing_ytdlp_is_not_ready_and_advises_install(self):
+        env = YtDlpEnvironment(problems=("未安装 yt-dlp",))
+        self.assertFalse(env.ready)
+        self.assertEqual(env.summary(), "未安装 yt-dlp")
+        self.assertIn("pip install -U yt-dlp yt-dlp-ejs", env.advice())
+
+    def test_missing_ejs_advises_only_the_missing_piece(self):
+        env = _ytdlp_env(ejs_available=False, problems=("缺少 yt-dlp-ejs",))
+        self.assertFalse(env.ready)
+        self.assertIn("yt-dlp-ejs 缺失", env.summary())
+        advice = env.advice()
+        self.assertIn("pip install -U yt-dlp-ejs", advice)
+        self.assertNotIn("安装一个 JS 运行时", advice)
+
+    def test_missing_js_runtime_advises_runtime_versions(self):
+        env = _ytdlp_env(
+            runtime_name="",
+            runtime_version="",
+            problems=("没有可用的 JS 运行时",),
+        )
+        self.assertFalse(env.ready)
+        self.assertIn("无可用 JS 运行时", env.summary())
+        advice = env.advice()
+        self.assertIn("node>=22", advice)
+        self.assertIn("deno>=2.3", advice)
+
+    def test_complete_environment_is_ready_without_advice(self):
+        env = _ytdlp_env()
+        self.assertTrue(env.ready)
+        self.assertEqual(env.advice(), "")
+        summary = env.summary()
+        self.assertIn("yt-dlp 2026.08.20", summary)
+        self.assertIn("JS 运行时 node 22.22.2", summary)
+
+    def test_legacy_ytdlp_needs_no_runtime(self):
+        # 2026.08 之前的 yt-dlp 自带 jsinterp，没有 ejs / 运行时也算齐全。
+        env = YtDlpEnvironment(available=True, version="2026.03.17")
+        self.assertTrue(env.ready)
+        self.assertIn("内置 jsinterp", env.summary())
+        self.assertEqual(env.advice(), "")
+
+    def test_probe_result_is_cached_per_preference(self):
+        calls = []
+
+        def fake_probe(preference):
+            calls.append(preference)
+            return _ytdlp_env()
+
+        with mock.patch.object(ytdlp_runtime, "_probe_uncached", fake_probe):
+            probe_ytdlp_environment("node")
+            probe_ytdlp_environment("NODE")
+            probe_ytdlp_environment("deno")
+        self.assertEqual(calls, ["node", "deno"])
+
+    def test_runtime_preference_puts_deno_first(self):
+        # 与 yt-dlp 官方顺序一致，便于对照上游文档排查。
+        self.assertEqual(JS_RUNTIME_PREFERENCE[0], "deno")
+        self.assertIn("node", JS_RUNTIME_PREFERENCE)
+
+
+def _ytdlp_fmt(**kwargs) -> dict:
+    """裁剪自真实 extract_info 的 formats 条目。"""
+    fmt = {
+        "format_id": "18",
+        "url": "https://rr1.example.com/media",
+        "protocol": "https",
+        "vcodec": "none",
+        "acodec": "none",
+        "ext": "mp4",
+    }
+    fmt.update(kwargs)
+    return fmt
+
+
+PROGRESSIVE_FMT = _ytdlp_fmt(
+    format_id="18",
+    url="https://rr1.example.com/progressive",
+    vcodec="avc1.42001E",
+    acodec="mp4a.40.2",
+    height=360,
+    tbr=610,
+    filesize=3745000,
+    http_headers={"User-Agent": "Mozilla/5.0 (yt-dlp web)"},
+)
+VIDEO_1080_FMT = _ytdlp_fmt(
+    format_id="137",
+    url="https://rr1.example.com/video1080",
+    vcodec="avc1.640028",
+    height=1080,
+    tbr=4200,
+    filesize=44000000,
+    http_headers={"user-agent": "Mozilla/5.0 (yt-dlp adaptive)"},
+)
+VIDEO_720_FMT = _ytdlp_fmt(
+    format_id="136",
+    url="https://rr1.example.com/video720",
+    vcodec="avc1.4d401f",
+    height=720,
+    tbr=2100,
+    filesize=22000000,
+)
+AUDIO_FMT = _ytdlp_fmt(
+    format_id="140",
+    url="https://rr1.example.com/audio",
+    acodec="mp4a.40.2",
+    ext="m4a",
+    tbr=130,
+    filesize=1400000,
+)
+
+
+class YtDlpStreamSelectionTest(unittest.TestCase):
+    """选流：偏好顺序、清晰度上限与不可直连格式的剔除。"""
+
+    def test_dash_pair_preferred_over_progressive(self):
+        resolver = YtDlpStreamResolver(max_height=1080)
+        stream = resolver.select(
+            {"formats": [PROGRESSIVE_FMT, VIDEO_1080_FMT, AUDIO_FMT]}
+        )
+        self.assertIsInstance(stream, YtDlpStream)
+        self.assertEqual(stream.kind, "dash")
+        self.assertEqual(stream.height, 1080)
+        self.assertEqual(
+            stream.url,
+            "dash:https://rr1.example.com/video1080"
+            "||https://rr1.example.com/audio",
+        )
+        # 分离流的体积要合计，下游才能正确判断是否超过发送上限。
+        self.assertEqual(stream.filesize, 44000000 + 1400000)
+        self.assertEqual(stream.detail, "137/1080p/mp4+140/m4a")
+
+    def test_dash_disabled_falls_back_to_progressive(self):
+        resolver = YtDlpStreamResolver(max_height=1080, allow_dash=False)
+        stream = resolver.select(
+            {"formats": [PROGRESSIVE_FMT, VIDEO_1080_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.kind, "progressive")
+        self.assertEqual(stream.url, "https://rr1.example.com/progressive")
+        self.assertEqual(stream.height, 360)
+
+    def test_max_height_caps_video_track(self):
+        resolver = YtDlpStreamResolver(max_height=720)
+        stream = resolver.select(
+            {"formats": [VIDEO_1080_FMT, VIDEO_720_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.height, 720)
+        self.assertIn("video720", stream.url)
+
+    def test_zero_max_height_means_unlimited(self):
+        resolver = YtDlpStreamResolver(max_height=0)
+        stream = resolver.select(
+            {"formats": [VIDEO_1080_FMT, VIDEO_720_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.height, 1080)
+
+    def test_video_only_used_when_no_audio_track(self):
+        resolver = YtDlpStreamResolver(max_height=1080)
+        stream = resolver.select({"formats": [VIDEO_1080_FMT]})
+        self.assertEqual(stream.kind, "video_only")
+        self.assertEqual(stream.url, "https://rr1.example.com/video1080")
+
+    def test_sabr_formats_are_rejected(self):
+        # SABR 是服务端自适应分发，URL 不能直连下载。
+        sabr = _ytdlp_fmt(
+            format_id="248",
+            url="https://rr1.example.com/sabr",
+            protocol="sabr",
+            vcodec="vp9",
+            acodec="opus",
+            height=1080,
+        )
+        self.assertIsNone(YtDlpStreamResolver().select({"formats": [sabr]}))
+
+    def test_manifest_and_storyboard_formats_are_rejected(self):
+        dash_manifest = _ytdlp_fmt(
+            format_id="dash-137",
+            url="https://rr1.example.com/manifest.mpd",
+            protocol="http_dash_segments",
+            vcodec="avc1.640028",
+            height=1080,
+        )
+        hls = _ytdlp_fmt(
+            format_id="96",
+            url="https://rr1.example.com/index.m3u8",
+            protocol="m3u8_native",
+            vcodec="avc1.640028",
+            acodec="mp4a.40.2",
+            height=1080,
+        )
+        storyboard = _ytdlp_fmt(
+            format_id="sb0",
+            url="https://i.ytimg.com/sb/storyboard",
+            ext="mhtml",
+            vcodec="mhtml",
+            height=180,
+        )
+        resolver = YtDlpStreamResolver()
+        self.assertIsNone(
+            resolver.select({"formats": [dash_manifest, hls, storyboard]})
+        )
+
+    def test_non_http_url_rejected(self):
+        bogus = _ytdlp_fmt(url="ws://rr1.example.com/x", vcodec="avc1")
+        self.assertIsNone(YtDlpStreamResolver().select({"formats": [bogus]}))
+
+    def test_user_agent_read_case_insensitively(self):
+        resolver = YtDlpStreamResolver(allow_dash=False)
+        progressive = resolver.select({"formats": [PROGRESSIVE_FMT]})
+        self.assertEqual(progressive.user_agent, "Mozilla/5.0 (yt-dlp web)")
+        adaptive = resolver.select({"formats": [VIDEO_1080_FMT]})
+        self.assertEqual(adaptive.user_agent, "Mozilla/5.0 (yt-dlp adaptive)")
+
+    def test_avc_preferred_over_vp9_at_same_height(self):
+        vp9 = _ytdlp_fmt(
+            format_id="248",
+            url="https://rr1.example.com/vp9",
+            vcodec="vp09.00.40.08",
+            height=1080,
+            tbr=5000,
+        )
+        resolver = YtDlpStreamResolver(max_height=1080)
+        stream = resolver.select({"formats": [vp9, VIDEO_1080_FMT, AUDIO_FMT]})
+        # 同高度下选 avc1：ffmpeg 能直接 copy 合流，兼容性也更好。
+        self.assertIn("video1080", stream.url)
+
+    def test_empty_or_broken_info_yields_none(self):
+        resolver = YtDlpStreamResolver()
+        for info in ({}, {"formats": []}, {"formats": "nope"}, None, "x"):
+            with self.subTest(info=info):
+                self.assertIsNone(resolver.select(info))
+
+
+class YtDlpCookieJarTest(unittest.TestCase):
+    """Cookie jar：Netscape 落盘、权限收敛与按 revision 复用。"""
+
+    HEADER = "SAPISID=abc; __Secure-3PSID=def"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nova-ytdlp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.resolver = YtDlpStreamResolver(cookie_dir=self.tmp)
+
+    def test_blank_header_writes_nothing(self):
+        for raw in ("", "   ", "# only a comment"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.resolver._ensure_cookie_jar(raw, 1), "")
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_jar_written_in_netscape_format(self):
+        path = self.resolver._ensure_cookie_jar(self.HEADER, 1)
+        self.assertTrue(path.startswith(self.tmp))
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        self.assertEqual(lines[0], "# Netscape HTTP Cookie File")
+        rows = [line.split("\t") for line in lines if not line.startswith("#")]
+        self.assertEqual([row[5] for row in rows], ["SAPISID", "__Secure-3PSID"])
+        self.assertEqual([row[6] for row in rows], ["abc", "def"])
+        for row in rows:
+            self.assertEqual(row[0], ".youtube.com")
+            self.assertEqual(row[2], "/")
+            # 会话 Cookie 若写 0 会被 yt-dlp 当作已过期直接丢掉。
+            self.assertGreater(int(row[4]), 2000000000)
+
+    @unittest.skipUnless(os.name == "posix", "仅 POSIX 有真正的文件权限位")
+    def test_jar_permissions_are_owner_only(self):
+        path = self.resolver._ensure_cookie_jar(self.HEADER, 1)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_same_revision_reuses_file_without_rewriting(self):
+        path = self.resolver._ensure_cookie_jar(self.HEADER, 7)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("sentinel\n")
+        self.assertEqual(self.resolver._ensure_cookie_jar(self.HEADER, 7), path)
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "sentinel\n")
+
+    def test_new_revision_rewrites_file(self):
+        path = self.resolver._ensure_cookie_jar(self.HEADER, 7)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("sentinel\n")
+        rewritten = self.resolver._ensure_cookie_jar(self.HEADER, 8)
+        self.assertEqual(rewritten, path)
+        with open(path, encoding="utf-8") as handle:
+            self.assertIn("SAPISID", handle.read())
+
+    def test_deleted_jar_is_regenerated(self):
+        path = self.resolver._ensure_cookie_jar(self.HEADER, 7)
+        os.remove(path)
+        self.assertEqual(self.resolver._ensure_cookie_jar(self.HEADER, 7), path)
+        self.assertTrue(os.path.exists(path))
+
+    def test_no_temp_file_left_behind(self):
+        self.resolver._ensure_cookie_jar(self.HEADER, 1)
+        leftovers = [n for n in os.listdir(self.tmp) if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+
+class YtDlpOptionsTest(unittest.TestCase):
+    """yt-dlp 选项组装。"""
+
+    def tearDown(self):
+        reset_ytdlp_environment_cache()
+
+    def _options(self, env, **kwargs):
+        with mock.patch.object(
+            ytdlp_runtime, "probe_ytdlp_environment", return_value=env
+        ):
+            return YtDlpStreamResolver(**kwargs).build_options()
+
+    def test_metadata_only_and_single_video(self):
+        options = self._options(_ytdlp_env())
+        self.assertTrue(options["skip_download"])
+        self.assertTrue(options["noplaylist"])
+        self.assertTrue(options["quiet"])
+        self.assertNotIn("cookiefile", options)
+        self.assertNotIn("proxy", options)
+
+    def test_detected_runtime_is_declared_explicitly(self):
+        # yt-dlp 的 js_runtimes 默认只有 deno，装了 node 也不会被启用。
+        options = self._options(_ytdlp_env(runtime_name="node"))
+        self.assertEqual(options["js_runtimes"], {"node": {"path": None}})
+
+    def test_legacy_ytdlp_gets_no_runtime_option(self):
+        env = YtDlpEnvironment(available=True, version="2026.03.17")
+        self.assertNotIn("js_runtimes", self._options(env))
+
+    def test_socket_timeout_clamped(self):
+        self.assertEqual(
+            self._options(_ytdlp_env(), timeout=300)["socket_timeout"], 30.0
+        )
+        self.assertEqual(
+            self._options(_ytdlp_env(), timeout=12)["socket_timeout"], 12.0
+        )
+
+    def test_proxy_and_cookiefile_passed_through(self):
+        with mock.patch.object(
+            ytdlp_runtime, "probe_ytdlp_environment", return_value=_ytdlp_env()
+        ):
+            resolver = YtDlpStreamResolver(proxy=" http://127.0.0.1:7890 ")
+            options = resolver.build_options("/tmp/jar.txt")
+        self.assertEqual(options["proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(options["cookiefile"], "/tmp/jar.txt")
+
+
+class YtDlpResolveTest(unittest.TestCase):
+    """resolve 的整体行为：缺件不调用、异常只降级、Cookie 正确接入。"""
+
+    def tearDown(self):
+        reset_ytdlp_environment_cache()
+
+    def _run(self, resolver, env, extract, **kwargs):
+        with mock.patch.object(
+            ytdlp_runtime, "probe_ytdlp_environment", return_value=env
+        ), mock.patch.object(
+            YtDlpStreamResolver, "_extract_sync", staticmethod(extract)
+        ):
+            return asyncio.run(resolver.resolve(VID, **kwargs))
+
+    def test_blank_video_id_short_circuits(self):
+        calls = []
+
+        def extract(video_id, options):
+            calls.append(video_id)
+            return {}
+
+        with mock.patch.object(
+            YtDlpStreamResolver, "_extract_sync", staticmethod(extract)
+        ):
+            self.assertIsNone(asyncio.run(YtDlpStreamResolver().resolve("  ")))
+        self.assertEqual(calls, [])
+
+    def test_unready_environment_never_invokes_ytdlp(self):
+        calls = []
+
+        def extract(video_id, options):
+            calls.append(video_id)
+            return {}
+
+        env = YtDlpEnvironment(problems=("未安装 yt-dlp",))
+        self.assertIsNone(self._run(YtDlpStreamResolver(), env, extract))
+        self.assertEqual(calls, [])
+
+    def test_extract_failure_degrades_to_none(self):
+        def extract(video_id, options):
+            raise RuntimeError("Sign in to confirm you are not a bot")
+
+        self.assertIsNone(
+            self._run(YtDlpStreamResolver(), _ytdlp_env(), extract)
+        )
+
+    def test_successful_resolve_returns_selected_stream(self):
+        seen = {}
+
+        def extract(video_id, options):
+            seen["video_id"] = video_id
+            seen["options"] = options
+            return {"formats": [PROGRESSIVE_FMT, VIDEO_1080_FMT, AUDIO_FMT]}
+
+        resolver = YtDlpStreamResolver(max_height=1080)
+        stream = self._run(resolver, _ytdlp_env(), extract)
+        self.assertEqual(seen["video_id"], VID)
+        self.assertEqual(stream.kind, "dash")
+        self.assertEqual(stream.height, 1080)
+
+    def test_cookie_header_is_handed_over_as_jar(self):
+        tmp = tempfile.mkdtemp(prefix="nova-ytdlp-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        seen = {}
+
+        def extract(video_id, options):
+            seen["options"] = options
+            return {"formats": [PROGRESSIVE_FMT]}
+
+        resolver = YtDlpStreamResolver(cookie_dir=tmp, allow_dash=False)
+        stream = self._run(
+            resolver,
+            _ytdlp_env(),
+            extract,
+            cookie_header="SAPISID=abc",
+            cookie_revision=3,
+        )
+        self.assertEqual(stream.kind, "progressive")
+        jar = seen["options"]["cookiefile"]
+        self.assertTrue(os.path.exists(jar))
+        with open(jar, encoding="utf-8") as handle:
+            self.assertIn("SAPISID", handle.read())
+
+    def test_no_direct_stream_returns_none(self):
+        def extract(video_id, options):
+            return {"formats": [_ytdlp_fmt(protocol="sabr", vcodec="vp9")]}
+
+        self.assertIsNone(
+            self._run(YtDlpStreamResolver(), _ytdlp_env(), extract)
+        )

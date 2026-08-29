@@ -2,6 +2,57 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.10.0 (2026-08-29)
+
+### YouTube：疑难视频不再只有一张封面
+
+上一版把 Cookie 做到了长期免维护，但线上很快撞到一类更棘手的视频：**Cookie 已经正确鉴权、服务端也确认已登录，`playabilityStatus` 甚至是 `OK`，却依然一个可下载的流都拿不到**。逐客户端探针查清了原因——YouTube 给 Web 端下发的是 **SABR**（服务端自适应码率）分发：`adaptiveFormats` 的 32 条里既没有 `url` 也没有 `signatureCipher`，唯一那条 progressive 流只给 `signatureCipher`，必须真的执行播放器 JS 才能还原直链；而 `tv` / `mweb` / `web_creator` 返回 `UNPLAYABLE`，`ios` / `android_vr` 压根不支持带 Cookie。等于说，这类视频在纯 Innertube 的路子上是死路。
+
+- **新增第 ④ 层兜底 `YtDlpStreamResolver`（`nova_core/parser/runtime_manager/youtube/ytdlp.py`）**：前三层一路都没取到流时，交给 yt-dlp 执行播放器 JS 解出可直连地址。之所以复用 yt-dlp 而不是自己实现签名还原与 PO Token，是因为上游每隔几周就换一次算法，把维护成本转移给上游远比追着改划算
+- **接入点刻意排在头像 / 热评抓取之后**：兜底要跑数秒并拉起一个 JS 运行时子进程，先把增强层的内容拿到手，才不会因为兜底耗时把卡片内容拖没。正常视频完全不进这一层，不产生任何额外开销
+- **登录态自动接力**：把 Cookie 运行时里当前那份（含已吸收的轮换值）写成 Netscape cookies.txt 交给 yt-dlp，落在缓存目录下、权限 `0600`、原子写入，并按 Cookie 的 revision 做缓存——只有真的轮换过才重写文件。不需要额外为 yt-dlp 准备一份 Cookie
+- **选流偏好与主路完全一致**：dash 分离流 > progressive 单文件 > 仅视频轨，同样受「画质上限」「允许 dash 分离流」约束，编解码器优先级也沿用 avc1 > vp9 > av01 / mp4a > opus > vorbis
+- **直链与 UA 绑定**：yt-dlp 取链时用的 User-Agent 会被带回来重建下载请求头，否则 googlevideo 必定 403
+- **串行化**：同一时刻只允许一个兜底任务，避免多条链接同时拉起多个 JS 运行时把 CPU 打满；单次上限默认 60 秒且**不占**解析总预算
+
+### 缺件时说清缺哪件，而不是静默失败
+
+这条链路需要三件套：`yt-dlp` ≥ 2026.08.19、`yt-dlp-ejs`、以及一个 JS 运行时（node ≥ 22 / deno ≥ 2.3 / bun ≥ 1.2.11 / quickjs）。只装 yt-dlp 是不够的，但从报错里完全看不出来这一点。
+
+- **新增环境探测 `probe_ytdlp_environment`**：按运行时偏好缓存结果，区分「没装 yt-dlp」「缺 yt-dlp-ejs」「有注册表但没有可用运行时」「版本太老、自带 jsinterp 无需外部运行时」四种状态
+- 缺件时**只安静降级、绝不抛错**，并在日志与降级 WARNING 里给出可直接照做的建议（缺哪件就说装哪件，附具体命令与最低版本号）；同一种缺件只提醒一次，不刷屏
+- **踩到并绕过了一个很隐蔽的坑**：yt-dlp 的 `js_runtimes` 默认值只有 `deno`，机器上装了 node 也不会被启用（表现为 `JS runtimes: none`）。插件现在总把探测到的运行时显式写进选项
+- yt-dlp 自身的输出全部降到 DEBUG；兜底成功在 INFO 留一行摘要（流类型、清晰度、格式、耗时）
+
+### 修复
+
+- **选流会把 DASH / HLS 清单误当成可直连流**：`_is_direct` 原来只判断 `protocol` 是否以 `http` 开头，而 `http_dash_segments` 同样以 http 开头——命中时下游拿到的会是一个 `.mpd` 清单文件而不是视频。改为精确白名单 `{http, https}`，`m3u8_native` 一并排除（写测试时发现的）
+
+### 配置
+
+- 新增 `youtube.ytdlp_fallback`（默认开）、`youtube.ytdlp_js_runtime`（默认 `auto`，可指定 deno / node / bun / quickjs）、`youtube.ytdlp_timeout`（默认 60 秒，夹在 10–300）
+
+### 文档
+
+- README 的 YouTube 链路图从三层改成四层，新增「疑难视频的 yt-dlp 兜底」整节：SABR 的成因、三件套安装步骤、`--js-runtimes` 默认只有 deno 的坑、**兜底仍然需要 Cookie**（实测装齐三件套但匿名依旧撞门禁）、以及行为细节
+- 依赖章节写明 yt-dlp **刻意不进 `requirements.txt`**：只有 YouTube 疑难视频用得到，缺了就降级
+- 撤掉「不依赖 yt-dlp」这句已经不成立的表述，并把「不实现 PO token / 签名还原」改成「这份维护成本转交给 yt-dlp」
+
+### 测试
+
+- 新增 39 个用例：环境探测的四种状态与建议文案、探测结果按偏好缓存、Cookie jar 的 Netscape 格式 / `0600` 权限 / 按 revision 复用与重写 / 文件被删后重建 / 不留 `.tmp`、选流的 dash 优先与 `allow_dash=False` 回退、清晰度上限、SABR 与清单与 storyboard 的剔除、同高度下 avc1 优先、UA 大小写不敏感读取，以及 `resolve` 在环境缺件时根本不调用 yt-dlp、异常与空结果只降级、Cookie 正确落成 jar
+- 全量 399 passed + 93 subtests（其中 1 项文件权限断言只在 POSIX 上跑）
+
+## v1.9.2 (2026-08-29)
+
+### 修复：整段 cookies.txt 粘进面板后换行被吞掉
+
+AstrBot WebUI 里 `type=string` 的配置项是单行输入框，把多行 cookies.txt 整段粘进去，换行会被压成空格：文本塌成一行、首字符还是注释号 `#`，按行解析一条都取不到，于是静默退回匿名请求。线上真实踩到过。
+
+- `normalize_cookie_input` 现在能从被折叠成一行的 Netscape 文本里还原出 Cookie：制表符保留的情况按制表符切，制表符也被换成空格的情况按「域名 / TRUE / 路径 / 布尔 / 时间戳 / 名 / 值」的字段模式切，注释头与 `#HttpOnly_` 前缀一并跳过
+- 空值 Cookie（如 `YSC`）不会因为少一列而被丢掉
+- 只有识别出 Netscape 特征才会改写，形如 `PREF=hl TRUE en; SAPISID=abc` 的普通请求头原样保留
+
 ## v1.9.1 (2026-08-29)
 
 ### 修复：按 README 的步骤导出 Cookie，粘进配置却不生效
@@ -24,6 +75,7 @@
 
 - 新增 12 个用例：请求头原样返回、空值 / 空白 / BOM、多行粘贴折叠、Netscape 三种变体（注释行、`#HttpOnly_` 前缀、空值行、空格代替制表符）、JSON 数组与 `cookies` 包裹变体、JSON 里无名条目跳过、坏 JSON 回退按请求头处理，以及归一化结果能正常驱动 SAPISIDHASH 鉴权
 - 全量 354 passed + 82 subtests
+
 ## v1.9.0 (2026-08-29)
 
 ### 让 YouTube Cookie 从「隔几天就得重导」变成长期免维护

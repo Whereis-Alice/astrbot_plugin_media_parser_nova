@@ -33,8 +33,11 @@ from ...types import MediaMetadata
 from ..runtime_manager.youtube import (
     YOUTUBE_ORIGIN,
     YouTubeCookieRuntime,
+    YtDlpStream,
+    YtDlpStreamResolver,
     build_sapisid_authorization,
     parse_cookie_header,
+    probe_ytdlp_environment,
 )
 from ..utils import build_request_headers
 
@@ -1318,6 +1321,10 @@ class YouTubeParser(BaseVideoParser):
         cookie_alert_enabled: bool = False,
         cookie_state_file: str = "",
         cookie_auto_refresh: bool = True,
+        ytdlp_fallback: bool = True,
+        ytdlp_js_runtime: str = "auto",
+        ytdlp_timeout: int = 60,
+        ytdlp_cookie_dir: str = "",
     ):
         super().__init__("youtube")
         self.cookie = (cookie or "").strip()
@@ -1339,6 +1346,12 @@ class YouTubeParser(BaseVideoParser):
         self.cookie_alert_enabled = bool(cookie_alert_enabled)
         self._cookie_alert_pending = False
         self._cookie_alert_reason = ""
+        # yt-dlp 兜底：Innertube 取不到流时才启用，见 _resolve_with_ytdlp。
+        self.ytdlp_fallback = bool(ytdlp_fallback)
+        self.ytdlp_js_runtime = (ytdlp_js_runtime or "auto").strip() or "auto"
+        self.ytdlp_timeout = max(10, _as_int(ytdlp_timeout) or 60)
+        self.ytdlp_cookie_dir = (ytdlp_cookie_dir or "").strip()
+        self._ytdlp: Optional[YtDlpStreamResolver] = None
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         if self.cookie and not self.cookie_authenticated:
             recognized = len(parse_cookie_header(self.cookie))
@@ -1382,6 +1395,63 @@ class YouTubeParser(BaseVideoParser):
         if cookie_expired:
             return "；处理建议: 重新导出 YouTube Cookie（现有 Cookie 已失效）"
         return ""
+
+    def _ytdlp_advice(self) -> str:
+        """兜底链路没开或缺件时，把可操作建议一并写进降级告警。"""
+        if not self.ytdlp_fallback:
+            return (
+                "；提示: 打开配置项 youtube.ytdlp_fallback 可用 yt-dlp 兜底"
+                "解析被门禁挡下的视频"
+            )
+        env = probe_ytdlp_environment(self.ytdlp_js_runtime)
+        if env.ready:
+            return ""
+        return f"；yt-dlp 兜底不可用（{env.summary()}）{env.advice()}"
+
+    def _ytdlp_resolver(self) -> Optional[YtDlpStreamResolver]:
+        """惰性构造 yt-dlp 兜底解析器；未启用时返回 None。"""
+        if not self.ytdlp_fallback:
+            return None
+        if self._ytdlp is None:
+            self._ytdlp = YtDlpStreamResolver(
+                proxy=self.proxy,
+                max_height=self.max_height,
+                allow_dash=self.allow_dash,
+                timeout=self.ytdlp_timeout,
+                js_runtime=self.ytdlp_js_runtime,
+                cookie_dir=self.ytdlp_cookie_dir,
+            )
+        return self._ytdlp
+
+    async def _resolve_with_ytdlp(self, video_id: str) -> Optional[YtDlpStream]:
+        """走 yt-dlp 兜底取流：成功打一行摘要，失败只返回 None 继续降级。"""
+        resolver = self._ytdlp_resolver()
+        if resolver is None:
+            return None
+        started = time.time()
+        try:
+            stream = await resolver.resolve(
+                video_id,
+                cookie_header=self.cookie_runtime.header(),
+                cookie_revision=self.cookie_runtime.revision,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"[youtube] yt-dlp 兜底异常: video_id={video_id}; "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        if stream is None:
+            return None
+        logger.info(
+            f"[youtube] yt-dlp 兜底取流成功: video_id={video_id} "
+            f"流={stream.kind}@{stream.height}p "
+            f"格式={stream.detail or self._NA} "
+            f"耗时={time.time() - started:.2f}s"
+        )
+        return stream
 
     def consume_cookie_alert(self) -> Optional[str]:
         """读取并消费一次待通知的 Cookie 失效原因。"""
@@ -1911,6 +1981,31 @@ class YouTubeParser(BaseVideoParser):
         if not avatar_url:
             avatar_url = upscale_avatar_url(self._extract_avatar_url(player))
 
+        # 第 4 层：Innertube 一路都没拿到流时，交给 yt-dlp 兜底。
+        #
+        # YouTube 现在给 Web 端下发的基本都是 SABR 流与带签名挑战的流，必须
+        # 真的执行播放器 JS 才能还原直链。这活儿借 yt-dlp 做，比自己追着上游
+        # 改签名算法划算得多。刻意放在增强层之后：兜底要跑数秒并拉起 JS 运行
+        # 时子进程，先把头像/热评拿到手，才不会因为兜底耗时把卡片内容拖没。
+        used_ytdlp = False
+        ytdlp_detail = ""
+        if not media_url:
+            stream = await self._resolve_with_ytdlp(video_id)
+            if stream is not None and stream.url:
+                media_url = stream.url
+                media_kind = stream.kind
+                media_height = stream.height
+                ytdlp_detail = stream.detail
+                used_ytdlp = True
+                if stream.user_agent:
+                    # yt-dlp 的直链与它取链时用的 UA 绑定，换 UA 会被 403。
+                    video_headers = build_request_headers(
+                        is_video=True,
+                        referer="https://www.youtube.com/",
+                        origin="https://www.youtube.com",
+                        user_agent=stream.user_agent,
+                    )
+
         # 无可下载流时退化为封面卡片，并说明原因。
         limit_warnings: List[str] = []
         status_code = ""
@@ -1972,6 +2067,7 @@ class YouTubeParser(BaseVideoParser):
         metadata["youtube_channel_id"] = channel_id
         metadata["youtube_stream_kind"] = media_kind
         metadata["youtube_player_client"] = player_client
+        metadata["youtube_stream_source"] = "ytdlp" if used_ytdlp else "innertube"
 
         # 登录态诊断：cookie 被服务端当成未登录时必须显式告警，否则用户只会
         # 看到一张「仅展示封面」的卡片，日志里却毫无线索。
@@ -2002,6 +2098,7 @@ class YouTubeParser(BaseVideoParser):
                 f"[youtube] 未取到可下载视频流，已降级为封面卡片: "
                 f"{limit_warnings[0]}（{diagnosis}）"
                 f"{self._gate_advice(status_code, cookie_expired)}"
+                f"{self._ytdlp_advice()}"
                 f"；降级链: {chain}"
             )
         else:
@@ -2018,7 +2115,9 @@ class YouTubeParser(BaseVideoParser):
         logger.info(
             f"[youtube] 解析完成 video_id={video_id} "
             f"标题={title[:40]} 作者={author} "
-            f"流={media_kind}@{media_height}p client={player_client or 'n/a'} "
+            f"流={media_kind}@{media_height}p "
+            f"取流={'yt-dlp ' + ytdlp_detail if used_ytdlp else 'innertube'} "
+            f"client={player_client or self._NA} "
             f"热评={len(hot_comments)} 耗时={time.time() - started:.2f}s"
         )
         return metadata

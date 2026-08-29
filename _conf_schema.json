@@ -921,7 +921,7 @@
     "youtube": {
         "description": "YouTube 设置",
         "type": "object",
-        "hint": "解析走 YouTube 官方 Innertube 接口，不依赖 yt-dlp。dash 分离流需要服务器安装 ffmpeg（与 B 站共用同一依赖）；取不到可下载的流时会自动退化成封面卡片而不是报错。机房 IP 上较容易撞到 YouTube 的机器人门禁，建议配合下面的 Cookie 或住宅代理使用。",
+        "hint": "解析主路走 YouTube 官方 Innertube 接口，轻量且不依赖外部程序；官方接口拿不到可直连流时（现在相当常见，YouTube 大量改用 SABR 分发）再交给 yt-dlp 兜底，见下面的「疑难视频用 yt-dlp 兜底取流」。dash 分离流需要服务器安装 ffmpeg（与 B 站共用同一依赖）；两条路都取不到流时会退化成封面卡片而不是报错。机房 IP 上较容易撞到 YouTube 的机器人门禁，建议配合下面的 Cookie 或住宅代理使用。",
         "items": {
             "max_height": {
                 "description": "画质上限",
@@ -985,6 +985,31 @@
                 "type": "int",
                 "hint": "长时间没有 YouTube 解析请求时，插件会按这个间隔主动向 youtube.com 发一次带登录态的轻量请求，触发并吸收服务端的 Cookie 轮换，避免会话因长期沉默被判过期；同时会顺带检查登录态，失效时按上面的设置提醒管理员。默认 6 小时，最大 168；填 0 关闭主动保鲜（仍会在每次解析时跟进轮换）。",
                 "default": 6
+            },
+            "ytdlp_fallback": {
+                "description": "疑难视频用 yt-dlp 兜底取流（推荐开启）",
+                "type": "bool",
+                "hint": "YouTube 现在给不少视频只下发 SABR 流或带签名挑战的流，官方 Innertube 接口拿不到可直连地址，只能出封面卡片。开启本项后，这类视频会再交给 yt-dlp 解一次（它会执行播放器 JS 还原签名），成功率显著提高。常规视频不受影响：只有 Innertube 一路都取不到流时才会走这条兜底，所以不会拖慢日常解析。前置条件：AstrBot 所用的 Python 环境里装有 yt-dlp（建议 2026.08.19 及以上）与 yt-dlp-ejs，且服务器上装有一个 JS 运行时（Node.js ≥ 22 或 Deno ≥ 2.3，二者装其一即可）；缺件时插件会在日志里给出具体的安装建议并安静退回封面卡片。",
+                "default": true
+            },
+            "ytdlp_js_runtime": {
+                "description": "yt-dlp 使用的 JS 运行时",
+                "type": "string",
+                "options": [
+                    "auto",
+                    "deno",
+                    "node",
+                    "bun",
+                    "quickjs"
+                ],
+                "hint": "auto 表示自动挑一个可用的（优先级 deno > node > bun > quickjs），绝大多数情况保持 auto 即可。注意 yt-dlp 自己的默认值只认 deno，装了 Node 也不会启用，本插件已替你显式指定，所以不需要为此手动改这一项；只有你想强制用某个运行时时才需要指定。",
+                "default": "auto"
+            },
+            "ytdlp_timeout": {
+                "description": "yt-dlp 兜底超时（秒）",
+                "type": "int",
+                "hint": "兜底解析要执行播放器 JS，通常 5～10 秒，网络差或视频复杂时更久。超时后放弃兜底并退回封面卡片。有效范围 10～300。",
+                "default": 60
             }
         }
     },

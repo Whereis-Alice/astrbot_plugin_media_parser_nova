@@ -536,6 +536,10 @@ class YouTubeConfig:
     cookie_auto_refresh: bool = True
     cookie_keepalive_hours: int = 6
     cookie_runtime_file: str = ""
+    ytdlp_fallback: bool = True
+    ytdlp_js_runtime: str = "auto"
+    ytdlp_timeout: int = 60
+    ytdlp_runtime_dir: str = ""
 
 
 @dataclass
@@ -1218,6 +1222,30 @@ class ConfigManager:
                     and youtube_cookie_auto_refresh
                 ),
             ),
+            ytdlp_fallback=self._parse_bool(
+                youtube_raw.get("ytdlp_fallback", True),
+                True,
+                "youtube.ytdlp_fallback",
+            ),
+            ytdlp_js_runtime=(
+                str(youtube_raw.get("ytdlp_js_runtime", "") or "auto")
+                .strip()
+                .lower()
+                or "auto"
+            ),
+            ytdlp_timeout=min(
+                300,
+                max(
+                    10,
+                    self._parse_non_negative_int(
+                        youtube_raw.get("ytdlp_timeout", 60), 60
+                    ),
+                ),
+            ),
+            ytdlp_runtime_dir=self._build_youtube_runtime_dir(
+                cache_dir,
+                enabled=cache_dir_available,
+            ),
         )
 
         # --- proxy ---
@@ -1423,6 +1451,10 @@ class ConfigManager:
                 ),
                 cookie_state_file=self.youtube.cookie_runtime_file,
                 cookie_auto_refresh=self.youtube.cookie_auto_refresh,
+                ytdlp_fallback=self.youtube.ytdlp_fallback,
+                ytdlp_js_runtime=self.youtube.ytdlp_js_runtime,
+                ytdlp_timeout=self.youtube.ytdlp_timeout,
+                ytdlp_cookie_dir=self.youtube.ytdlp_runtime_dir,
             )
             parsers.append(self.youtube_parser)
 
@@ -1451,6 +1483,22 @@ class ConfigManager:
             )
             return ""
         return os.path.join(cookie_dir, "cookie.json")
+
+    @staticmethod
+    def _build_youtube_runtime_dir(cache_dir: str, enabled: bool) -> str:
+        """给 YouTube 兜底链路（yt-dlp 的 Cookie jar）挑一个可写目录。
+
+        目录不可用时返回空串，届时 jar 落到系统临时目录，功能不受影响。
+        """
+        if not enabled or not cache_dir:
+            return ""
+        runtime_dir = Config.build_runtime_dir(cache_dir, "youtube")
+        try:
+            os.makedirs(runtime_dir, exist_ok=True)
+        except Exception as exc:
+            logger.debug(f"YouTube 运行时目录不可用，改用系统临时目录: {exc}")
+            return ""
+        return runtime_dir
 
     @staticmethod
     def _parse_parser_outputs(values) -> Dict[str, str]:
