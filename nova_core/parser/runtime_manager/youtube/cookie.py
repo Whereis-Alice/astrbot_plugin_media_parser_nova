@@ -184,6 +184,67 @@ def _cookies_from_json(text: str) -> Dict[str, str]:
     return jar
 
 
+_NETSCAPE_BOOLS = frozenset(("TRUE", "FALSE"))
+
+
+def _looks_like_netscape(text: str) -> bool:
+    """粗判一段文本是不是 cookies.txt（不要求换行还在）。"""
+    if "\t" in text or _HTTPONLY_PREFIX in text or "# Netscape" in text:
+        return True
+    upper = text.upper()
+    return " TRUE " in upper or " FALSE " in upper
+
+
+def _is_netscape_record_start(fields: List[str], index: int) -> bool:
+    """判断 fields[index] 是不是一条 cookies.txt 记录的起点（域名字段）。"""
+    if index + 5 >= len(fields):
+        return False
+    domain = fields[index]
+    if domain.startswith(_HTTPONLY_PREFIX):
+        domain = domain[len(_HTTPONLY_PREFIX):]
+    if not domain or domain.startswith("/") or domain.startswith("#"):
+        return False
+    if "." not in domain and domain != "localhost":
+        return False
+    if fields[index + 1].upper() not in _NETSCAPE_BOOLS:
+        return False
+    if not fields[index + 2].startswith("/"):
+        return False
+    if fields[index + 3].upper() not in _NETSCAPE_BOOLS:
+        return False
+    return fields[index + 4].lstrip("-").isdigit()
+
+
+def _cookies_from_netscape_stream(text: str) -> Dict[str, str]:
+    """解析换行被吞掉的 cookies.txt。
+
+    AstrBot WebUI 的单行输入框会把粘贴内容里的换行压成空格，于是整份
+    cookies.txt 塌成一行、首字符还是注释号，按行解析会一条都取不到，
+    最后静默退回匿名请求。这里改成按字段流式扫描：靠
+    "域名 TRUE 路径 TRUE 过期时间" 这个结构特征定位每条记录的起点，
+    因此不依赖换行是否还在。
+    """
+    fields = text.split()
+    jar: Dict[str, str] = {}
+    index = 0
+    total = len(fields)
+    while index < total:
+        if not _is_netscape_record_start(fields, index):
+            index += 1
+            continue
+        name = fields[index + 5]
+        cursor = index + 6
+        value = ""
+        # 空值 cookie 只有 6 个字段，此时下一个字段已经是新记录的起点。
+        if cursor < total and not _is_netscape_record_start(fields, cursor):
+            value = fields[cursor]
+            cursor += 1
+        if name:
+            jar[name] = value
+        index = cursor
+    return jar
+
+
 def normalize_cookie_input(raw: str) -> str:
     """把用户可能填进配置的各种 Cookie 形态统一成 Cookie 请求头。
 
@@ -194,6 +255,9 @@ def normalize_cookie_input(raw: str) -> str:
 
     现在三种格式都收，统一转成请求头字符串；已经是请求头的原样返回（只
     折叠掉粘贴时带进来的换行与多余空白），保证不会破坏既有配置。
+
+    另外 AstrBot WebUI 的单行输入框会把粘贴内容的换行压成空格，cookies.txt
+    会因此塌成一行，所以按行解析失败后还要再按字段结构扫一遍。
     """
     text = (raw or "").strip().lstrip("\ufeff").strip()
     if not text:
@@ -201,8 +265,10 @@ def normalize_cookie_input(raw: str) -> str:
     jar: Dict[str, str] = {}
     if text[:1] in ("[", "{"):
         jar = _cookies_from_json(text)
-    if not jar and ("\t" in text or _HTTPONLY_PREFIX in text or "# Netscape" in text):
+    if not jar and _looks_like_netscape(text):
         jar = _cookies_from_netscape(text)
+        if not jar:
+            jar = _cookies_from_netscape_stream(text)
     if not jar and "\n" in text and "=" not in text.split("\n", 1)[0]:
         jar = _cookies_from_netscape(text)
     if jar:

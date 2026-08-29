@@ -1634,3 +1634,66 @@ class CookieInputNormalizationTest(unittest.TestCase):
         runtime = YouTubeCookieRuntime(normalize_cookie_input(raw))
         self.assertTrue(runtime.authenticated)
         self.assertEqual(runtime.header(), "SAPISID=abc")
+
+    # ── 换行被 WebUI 吞掉的整段粘贴 ──────────────────────
+
+    # AstrBot WebUI 里 type=string 的配置项是单行输入框，整段 cookies.txt
+    # 粘进去以后换行会被压成空格：文本塌成一行、首字符还是注释号，按行
+    # 解析会一条都取不到，于是静默退回匿名请求（线上真实踩到过）。
+    COLLAPSED_HEAD = "# Netscape HTTP Cookie File"
+
+    def test_single_line_netscape_paste_keeps_tabs_is_recovered(self):
+        raw = " ".join(
+            (
+                self.COLLAPSED_HEAD,
+                "# https://curl.haxx.se/rfc/cookie_spec.html",
+                "# This is a generated file! Do not edit.",
+                ".youtube.com	TRUE	/	TRUE	1800000000	SAPISID	abc",
+                ".youtube.com	TRUE	/	TRUE	1800000000	__Secure-3PSID	def",
+                ".youtube.com	TRUE	/	FALSE	1800000000	SIDCC	ghi",
+            )
+        )
+        self.assertNotIn("\n", raw)
+        self.assertEqual(normalize_cookie_input(raw), self.HEADER)
+
+    def test_single_line_netscape_paste_without_tabs_is_recovered(self):
+        raw = " ".join(
+            (
+                self.COLLAPSED_HEAD,
+                ".youtube.com TRUE / TRUE 1800000000 SAPISID abc",
+                "#HttpOnly_.youtube.com TRUE / TRUE 1800000000"
+                " __Secure-3PSID def",
+                ".youtube.com TRUE / FALSE 1800000000 SIDCC ghi",
+            )
+        )
+        self.assertEqual(normalize_cookie_input(raw), self.HEADER)
+
+    def test_collapsed_paste_keeps_empty_value_cookie(self):
+        raw = " ".join(
+            (
+                self.COLLAPSED_HEAD,
+                ".youtube.com	TRUE	/	TRUE	0	YSC",
+                ".youtube.com	TRUE	/	TRUE	1800000000	SAPISID	abc",
+            )
+        )
+        self.assertEqual(normalize_cookie_input(raw), "YSC=; SAPISID=abc")
+
+    def test_collapsed_paste_drives_sapisid_authorization(self):
+        raw = " ".join(
+            (
+                self.COLLAPSED_HEAD,
+                ".youtube.com	TRUE	/	FALSE	1800000000	HSID	hs",
+                ".youtube.com	TRUE	/	TRUE	1800000000	SAPISID	abc",
+            )
+        )
+        runtime = YouTubeCookieRuntime(normalize_cookie_input(raw))
+        self.assertTrue(runtime.authenticated)
+        self.assertEqual(runtime.names(), ("HSID", "SAPISID"))
+
+    def test_header_containing_the_word_true_is_left_alone(self):
+        raw = "PREF=hl TRUE en; SAPISID=abc"
+        self.assertEqual(normalize_cookie_input(raw), raw)
+
+    def test_comment_only_text_yields_no_cookies(self):
+        raw = " ".join((self.COLLAPSED_HEAD, "# nothing useful here"))
+        self.assertEqual(parse_cookie_header(normalize_cookie_input(raw)), {})

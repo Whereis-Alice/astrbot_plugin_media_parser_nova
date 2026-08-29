@@ -1341,10 +1341,13 @@ class YouTubeParser(BaseVideoParser):
         self._cookie_alert_reason = ""
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         if self.cookie and not self.cookie_authenticated:
+            recognized = len(parse_cookie_header(self.cookie))
             logger.warning(
-                "[youtube] 已配置 cookie，但其中找不到 SAPISID / "
-                "__Secure-3PAPISID，无法生成 SAPISIDHASH 鉴权头，"
-                "本次仍按匿名请求处理"
+                f"[youtube] 已配置 cookie（识别出 {recognized} 项），但其中"
+                "找不到 SAPISID / __Secure-3PAPISID，无法生成 SAPISIDHASH "
+                "鉴权头，本次仍按匿名请求处理；常见原因是只粘贴了片段、"
+                "或导出时并不处于登录状态，请在已登录的窗口里重新整段导出 "
+                "cookies.txt 再填入 youtube.cookie"
             )
 
     _NA = "n/a"
