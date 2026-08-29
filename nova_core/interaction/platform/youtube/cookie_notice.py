@@ -15,6 +15,10 @@ from ...base import AdminAssistManager
 _REASON_TEXTS = {
     "player_login_required": "视频仍被 YouTube 机器人验证挡下（playabilityStatus=LOGIN_REQUIRED）",
     "innertube_logged_out": "Innertube 返回 loggedOut=true，服务端已把当前 Cookie 当成未登录",
+    "keepalive_logged_out": (
+        "定期 Cookie 保鲜请求被 YouTube 判定为未登录，"
+        "说明这份 Cookie 已经无法靠自动跟进轮换救回来"
+    ),
 }
 
 
@@ -77,10 +81,12 @@ class YouTubeCookieNoticeManager(AdminAssistManager):
                 "检测到 YouTube Cookie 已失效，视频解析会退化成只发封面。",
                 f"原因: {self.describe_reason(reason)}",
                 "处理方式（YouTube 无法扫码登录，只能手动更新）:",
-                "1. 用无痕窗口登录 YouTube；",
+                "1. 用无痕窗口登录 YouTube 小号；",
                 "2. 在同一标签页打开 youtube.com/robots.txt，用 Cookie 导出扩展导出；",
                 "3. 把导出的 Cookie 填进插件配置 youtube.cookie；",
                 "4. 直接关掉整个无痕窗口，千万不要点登出（登出会作废这份 Cookie）。",
+                "重新填一次之后插件会自动跟进服务端的 Cookie 轮换，正常情况下不需要再定期回来更新。",
+                "如果这条提醒反复出现，多半是出口 IP 信誉问题，建议给 proxy.youtube 配住宅代理。",
                 f"本提醒 {cooldown_minutes} 分钟内只发一次。",
             ]
         )

@@ -79,6 +79,7 @@ class MediaParserNovaPlugin(Star):
         self.message_sender = MessageSender()
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._expired_cleanup_task: Optional[asyncio.Task] = None
+        self._youtube_keepalive_task: Optional[asyncio.Task] = None
         self._active_media_flows = 0
         self._cache_cleanup_lock = asyncio.Lock()
         rate_limit = cfg.parse_rate_limit
@@ -112,11 +113,13 @@ class MediaParserNovaPlugin(Star):
         )
 
     async def initialize(self):
-        """事件循环就绪后再启动后台清理任务（__init__ 阶段无运行中的事件循环）。"""
+        """事件循环就绪后再启动后台任务（__init__ 阶段无运行中的事件循环）。"""
         self._start_expired_cache_cleanup()
+        self._start_youtube_cookie_keepalive()
 
     async def terminate(self):
         await self._shutdown_expired_cache_cleanup()
+        await self._shutdown_youtube_cookie_keepalive()
         await self._shutdown_delayed_cleanups()
         await self.admin_cookie_assist.shutdown()
         await self.youtube_cookie_notice.shutdown()
@@ -260,6 +263,93 @@ class MediaParserNovaPlugin(Star):
     async def _shutdown_expired_cache_cleanup(self):
         task = self._expired_cleanup_task
         self._expired_cleanup_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    # ── YouTube Cookie 保鲜 ─────────────────────────────
+
+    def _youtube_keepalive_enabled(self) -> bool:
+        """只有配置了 Cookie 且保鲜间隔为正数时才需要后台保鲜任务。"""
+        if self.youtube_parser is None:
+            return False
+        cfg = self.config_manager
+        if not cfg.youtube.cookie:
+            return False
+        try:
+            return int(cfg.youtube.cookie_keepalive_hours) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _youtube_keepalive_interval(self) -> int:
+        hours = self.config_manager.youtube.cookie_keepalive_hours
+        try:
+            hours = int(hours)
+        except (TypeError, ValueError):
+            hours = 6
+        return max(1, min(hours, 168)) * 3600
+
+    async def _youtube_cookie_keepalive_once(self) -> None:
+        """跑一次保鲜请求：吸收服务端轮换并顺带体检登录态。"""
+        parser = self.youtube_parser
+        if parser is None:
+            return
+        cfg = self.config_manager
+        trusted_proxies = [cfg.proxy.address] if cfg.proxy.address else []
+        connector = create_public_only_connector(
+            trusted_proxy_urls=trusted_proxies,
+        )
+        try:
+            session = aiohttp.ClientSession(connector=connector)
+        except BaseException:
+            # 会话构造失败时不会接管 connector，需手动关闭避免连接器泄漏。
+            await connector.close()
+            raise
+        async with session:
+            logged_in, detail = await parser.keepalive_cookie(session)
+        summary = f"[youtube] Cookie 保鲜: {detail}；{parser.cookie_status_line()}"
+        if logged_in is False:
+            self.logger.warning(summary + "；请重新导出 YouTube Cookie")
+            self.youtube_cookie_notice.trigger_assist_request(
+                "keepalive_logged_out"
+            )
+        else:
+            self.logger.info(summary)
+
+    async def _youtube_cookie_keepalive_loop(self) -> None:
+        try:
+            while True:
+                # 启动后先立刻跑一次，既能校验 Cookie 健康度，
+                # 也能把长时间沉默期间积累的轮换补上。
+                try:
+                    await self._youtube_cookie_keepalive_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"[youtube] Cookie 保鲜失败: {e!r}")
+                await asyncio.sleep(self._youtube_keepalive_interval())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[youtube] Cookie 保鲜任务异常退出: {e!r}")
+
+    def _start_youtube_cookie_keepalive(self) -> None:
+        task = self._youtube_keepalive_task
+        if task and not task.done():
+            return
+        if not self._youtube_keepalive_enabled():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._youtube_keepalive_task = loop.create_task(
+            self._youtube_cookie_keepalive_loop()
+        )
+
+    async def _shutdown_youtube_cookie_keepalive(self) -> None:
+        task = self._youtube_keepalive_task
+        self._youtube_keepalive_task = None
         if task and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -844,6 +934,7 @@ class MediaParserNovaPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def auto_parse(self, event: AstrMessageEvent):
         self._start_expired_cache_cleanup()
+        self._start_youtube_cookie_keepalive()
         cfg = self.config_manager
         self.admin_cookie_assist.try_update_admin_origin(event)
         self.youtube_cookie_notice.try_update_admin_origin(event)

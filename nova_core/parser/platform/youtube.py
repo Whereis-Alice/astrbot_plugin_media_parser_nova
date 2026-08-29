@@ -17,7 +17,6 @@ YouTube 视频解析器。
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import time
@@ -31,6 +30,12 @@ from .base import BaseVideoParser
 from ...constants import Config
 from ...logger import logger
 from ...types import MediaMetadata
+from ..runtime_manager.youtube import (
+    YOUTUBE_ORIGIN,
+    YouTubeCookieRuntime,
+    build_sapisid_authorization,
+    parse_cookie_header,
+)
 from ..utils import build_request_headers
 
 
@@ -244,13 +249,9 @@ COOKIE_PLAYER_CLIENTS: Tuple[str, ...] = (
 # 它们不参与选流，只负责把标题/作者/时长/播放量补回来。
 METADATA_PLAYER_CLIENTS: Tuple[str, ...] = ("tv_simply",)
 
-# SAPISIDHASH 鉴权用到的 cookie 名，按优先级排列。
-_SAPISID_COOKIE_NAMES: Tuple[str, ...] = (
-    "SAPISID",
-    "__Secure-3PAPISID",
-    "__Secure-1PAPISID",
-)
-_YOUTUBE_ORIGIN = "https://www.youtube.com"
+# Cookie 鉴权原语统一由 runtime_manager.youtube 提供，这里只留别名，
+# 避免同一份 SAPISIDHASH 逻辑在两处各写一遍。
+_YOUTUBE_ORIGIN = YOUTUBE_ORIGIN
 
 # 编解码器优先级：优先 avc1/mp4a，兼容性最好，ffmpeg 直接 copy 合流。
 _VIDEO_CODEC_RANK = (
@@ -674,44 +675,10 @@ def extract_youtube_publish_date(
 
 
 # ── Cookie 鉴权（SAPISIDHASH）────────────────────────────
-
-def parse_cookie_header(cookie: str) -> Dict[str, str]:
-    """把 "a=1; b=2" 形式的 Cookie 头切成字典（保留大小写）。"""
-    jar: Dict[str, str] = {}
-    for chunk in (cookie or "").split(";"):
-        name, sep, value = chunk.partition("=")
-        name = name.strip()
-        if not name or not sep:
-            continue
-        jar[name] = value.strip()
-    return jar
-
-
-def build_sapisid_authorization(
-    cookie: str,
-    origin: str = _YOUTUBE_ORIGIN,
-    timestamp: Optional[int] = None,
-) -> str:
-    """
-    由 cookie 里的 SAPISID 算出 Innertube 需要的 Authorization 头。
-
-    只把 Cookie 头丢给 Innertube 是**无效**的（服务端会当匿名请求处理），
-    必须额外带 Authorization: SAPISIDHASH <ts>_<sha1(ts SAPISID origin)>
-    才算真正登录。取不到 SAPISID 时返回空串，调用方据此退回匿名请求。
-    """
-    jar = parse_cookie_header(cookie)
-    sapisid = ""
-    for name in _SAPISID_COOKIE_NAMES:
-        if jar.get(name):
-            sapisid = jar[name]
-            break
-    if not sapisid:
-        return ""
-    stamp = int(timestamp if timestamp is not None else time.time())
-    digest = hashlib.sha1(
-        f"{stamp} {sapisid} {origin}".encode("utf-8")
-    ).hexdigest()
-    return f"SAPISIDHASH {stamp}_{digest}"
+#
+# parse_cookie_header / build_sapisid_authorization 现由
+# runtime_manager.youtube 实现并在本模块顶部导入，此处仅作为向后兼容的
+# 再导出点（__all__ 里仍然保留这两个名字）。
 
 
 def detect_youtube_login_state(payload: Any) -> Optional[bool]:
@@ -1349,13 +1316,20 @@ class YouTubeParser(BaseVideoParser):
         total_budget_seconds: float = 45.0,
         allow_dash: bool = True,
         cookie_alert_enabled: bool = False,
+        cookie_state_file: str = "",
+        cookie_auto_refresh: bool = True,
     ):
         super().__init__("youtube")
         self.cookie = (cookie or "").strip()
-        # 只有能算出 SAPISIDHASH 的 cookie 才算「真登录」，否则退回匿名。
-        self.cookie_authenticated = bool(
-            build_sapisid_authorization(self.cookie)
+        # Cookie 交给运行时托管：它负责吸收服务端下发的轮换值、落盘并在
+        # 重启后接续，避免配置里那份静态字符串随时间腐烂。
+        self.cookie_runtime = YouTubeCookieRuntime(
+            configured_cookie=self.cookie,
+            state_path=cookie_state_file,
+            auto_refresh=cookie_auto_refresh,
         )
+        # 只有能算出 SAPISIDHASH 的 cookie 才算「真登录」，否则退回匿名。
+        self.cookie_authenticated = self.cookie_runtime.authenticated
         self.proxy = proxy
         self.max_height = max(0, _as_int(max_height))
         self.player_clients = self._resolve_clients(player_clients)
@@ -1472,9 +1446,10 @@ class YouTubeParser(BaseVideoParser):
         }
         # 原生移动客户端不接受鉴权，带 Cookie 反而可能触发额外风控，
         # 所以只给显式声明 cookies=True 的客户端带上登录态。
-        if self.cookie and profile.get("cookies"):
-            headers["Cookie"] = self.cookie
-            authorization = build_sapisid_authorization(self.cookie)
+        cookie_header = self.cookie_runtime.header()
+        if cookie_header and profile.get("cookies"):
+            headers["Cookie"] = cookie_header
+            authorization = build_sapisid_authorization(cookie_header)
             if authorization:
                 headers["Authorization"] = authorization
                 headers["X-Origin"] = _YOUTUBE_ORIGIN
@@ -1521,6 +1496,8 @@ class YouTubeParser(BaseVideoParser):
             timeout=aiohttp.ClientTimeout(total=deadline.timeout(12.0)),
             proxy=self.proxy,
         ) as response:
+            # 先吸收轮换再判状态码：4xx 响应里同样可能带着新的 Cookie。
+            self.cookie_runtime.absorb_response(response)
             response.raise_for_status()
             data = await response.json(content_type=None)
         if not isinstance(data, dict):
@@ -1662,14 +1639,16 @@ class YouTubeParser(BaseVideoParser):
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        if self.cookie:
-            headers["Cookie"] = self.cookie
+        cookie_header = self.cookie_runtime.header()
+        if cookie_header:
+            headers["Cookie"] = cookie_header
         async with session.get(
             url,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=deadline.timeout(15.0)),
             proxy=self.proxy,
         ) as response:
+            self.cookie_runtime.absorb_response(response)
             response.raise_for_status()
             html = await response.text()
         return parse_watch_html(html)
@@ -1706,7 +1685,28 @@ class YouTubeParser(BaseVideoParser):
         url: str,
     ) -> Optional[MediaMetadata]:
         async with self.semaphore:
-            return await self._parse(session, url)
+            try:
+                return await self._parse(session, url)
+            finally:
+                # 解析途中吸收到的 Cookie 轮换在这里统一落盘，
+                # 保证下次启动用的是服务端最新认可的那份凭据。
+                await self.cookie_runtime.flush()
+
+    async def keepalive_cookie(
+        self,
+        session: aiohttp.ClientSession,
+        timeout_seconds: float = 20.0,
+    ) -> Tuple[Optional[bool], str]:
+        """主动跑一次 Cookie 保鲜请求，返回 (登录态, 可读摘要)。"""
+        return await self.cookie_runtime.keepalive(
+            session,
+            proxy=self.proxy,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def cookie_status_line(self) -> str:
+        """返回当前 Cookie 运行时状态摘要（不含任何取值）。"""
+        return self.cookie_runtime.status_line()
 
     async def _parse(
         self,

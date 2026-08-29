@@ -169,3 +169,8 @@ logs/
 data/cmd_config.json
 cmd_config.json
 **/cmd_config.json
+
+# 插件运行时凭据（B 站 / YouTube Cookie 轮换状态，绝不入库）
+runtime_manager/
+**/runtime_manager/cookie.json
+**/runtime_manager/youtube/cookie.json

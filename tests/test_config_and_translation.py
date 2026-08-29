@@ -78,6 +78,35 @@ class ConfigAndTranslationTests(unittest.TestCase):
         self.assertTrue(default.youtube.notify_admin_on_cookie_expired)
         self.assertEqual(default.youtube.cookie_alert_cooldown_minutes, 120)
 
+    def test_youtube_cookie_keepalive_options_are_parsed(self):
+        default = ConfigManager({})
+        self.assertTrue(default.youtube.cookie_auto_refresh)
+        self.assertEqual(default.youtube.cookie_keepalive_hours, 6)
+        # 没填 Cookie 时不需要运行时文件。
+        self.assertEqual(default.youtube.cookie_runtime_file, "")
+
+        disabled = ConfigManager(
+            {
+                "youtube": {
+                    "cookie_auto_refresh": False,
+                    "cookie_keepalive_hours": 0,
+                }
+            }
+        )
+        self.assertFalse(disabled.youtube.cookie_auto_refresh)
+        self.assertEqual(disabled.youtube.cookie_keepalive_hours, 0)
+        self.assertEqual(disabled.youtube.cookie_runtime_file, "")
+
+        clamped = ConfigManager(
+            {"youtube": {"cookie_keepalive_hours": 9999}}
+        )
+        self.assertEqual(clamped.youtube.cookie_keepalive_hours, 168)
+
+        invalid = ConfigManager(
+            {"youtube": {"cookie_keepalive_hours": "不是数字"}}
+        )
+        self.assertEqual(invalid.youtube.cookie_keepalive_hours, 6)
+
     def test_card_and_platform_hot_comment_options_are_parsed(self):
         config = ConfigManager(
             {

@@ -6,6 +6,10 @@
 
 import asyncio
 import hashlib
+import json
+import os
+import shutil
+import tempfile
 import unittest
 
 from nova_core.parser.platform.youtube import (
@@ -33,6 +37,10 @@ from nova_core.parser.platform.youtube import (
     thumbnail_candidates,
 )
 from nova_core.parser.platform.youtube import _Deadline
+from nova_core.parser.runtime_manager.youtube import (
+    YouTubeCookieRuntime,
+    collect_set_cookie_headers,
+)
 
 VID = "dQw4w9WgXcQ"
 
@@ -1247,3 +1255,292 @@ class MetadataFallbackTest(unittest.TestCase):
         self.assertEqual(self._run(parser, failures), {})
         self.assertEqual(calls, [])
         self.assertEqual(failures, [])
+
+
+class _FakeMultiHeaders:
+    """模拟 aiohttp 的多值 headers（支持 getall）。"""
+
+    def __init__(self, set_cookies):
+        self._items = list(set_cookies)
+
+    def getall(self, name, default=None):
+        if name.lower() != "set-cookie":
+            return list(default or [])
+        return list(self._items)
+
+    def get(self, name, default=""):
+        if name.lower() != "set-cookie":
+            return default
+        return self._items[0] if self._items else default
+
+
+class _FakeSingleHeaders:
+    """模拟只支持单值 get 的 headers 实现。"""
+
+    def __init__(self, value):
+        self._value = value
+
+    def get(self, name, default=""):
+        if name.lower() != "set-cookie":
+            return default
+        return self._value
+
+
+class _FakeCookieResponse:
+    def __init__(self, headers, status=200, text=""):
+        self.headers = headers
+        self.status = status
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _FakeCookieSession:
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self._response
+
+
+class YouTubeCookieRuntimeTest(unittest.TestCase):
+    """Cookie 运行时：轮换吸收、白名单防护、落盘接续与主动保鲜。"""
+
+    COOKIE = "SID=abc; SAPISID=SECRET; __Secure-3PSIDTS=old-ts"
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="nova-yt-cookie-")
+        self.state_path = os.path.join(self.tmpdir, "cookie.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    # ── 回放与吸收 ──
+
+    def test_header_is_byte_identical_before_any_rotation(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertEqual(runtime.header(), self.COOKIE)
+        self.assertEqual(runtime.revision, 0)
+        self.assertTrue(runtime.authenticated)
+
+    def test_absorb_merges_rotating_cookie_and_keeps_identity(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        changed = runtime.absorb(
+            ["__Secure-3PSIDTS=new-ts; Path=/; Secure; HttpOnly"]
+        )
+        self.assertTrue(changed)
+        self.assertEqual(runtime.revision, 1)
+        header = runtime.header()
+        self.assertIn("__Secure-3PSIDTS=new-ts", header)
+        self.assertNotIn("old-ts", header)
+        self.assertIn("SAPISID=SECRET", header)
+        self.assertIn("SID=abc", header)
+        self.assertTrue(runtime.authenticated)
+
+    def test_absorb_same_value_is_not_counted_as_rotation(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertFalse(runtime.absorb(["__Secure-3PSIDTS=old-ts"]))
+        self.assertEqual(runtime.revision, 0)
+        self.assertEqual(runtime.header(), self.COOKIE)
+
+    def test_deletion_directives_never_clear_the_jar(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE + "; SIDCC=live")
+        for raw in (
+            "SIDCC=EXPIRED; Max-Age=0",
+            "SIDCC=; Path=/",
+            "SIDCC=deleted; Max-Age=-1",
+        ):
+            with self.subTest(raw=raw):
+                self.assertFalse(runtime.absorb([raw]))
+        self.assertIn("SIDCC=live", runtime.header())
+
+    def test_unknown_cookie_names_stay_out_of_the_jar(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertFalse(runtime.absorb(["__utma=tracking; Path=/"]))
+        self.assertNotIn("__utma", runtime.names())
+        self.assertEqual(runtime.header(), self.COOKIE)
+
+    def test_malformed_set_cookie_is_skipped(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertFalse(runtime.absorb(["", "   ", "garbage-without-equals"]))
+        self.assertEqual(runtime.header(), self.COOKIE)
+
+    def test_auto_refresh_disabled_absorbs_nothing(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, auto_refresh=False)
+        self.assertFalse(runtime.absorb(["__Secure-3PSIDTS=new-ts"]))
+        self.assertEqual(runtime.header(), self.COOKIE)
+
+    def test_unconfigured_runtime_is_inert(self):
+        runtime = YouTubeCookieRuntime("")
+        self.assertFalse(runtime.absorb(["__Secure-3PSIDTS=new-ts"]))
+        self.assertEqual(runtime.header(), "")
+        self.assertFalse(runtime.authenticated)
+        self.assertEqual(runtime.status_line(), "未配置")
+
+    def test_absorb_response_reads_multi_value_headers(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        response = _FakeCookieResponse(
+            _FakeMultiHeaders(["SIDCC=one; Path=/", "YSC=two; Path=/"])
+        )
+        self.assertTrue(runtime.absorb_response(response))
+        self.assertIn("SIDCC", runtime.names())
+        self.assertIn("YSC", runtime.names())
+
+    def test_collect_set_cookie_supports_both_header_shapes(self):
+        multi = _FakeCookieResponse(_FakeMultiHeaders(["a=1", "b=2"]))
+        self.assertEqual(collect_set_cookie_headers(multi), ["a=1", "b=2"])
+        single = _FakeCookieResponse(_FakeSingleHeaders("a=1"))
+        self.assertEqual(collect_set_cookie_headers(single), ["a=1"])
+        self.assertEqual(
+            collect_set_cookie_headers(_FakeCookieResponse(_FakeSingleHeaders(""))),
+            [],
+        )
+        self.assertEqual(collect_set_cookie_headers(object()), [])
+
+    # ── 落盘与接续 ──
+
+    def test_rotation_survives_restart_through_state_file(self):
+        first = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        self.assertTrue(first.absorb(["__Secure-3PSIDTS=new-ts"]))
+        self.assertTrue(self._run(first.flush()))
+        self.assertTrue(os.path.exists(self.state_path))
+
+        second = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        self.assertIn("__Secure-3PSIDTS=new-ts", second.header())
+        self.assertNotIn("old-ts", second.header())
+        self.assertTrue(second.authenticated)
+
+    def test_state_file_is_discarded_when_config_cookie_changes(self):
+        first = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        first.absorb(["__Secure-3PSIDTS=new-ts"])
+        self._run(first.flush())
+
+        replaced = "SID=zzz; SAPISID=OTHER; __Secure-3PSIDTS=fresh"
+        second = YouTubeCookieRuntime(replaced, state_path=self.state_path)
+        self.assertEqual(second.header(), replaced)
+        self.assertNotIn("new-ts", second.header())
+
+    def test_state_file_only_stores_cookie_pairs_and_a_hash(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        runtime.absorb(["SIDCC=fresh"])
+        self._run(runtime.flush())
+        with open(self.state_path, "r", encoding="utf-8") as file_obj:
+            data = json.load(file_obj)
+        self.assertEqual(
+            set(data),
+            {"fingerprint", "cookies", "updated_at", "revision"},
+        )
+        self.assertEqual(data["cookies"]["SIDCC"], "fresh")
+        self.assertNotIn("SECRET", data["fingerprint"])
+
+    def test_flush_without_pending_rotation_writes_nothing(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        self.assertFalse(self._run(runtime.flush()))
+        self.assertFalse(os.path.exists(self.state_path))
+
+    def test_corrupt_state_file_is_tolerated(self):
+        with open(self.state_path, "w", encoding="utf-8") as file_obj:
+            file_obj.write("not json at all")
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        self.assertEqual(runtime.header(), self.COOKIE)
+
+    # ── 保鲜 ──
+
+    def test_keepalive_sends_credentials_and_absorbs_rotation(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        session = _FakeCookieSession(
+            _FakeCookieResponse(
+                _FakeMultiHeaders(["__Secure-3PSIDTS=rotated; Path=/"]),
+                text='{"LOGGED_IN":true}',
+            )
+        )
+        logged_in, detail = self._run(runtime.keepalive(session))
+        self.assertIs(logged_in, True)
+        self.assertIn("已吸收轮换", detail)
+
+        url, kwargs = session.calls[0]
+        self.assertTrue(url.startswith("https://www.youtube.com/"))
+        headers = kwargs["headers"]
+        self.assertEqual(headers["Cookie"], self.COOKIE)
+        self.assertTrue(headers["Authorization"].startswith("SAPISIDHASH "))
+        self.assertEqual(headers["X-Origin"], "https://www.youtube.com")
+        self.assertEqual(headers["X-Goog-AuthUser"], "0")
+
+        self.assertIn("__Secure-3PSIDTS=rotated", runtime.header())
+        self.assertTrue(os.path.exists(self.state_path))
+        self.assertIn("保鲜正常", runtime.status_line())
+
+    def test_keepalive_reports_logged_out_state(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        session = _FakeCookieSession(
+            _FakeCookieResponse(
+                _FakeMultiHeaders([]), text='{"logged_in":"0"}'
+            )
+        )
+        logged_in, detail = self._run(runtime.keepalive(session))
+        self.assertIs(logged_in, False)
+        self.assertIn("未登录", detail)
+        self.assertIn("保鲜未通过", runtime.status_line())
+
+    def test_keepalive_unknown_login_state_is_not_a_failure(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        session = _FakeCookieSession(
+            _FakeCookieResponse(_FakeMultiHeaders([]), text="<html></html>")
+        )
+        logged_in, detail = self._run(runtime.keepalive(session))
+        self.assertIsNone(logged_in)
+        self.assertIn("未读出登录态", detail)
+
+    def test_keepalive_without_cookie_skips_the_request(self):
+        runtime = YouTubeCookieRuntime("")
+        session = _FakeCookieSession(
+            _FakeCookieResponse(_FakeMultiHeaders([]))
+        )
+        logged_in, detail = self._run(runtime.keepalive(session))
+        self.assertIsNone(logged_in)
+        self.assertEqual(session.calls, [])
+        self.assertIn("跳过", detail)
+
+    def test_keepalive_network_failure_is_reported_not_raised(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+
+        class _Boom:
+            def get(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        logged_in, detail = self._run(runtime.keepalive(_Boom()))
+        self.assertIsNone(logged_in)
+        self.assertIn("RuntimeError", detail)
+
+    # ── 安全约定 ──
+
+    def test_status_line_never_leaks_cookie_values(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        runtime.absorb(["SIDCC=super-secret-value"])
+        line = runtime.status_line()
+        for secret in ("SECRET", "old-ts", "super-secret-value"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, line)
+
+    def test_parser_requests_follow_the_rotated_cookie(self):
+        parser = YouTubeParser(cookie=self.COOKIE)
+        self.assertEqual(parser.cookie_runtime.header(), self.COOKIE)
+        self.assertTrue(parser.cookie_authenticated)
+        parser.cookie_runtime.absorb(["__Secure-3PSIDTS=rotated"])
+        headers = parser._innertube_headers("web")
+        self.assertIn("__Secure-3PSIDTS=rotated", headers["Cookie"])
+        self.assertNotIn("old-ts", headers["Cookie"])
+        self.assertTrue(headers["Authorization"].startswith("SAPISIDHASH "))

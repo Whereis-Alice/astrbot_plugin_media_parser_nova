@@ -532,6 +532,9 @@ class YouTubeConfig:
     allow_dash: bool = True
     notify_admin_on_cookie_expired: bool = True
     cookie_alert_cooldown_minutes: int = 120
+    cookie_auto_refresh: bool = True
+    cookie_keepalive_hours: int = 6
+    cookie_runtime_file: str = ""
 
 
 @dataclass
@@ -1159,6 +1162,11 @@ class ConfigManager:
 
         # --- youtube ---
         youtube_raw = self._as_dict(config.get("youtube"))
+        youtube_cookie_auto_refresh = self._parse_bool(
+            youtube_raw.get("cookie_auto_refresh", True),
+            True,
+            "youtube.cookie_auto_refresh",
+        )
         self.youtube = YouTubeConfig(
             cookie=str(youtube_raw.get("cookie", "") or "").strip(),
             max_height=self._parse_youtube_max_height(
@@ -1188,6 +1196,21 @@ class ConfigManager:
                 1,
                 self._parse_non_negative_int(
                     youtube_raw.get("cookie_alert_cooldown_minutes", 120), 120
+                ),
+            ),
+            cookie_auto_refresh=youtube_cookie_auto_refresh,
+            cookie_keepalive_hours=min(
+                168,
+                self._parse_non_negative_int(
+                    youtube_raw.get("cookie_keepalive_hours", 6), 6
+                ),
+            ),
+            cookie_runtime_file=self._build_youtube_cookie_runtime_file(
+                cache_dir,
+                enabled=bool(
+                    youtube_raw.get("cookie")
+                    and cache_dir_available
+                    and youtube_cookie_auto_refresh
                 ),
             ),
         )
@@ -1393,12 +1416,36 @@ class ConfigManager:
                 cookie_alert_enabled=(
                     self.youtube.notify_admin_on_cookie_expired
                 ),
+                cookie_state_file=self.youtube.cookie_runtime_file,
+                cookie_auto_refresh=self.youtube.cookie_auto_refresh,
             )
             parsers.append(self.youtube_parser)
 
         return parsers
 
     # ── 静态辅助 ────────────────────────────────────────
+
+    @staticmethod
+    def _build_youtube_cookie_runtime_file(
+        cache_dir: str,
+        enabled: bool,
+    ) -> str:
+        """给 YouTube Cookie 运行时挑一个可写文件路径，不可用时返回空串。
+
+        YouTube 会不断轮换 Cookie，运行时把最新值写在这里，插件重载后接着
+        用；目录不可写时只是退化成「仅内存跟进轮换」，不影响解析。
+        """
+        if not enabled or not cache_dir:
+            return ""
+        cookie_dir = Config.build_runtime_dir(cache_dir, "youtube")
+        try:
+            os.makedirs(cookie_dir, exist_ok=True)
+        except Exception as exc:
+            logger.warning(
+                f"YouTube Cookie 运行时目录不可用，轮换结果只保留在内存: {exc}"
+            )
+            return ""
+        return os.path.join(cookie_dir, "cookie.json")
 
     @staticmethod
     def _parse_parser_outputs(values) -> Dict[str, str]:

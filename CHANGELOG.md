@@ -2,6 +2,37 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.9.0 (2026-08-29)
+
+### 让 YouTube Cookie 从「隔几天就得重导」变成长期免维护
+
+先说清一件容易被误会的事：YouTube Cookie 感觉特别容易失效，**主因不是有效期短**，而是 Google 会在几乎每次请求的响应里用 `Set-Cookie` 轮换 `__Secure-1PSIDTS` / `__Secure-3PSIDTS` / `SIDCC` 这几枚短周期凭据。浏览器会静默跟进，所以你自己刷 YouTube 永远不掉登录；而插件此前每次都原样发配置里那份静态字符串，等于一个「永不更新凭据的浏览器」，服务端迟早判定会话过期。
+
+- **新增 `YouTubeCookieRuntime`（`nova_core/parser/runtime_manager/youtube/cookie.py`）**：每次 Innertube 与 watch 页面请求的响应都会被解析 `Set-Cookie` 并吸收轮换值，下次请求带上最新的那份，行为对齐真实浏览器
+- **落盘持久化**：轮换结果写入 `<缓存目录>/runtime_manager/youtube/cookie.json`，重启 AstrBot 不会退回到最初那份旧 Cookie。写入采用临时文件 + 原子替换，权限 `0600`；文件里记了配置 Cookie 全串的 sha256 指纹，一旦你在面板换了新 Cookie，旧状态会被整份丢弃而不是混用
+- **主动保鲜**：新增后台任务，默认每 6 小时带当前 Cookie 访问一次 `youtube.com/account`（附 SAPISIDHASH 授权头），既顺手吸收一轮轮换，也能在真正掉登录时第一时间发现。长时间没人解析 YouTube 也不会「放着放着就凉了」
+- **4xx 也先吸收再抛错**：Google 在 401/403 响应里同样会下发新的轮换 Cookie，此前 `raise_for_status()` 抢在解析之前执行，等于把唯一的自救机会丢掉了
+- **只认白名单、只进不删**：仅吸收身份类与轮换类已知 Cookie 名；服务端下发的删除指令（空值 / `EXPIRED` / `DELETED` / `max-age<=0`）一律忽略，避免一次异常响应就把整罐 Cookie 清空
+- **日志只出 Cookie 名，绝不出取值**：状态摘要形如「已吸收 3 枚轮换 Cookie（__Secure-1PSIDTS, __Secure-3PSIDTS, SIDCC），修订 4」，凭据本身不进日志
+- 保鲜请求判定为未登录时，除 WARNING 外还会走已有的私聊提醒链（新增 reason 码 `keepalive_logged_out`），提醒文案补上「重新填一次后插件会自动跟进轮换」与「反复出现建议配住宅代理」
+- `cookie.json` 已加入 `.gitignore`，不会被误提交
+
+### 新增配置项
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `youtube.cookie_auto_refresh` | 开 | 自动跟进服务端 Cookie 轮换并落盘。关掉则退回旧行为（每次原样发配置里那份） |
+| `youtube.cookie_keepalive_hours` | 6 | 主动保鲜间隔（小时），`0` 表示不主动保鲜，上限 168 |
+
+### 文档
+
+- README 的「Cookie 获取与保鲜」整节重写为「**让 Cookie 长期不用再管**」，讲清轮换机制，并给出三层组合拳：冻结会话式导出（无痕窗口 → 登录 → 同标签页跳 `robots.txt` → 本地导出 → 直接关窗口而不点登出）→ 插件自动跟进轮换 → 住宅代理兜底
+- 需要强调的现实：**不存在永不过期的 YouTube Cookie**，Google 不发长期令牌。能做到的是「手工导出一次，之后长期不用再管」
+
+### 测试
+
+- 新增 23 个用例：Cookie 轮换吸收（多值 / 单值响应头、白名单过滤、删除指令忽略、修订号递增）、状态文件读写（原子写、权限、指纹隔离、损坏文件容错）、保鲜请求的登录 / 未登录 / 网络异常三条路径、未轮换时逐字节回放原配置串，以及两个新配置项的默认值 / 关闭 / 越界钳制 / 非法值回退
+- 全量 342 passed + 78 subtests
 ## v1.8.3 (2026-08-29)
 
 ### 被机器人门禁挡下的 YouTube 视频，卡片不再只剩一句话

@@ -971,8 +971,20 @@
             "cookie": {
                 "description": "YouTube Cookie",
                 "type": "string",
-                "hint": "留空即可解析公开视频。部分视频会被 YouTube 的「Sign in to confirm you are not a bot」门禁挡住（机房 IP 尤其常见），此时只能出封面卡片；填入登录后的完整 Cookie（必须包含 SAPISID 或 __Secure-3PAPISID，否则鉴权无效）可绕过门禁并解析年龄限制内容，填写后会自动追加 tv、web 两个支持鉴权的客户端。仅本地使用，不要公开分享；账号有被风控的风险，建议用小号。",
+                "hint": "留空即可解析公开视频。部分视频会被 YouTube 的「Sign in to confirm you are not a bot」门禁挡住（机房 IP 尤其常见），此时只能出封面卡片；填入登录后的完整 Cookie（必须包含 SAPISID 或 __Secure-3PAPISID，否则鉴权无效）可绕过门禁并解析年龄限制内容，填写后会自动追加 tv、web 两个支持鉴权的客户端。导出时建议用无痕窗口登录小号，导出完成后直接关掉整个窗口（不要点登出），这样会话不会被服务端作废。仅本地使用，不要公开分享；账号有被风控的风险，建议用小号。",
                 "default": ""
+            },
+            "cookie_auto_refresh": {
+                "description": "自动跟进 Cookie 轮换（推荐开启）",
+                "type": "bool",
+                "hint": "YouTube 会不断通过 Set-Cookie 轮换 __Secure-1PSIDTS / __Secure-3PSIDTS / SIDCC 等短命凭据，真实浏览器是静默跟进的，所以你在电脑上永远不会掉登录。开启本项后插件同样跟进这些新值并落盘到缓存目录，重启后接着用，于是一份手工导出的 Cookie 可以长期免维护。关闭则永远原样回放配置里那份静态字符串，Cookie 会随时间腐烂失效。",
+                "default": true
+            },
+            "cookie_keepalive_hours": {
+                "description": "Cookie 保鲜间隔（小时，0=关闭）",
+                "type": "int",
+                "hint": "长时间没有 YouTube 解析请求时，插件会按这个间隔主动向 youtube.com 发一次带登录态的轻量请求，触发并吸收服务端的 Cookie 轮换，避免会话因长期沉默被判过期；同时会顺带检查登录态，失效时按上面的设置提醒管理员。默认 6 小时，最大 168；填 0 关闭主动保鲜（仍会在每次解析时跟进轮换）。",
+                "default": 6
             }
         }
     },
