@@ -2,6 +2,30 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.12.0 (2026-08-31)
+
+这一版把 **PO Token**（YouTube 的 BotGuard 证明令牌）这条路接通：插件仍然不实现 BotGuard，但现在会**探测**当前 Python 环境里装没装社区 provider 插件，并把地址与取用策略**透传**给 yt-dlp。同时把上一版 README 里那段过于乐观的说法按真机实测改写。
+
+### 新增
+
+- **`youtube.ytdlp_pot_provider`（PO Token 提供方地址，选填）**：留空即用 provider 自己的默认位置——脚本模式 `~/bgutil-ytdlp-pot-provider/server`，HTTP 服务模式 `127.0.0.1:4416`；填 `http(s)://` 开头的地址走 HTTP 模式，填目录或脚本路径走脚本模式
+- **`youtube.ytdlp_fetch_pot`（PO Token 取用策略）**：自动（默认）/ 总是 / 从不。默认的「自动」由 yt-dlp 判断这次要不要令牌；「总是」会在每次兜底时强制生成，多花 1～3 秒拉起子进程，只在确实被 403/SABR 反复挡住时才值得开；「从不」用于排查 provider 自身故障
+- **环境探测新增 PO Token 提供方一项**：只扫 `yt_dlp_plugins.extractor` 命名空间下的模块名，**不 import 任何实现**（provider 在 import 期就会找 node、探 HTTP 服务，既慢又可能抛错）。结果写进日志摘要（`POT 提供方 bgutil_script/bgutil_http` 或 `无 POT 提供方`），做法保持通用而不写死某个包名
+- **降级告警会顺手给出安装方式**：链路本身齐全、只是少了 provider 这个可选增强件时，「未取到可下载视频流」那条 WARNING 末尾会附上 `pip install -U bgutil-ytdlp-pot-provider`。缺 provider **不计入** `problems`，所以不会让兜底链路被判成不可用
+
+### 设计取舍
+
+- 两项都留默认时**不往 yt-dlp 传任何 `extractor_args`**。`auto` 交给 yt-dlp 判断更省时间；地址写死反而会把 provider 自己的默认值挡掉
+- 「总是」只在真的探测到 provider 时才传：没有提供方却要求必须取令牌，会让 yt-dlp 直接报错，比不传更糟
+- 非法的策略取值一律回落「自动」——这一项只影响性能与成功率，不该因为拼错就让整份配置解析失败
+
+### 文档
+
+- README 的 PO Token 小节**按真机实测重写**。上一版写的是「装上就能彻底摆脱 Cookie」，实测下来这个说法不成立，得分情况：
+  - **能救**：拿到了元数据但媒体流 403 / 只有 SABR，也就是日志里的「有元数据但无可直连媒体流」
+  - **救不了**：播放器阶段就被拦（`playabilityStatus=LOGIN_REQUIRED`、`Sign in to confirm you’re not a bot`）。实测 provider 装好、日志确认 `Retrieved a player PO Token`，被拦的视频加不加令牌都还是 `LOGIN_REQUIRED`；换 `web` / `mweb` / `tv_simply` / `web_embedded` / `android` 等客户端、强制每次取令牌、间隔重试全都一样。请求还没走到取流就被挡回，令牌没有介入的机会。这类是机房 IP 的常态，只能靠住宅／家宽出口代理或有效 Cookie
+- 补上脚本模式与 HTTP 服务模式的差异、完整安装步骤（pip + clone + `npm ci` + `npx tsc`）、`yt-dlp -v | grep pot` 的自检命令，以及占用参考：编译产物约 190 MB，脚本模式零常驻内存
+
 ## v1.11.1 (2026-08-31)
 
 一次真机排障的产出。现象是「明明填了 Cookie，YouTube 视频却始终只出封面卡片」，日志给的结论是 `登录态=cookie(已失效)`。实地探针确认这份 Cookie 确实被 Google 服务端吊销了（带 Cookie 与匿名请求的结果完全一致，连几天前解析成功过的视频现在也一样被挡），根因是从机房 IP 使用国内浏览器签发的会话。但排查过程里挖出两个**会把问题放大、并让它极难被发现**的自身缺陷，这一版修掉它们。

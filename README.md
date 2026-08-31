@@ -386,6 +386,8 @@ YouTube 解析主路走官方 Innertube 接口，**不依赖任何第三方镜�
 | yt-dlp 兜底取流 | 开 | Innertube 一路都没取到流时，借 yt-dlp 执行播放器 JS 解出直链。需要额外装三件套，见下文 |
 | yt-dlp 的 JS 运行时 | `auto` | `auto` 按 deno → node → bun → quickjs 自动挑一个可用的；也可指定其中之一 |
 | yt-dlp 兜底超时 | 60 秒 | 单次兜底的上限，超时按封面卡片降级。这一项**不占**上面那份总时间预算 |
+| PO Token 提供方地址 | 空 | 选填。装了 `bgutil-ytdlp-pot-provider` 后通常留空即可（用它自己的默认位置）。填 `http(s)://` 走 HTTP 服务模式，填路径走脚本模式，见下文 |
+| PO Token 取用策略 | 自动 | 自动 / 总是 / 从不。「总是」每次兜底都强制生成令牌，多花 1～3 秒 |
 
 热评开关在「消息输出 → 附加内容：热评 → YouTube」，默认开启。
 
@@ -453,18 +455,55 @@ pip install -U yt-dlp yt-dlp-ejs
 
 > 为什么必须每次重写：yt-dlp 收到 `cookiefile` 后，会在收工时把它自己的 cookie 罐**存回同一个文件**。如果这一趟 YouTube 下发过删除指令，`SID` / `SAPISID` / `LOGIN_INFO` 这些登录核心项就会被就地抹掉，文件从 24 项缩到 13 项——之后只要复用这份文件，兜底就永远按匿名跑，日志表现是「明明填了 Cookie 却一直 `Sign in to confirm you’re not a bot`」。插件自己的 `cookie.json` 是权威来源，yt-dlp 那份只是每次现生成的副本。
 
-#### 想彻底摆脱 Cookie：装一个 PO token provider
+#### 可选增强：PO Token provider（含实测边界，别抱错期待）
 
-「Sign in to confirm you’re not a bot」本质上是 YouTube 在要 **PO token**（BotGuard 出的证明令牌）。Cookie 只是绕开它的一种方式，而且在机房 IP 上很容易被吊销。社区的标准解是给 yt-dlp 装一个 PO token provider 插件，让它自己现场生成令牌：
+**PO Token** 是 YouTube 的 BotGuard 证明令牌。yt-dlp 自己不生成它，而是留了一层插件接口，交给第三方 provider 去跑 BotGuard。社区的事实标准是 `bgutil-ytdlp-pot-provider`。插件这边同样不实现 BotGuard，只做两件事：**探测**有没有装 provider（结果写进日志摘要，缺了会在降级告警里给出安装方式），以及把地址**透传**给 yt-dlp。
+
+先说结论，免得白折腾：
+
+| 你遇到的现象 | PO Token 能不能救 |
+| --- | --- |
+| 拿到了元数据，但媒体流 403 / 只有 SABR（日志：「有元数据但无可直连媒体流」） | **能**，这正是它的用途 |
+| 播放器阶段就被拦（日志：`playabilityStatus=LOGIN_REQUIRED`、`Sign in to confirm you’re not a bot`） | **不能**。请求还没走到取流就被挡回，令牌根本没有介入的机会 |
+
+第二种是机房 IP 的常态。真机实测过：provider 装好、日志确认 `Retrieved a player PO Token`（令牌确实生成了），但被拦的那几个视频加不加令牌都还是 `LOGIN_REQUIRED`；换 `web` / `mweb` / `tv_simply` / `web_embedded` / `android` 等客户端、强制每次取令牌、间隔重试，全部一样。这类只能靠**住宅／家宽出口代理**或**有效 Cookie**解决。
+
+##### 两种模式与安装
+
+provider 有两种运行形态，插件都支持：
+
+* **脚本模式（推荐）**：不常驻进程，需要令牌时现拉起一次 Node 跑完就退，单次约 1～3 秒。省内存，适合小机器；
+* **HTTP 服务模式**：常驻一个 Node 服务（默认 `127.0.0.1:4416`），令牌走 HTTP 取，延迟更低但要多养一个进程。
+
+脚本模式装法（在 **AstrBot 所用的那个 Python 环境** 里装 pip 包）：
 
 ```bash
 pip install -U bgutil-ytdlp-pot-provider
-# 再按上游 README 起一个本地 provider 服务（Node，默认监听 4416）
+
+# 生成脚本单独 clone 一份并编译（版本号与上面的 pip 包保持一致）
+git clone --depth 1 --branch 1.3.2 \
+  https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+  ~/bgutil-ytdlp-pot-provider
+cd ~/bgutil-ytdlp-pot-provider/server && npm ci && npx tsc
 ```
 
-装好后 yt-dlp 会自动发现它，插件这边**不需要任何配置改动**——第 ④ 层兜底照常调用 yt-dlp，只是它这次能自己过门禁。相比 Cookie 的好处是不会过期、也不用绑一个可能被风控的小号。代价是多跑一个常驻 Node 服务。
+需要 **Node ≥ 18**，编译产物约 190 MB（主要是 npm 依赖），运行时零常驻内存。装完可以这样确认 yt-dlp 认到了：
 
-插件自己仍然不实现 PO token（要跑一整套 BotGuard 虚拟机），这条只是把选择权交给你。
+```bash
+yt-dlp -v --js-runtimes node "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>&1 | grep -i "pot"
+# 期望看到 PO Token Providers: ... bgutil:script-node-1.3.2 (external)
+```
+
+路径就放在 `~/bgutil-ytdlp-pot-provider/server` 时**插件侧零配置**——那是 provider 自己的默认位置。
+
+##### 两个配置项
+
+| 配置项 | 作用 |
+| --- | --- |
+| `youtube.ytdlp_pot_provider` | 选填。留空即用 provider 默认位置（脚本模式 `~/bgutil-ytdlp-pot-provider/server`，HTTP 模式 `127.0.0.1:4416`）。填 `http://` 或 `https://` 开头的地址走 HTTP 模式，填目录或脚本路径走脚本模式 |
+| `youtube.ytdlp_fetch_pot` | 取用策略。**自动**（默认，由 yt-dlp 判断这次要不要令牌）／**总是**（每次兜底都强制生成，多花 1～3 秒，只在确实被 403/SABR 反复挡住时才值得）／**从不**（跳过令牌，用于排查 provider 自身故障） |
+
+两项都留默认时插件不会往 yt-dlp 传任何 `extractor_args`，这是有意的：`auto` 交给 yt-dlp 判断更省时间，地址写死反而会挡掉 provider 的默认值。另外「总是」只在真的探测到 provider 时才生效——没装却要求必须取令牌只会让 yt-dlp 直接报错。
 
 #### 行为细节
 

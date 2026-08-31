@@ -1325,6 +1325,8 @@ class YouTubeParser(BaseVideoParser):
         ytdlp_js_runtime: str = "auto",
         ytdlp_timeout: int = 60,
         ytdlp_cookie_dir: str = "",
+        ytdlp_pot_provider: str = "",
+        ytdlp_fetch_pot: str = "auto",
     ):
         super().__init__("youtube")
         self.cookie = (cookie or "").strip()
@@ -1351,6 +1353,9 @@ class YouTubeParser(BaseVideoParser):
         self.ytdlp_js_runtime = (ytdlp_js_runtime or "auto").strip() or "auto"
         self.ytdlp_timeout = max(10, _as_int(ytdlp_timeout) or 60)
         self.ytdlp_cookie_dir = (ytdlp_cookie_dir or "").strip()
+        # PO Token 提供方由用户自备（第三方 yt-dlp 插件），这里只透传。
+        self.ytdlp_pot_provider = (ytdlp_pot_provider or "").strip()
+        self.ytdlp_fetch_pot = (ytdlp_fetch_pot or "auto").strip() or "auto"
         self._ytdlp: Optional[YtDlpStreamResolver] = None
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         if self.cookie and not self.cookie_authenticated:
@@ -1404,9 +1409,11 @@ class YouTubeParser(BaseVideoParser):
                 "解析被门禁挡下的视频"
             )
         env = probe_ytdlp_environment(self.ytdlp_js_runtime)
-        if env.ready:
-            return ""
-        return f"；yt-dlp 兜底不可用（{env.summary()}）{env.advice()}"
+        if not env.ready:
+            return f"；yt-dlp 兜底不可用（{env.summary()}）{env.advice()}"
+        # 链路本身没问题，但少了 PO Token 提供方这个可选增强件时，顺手把
+        # 安装方式写进降级告警——它正是这类「有元数据、没媒体流」的常见解。
+        return env.pot_advice()
 
     def _ytdlp_resolver(self) -> Optional[YtDlpStreamResolver]:
         """惰性构造 yt-dlp 兜底解析器；未启用时返回 None。"""
@@ -1420,6 +1427,8 @@ class YouTubeParser(BaseVideoParser):
                 timeout=self.ytdlp_timeout,
                 js_runtime=self.ytdlp_js_runtime,
                 cookie_dir=self.ytdlp_cookie_dir,
+                pot_provider=self.ytdlp_pot_provider,
+                fetch_pot=self.ytdlp_fetch_pot,
             )
         return self._ytdlp
 

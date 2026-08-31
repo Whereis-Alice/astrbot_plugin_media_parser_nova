@@ -21,6 +21,18 @@
 node 也不会被启用（日志里表现为 "JS runtimes: none"）。所以本模块总是把
 探测到的运行时显式写进 `js_runtimes` 选项。
 
+PO Token 提供方（可选件）：YouTube 对部分请求要求 BotGuard 令牌（PO
+Token）。yt-dlp 自己不产生这类令牌，而是留了一层插件接口，由第三方
+provider（如 bgutil-ytdlp-pot-provider）去跑 BotGuard。本模块的立场不变
+——不自己实现 BotGuard，只做两件事：探测当前 Python 环境里有没有装
+provider 插件，以及把用户配置的地址/路径透传给 yt-dlp 的 extractor_args。
+装不装都不影响兜底链路可用（缺 provider 不计入 problems）。
+
+实测边界（别抱错期待）：PO Token 能救的是 SABR / gvs 403 那一类「有元数
+据但拿不到媒体流」的情况；如果 YouTube 在播放器响应阶段就回
+`playabilityStatus=LOGIN_REQUIRED`（典型是机房 IP 信誉太差被要求人机验
+证），令牌根本没有介入的机会，此时只能靠住宅出口代理或有效 Cookie。
+
 安全约定：Cookie 只以名值写入权限 0600 的临时 jar 文件，日志里一律只出
 现 Cookie 项数，绝不输出取值。
 """
@@ -29,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pkgutil
 import re
 import stat
 import tempfile
@@ -53,6 +66,17 @@ __all__ = [
 # yt-dlp 官方的运行时优先级；最低版本仅用于生成安装建议文案。
 JS_RUNTIME_PREFERENCE: Tuple[str, ...] = ("deno", "node", "bun", "quickjs")
 _RUNTIME_HINT = "node>=22 / deno>=2.3 / bun>=1.2.11 / quickjs>=2023.12.9"
+
+# PO Token 提供方相关。地址以 http(s):// 开头视为 HTTP 服务模式，否则当作
+# 脚本模式的 server 目录/脚本路径。
+_POT_URL_RE = re.compile(r"^https?://", re.I)
+_FETCH_POT_CHOICES: Tuple[str, ...] = ("auto", "always", "never")
+_POT_PLUGIN_HINT = (
+    "pip install -U bgutil-ytdlp-pot-provider，"
+    "并按其 README 准备生成脚本或 HTTP 服务"
+)
+# provider 插件模块名的常见前缀，剥掉后更适合放进日志摘要。
+_POT_NAME_PREFIXES: Tuple[str, ...] = ("getpot_", "get_pot_", "pot_")
 
 # yt-dlp 的 protocol 取值里只有这两个是「一个 URL 直接下载完整媒体」；
 # http_dash_segments / m3u8 / m3u8_native / sabr 都需要额外的拼装逻辑。
@@ -128,6 +152,9 @@ class YtDlpEnvironment:
     ejs_available: bool = False
     runtime_name: str = ""
     runtime_version: str = ""
+    # 已安装的 PO Token 提供方插件模块名。属于可选增强件，故意不进
+    # problems——缺它不影响兜底链路可用。
+    pot_providers: Tuple[str, ...] = ()
     problems: Tuple[str, ...] = ()
 
     @property
@@ -151,6 +178,10 @@ class YtDlpEnvironment:
                 parts.append("无可用 JS 运行时")
         else:
             parts.append("使用内置 jsinterp")
+        if self.pot_providers:
+            parts.append(f"POT 提供方 {_pot_label(self.pot_providers)}")
+        else:
+            parts.append("无 POT 提供方")
         return "，".join(parts)
 
     def advice(self) -> str:
@@ -169,6 +200,20 @@ class YtDlpEnvironment:
         if not steps:
             return ""
         return "；处理建议: " + "；".join(steps)
+
+    def pot_advice(self) -> str:
+        """没装 PO Token 提供方时给出安装提示；装了则返回空串。
+
+        与 `advice()` 分开是因为性质不同：那边是"缺了就不能跑"，这边是
+        "装了可能更稳"，不该混进同一条告警里误导人。
+        """
+        if self.pot_providers:
+            return ""
+        return (
+            "；可选增强: 未检测到 PO Token 提供方，"
+            "若遇到取到元数据但媒体流 403/SABR 受阻，可 "
+            f"{_POT_PLUGIN_HINT}"
+        )
 
 
 def _probe_js_runtime(preference: str = "") -> Tuple[str, str, bool]:
@@ -243,6 +288,51 @@ def _probe_ejs() -> bool:
     return True
 
 
+def _probe_pot_providers() -> Tuple[str, ...]:
+    """列出已安装的 PO Token 提供方插件模块名。
+
+    只扫 `yt_dlp_plugins.extractor` 命名空间包下的模块名，不 import 任何一
+    个实现。理由：provider 插件在 import 期就会做环境检查（找 node、探
+    HTTP 服务），import 一遍既慢又可能抛错，而我们这里只需要知道"装了没"。
+    做法保持通用，不写死某个 provider 的包名。
+
+    Returns:
+        排序后的模块名元组；探测失败或一个都没有时返回空元组。
+    """
+    try:
+        import yt_dlp_plugins.extractor as extractor_ns
+
+        paths = list(getattr(extractor_ns, "__path__", []) or [])
+    except Exception:
+        return ()
+    if not paths:
+        return ()
+    found: List[str] = []
+    try:
+        for module in pkgutil.iter_modules(paths):
+            name = str(getattr(module, "name", "") or "")
+            if "pot" in name.lower() and name not in found:
+                found.append(name)
+    except Exception:
+        return ()
+    return tuple(sorted(found))
+
+
+def _pot_label(names: Tuple[str, ...]) -> str:
+    """把 provider 模块名整理成适合写进日志的短标签。"""
+    labels: List[str] = []
+    for name in names:
+        short = name
+        for prefix in _POT_NAME_PREFIXES:
+            if short.startswith(prefix):
+                short = short[len(prefix):]
+                break
+        short = short.strip("_") or name
+        if short not in labels:
+            labels.append(short)
+    return "/".join(labels)
+
+
 def _probe_uncached(preference: str) -> YtDlpEnvironment:
     """不走缓存地做一次完整探测。"""
     try:
@@ -252,6 +342,7 @@ def _probe_uncached(preference: str) -> YtDlpEnvironment:
     version = _ytdlp_version(yt_dlp)
     runtime_name, runtime_version, ejs_arch = _probe_js_runtime(preference)
     ejs_available = _probe_ejs() if ejs_arch else False
+    pot_providers = _probe_pot_providers()
     problems: List[str] = []
     if ejs_arch:
         if not ejs_available:
@@ -265,6 +356,7 @@ def _probe_uncached(preference: str) -> YtDlpEnvironment:
         ejs_available=ejs_available,
         runtime_name=runtime_name,
         runtime_version=runtime_version,
+        pot_providers=pot_providers,
         problems=tuple(problems),
     )
 
@@ -364,6 +456,8 @@ class YtDlpStreamResolver:
         timeout: float = 60.0,
         js_runtime: str = "auto",
         cookie_dir: str = "",
+        pot_provider: str = "",
+        fetch_pot: str = "auto",
     ):
         self.proxy = (proxy or "").strip() or None
         self.max_height = max(0, _as_int(max_height))
@@ -371,6 +465,9 @@ class YtDlpStreamResolver:
         self.timeout = max(10.0, float(timeout or 60.0))
         self.js_runtime = (js_runtime or "auto").strip().lower() or "auto"
         self.cookie_dir = (cookie_dir or "").strip()
+        self.pot_provider = (pot_provider or "").strip()
+        mode = (fetch_pot or "auto").strip().lower()
+        self.fetch_pot = mode if mode in _FETCH_POT_CHOICES else "auto"
         self._jar_path = ""
         # yt-dlp 一次解析会起子进程并跑 JS，串行化避免并发请求把 CPU 打满。
         self._gate = asyncio.Semaphore(1)
@@ -459,6 +556,37 @@ class YtDlpStreamResolver:
 
     # ── 选项与调用 ───────────────────────────────────────
 
+    def _extractor_args(self, env: YtDlpEnvironment) -> Dict[str, Any]:
+        """组装与 PO Token 相关的 extractor_args。
+
+        默认（fetch_pot=auto、未填地址）什么都不传，这是有意为之：
+
+        * `auto` 交给 yt-dlp 自己判断何时需要令牌。强制 `always` 的代价是
+          每次兜底都要拉起一个 node 子进程跑 BotGuard，实测 1~3 秒，而多
+          数视频根本不需要令牌；
+        * 地址留空时 provider 自己有合理默认值——脚本模式默认找
+          `~/bgutil-ytdlp-pot-provider/server`，HTTP 模式默认
+          `127.0.0.1:4416`。这里写死反而会把这些默认值挡掉。
+
+        另外 `always` 只在真的探测到 provider 时才传：没有提供方却要求必须
+        取令牌，只会让 yt-dlp 直接报错，比不传更糟。
+        """
+        args: Dict[str, Any] = {}
+        if self.fetch_pot == "never" or (
+            self.fetch_pot == "always" and env.pot_providers
+        ):
+            args["youtube"] = {"fetch_pot": [self.fetch_pot]}
+        if self.pot_provider:
+            if _POT_URL_RE.match(self.pot_provider):
+                args["youtubepot-bgutilhttp"] = {
+                    "base_url": [self.pot_provider]
+                }
+            else:
+                args["youtubepot-bgutilscript"] = {
+                    "server_home": [self.pot_provider]
+                }
+        return args
+
     def build_options(self, jar_path: str = "") -> Dict[str, Any]:
         """组装 yt-dlp 选项（只取元数据，不下载）。"""
         env = probe_ytdlp_environment(self.js_runtime)
@@ -482,6 +610,9 @@ class YtDlpStreamResolver:
             options["cookiefile"] = jar_path
         if self.proxy:
             options["proxy"] = self.proxy
+        extractor_args = self._extractor_args(env)
+        if extractor_args:
+            options["extractor_args"] = extractor_args
         return options
 
     @staticmethod

@@ -62,6 +62,41 @@ class ConfigAndTranslationTests(unittest.TestCase):
         for key in (CARD_SKIN_X, CARD_SKIN_YOUTUBE, CARD_SKIN_AUTO):
             self.assertIn(key, CARD_SKINS)
 
+    def test_youtube_pot_options_are_parsed(self):
+        config = ConfigManager(
+            {
+                "youtube": {
+                    "ytdlp_pot_provider": "  http://127.0.0.1:4416  ",
+                    "ytdlp_fetch_pot": "总是",
+                }
+            }
+        )
+        self.assertEqual(
+            config.youtube.ytdlp_pot_provider, "http://127.0.0.1:4416"
+        )
+        self.assertEqual(config.youtube.ytdlp_fetch_pot, "always")
+
+        default = ConfigManager({})
+        self.assertEqual(default.youtube.ytdlp_pot_provider, "")
+        self.assertEqual(default.youtube.ytdlp_fetch_pot, "auto")
+
+    def test_fetch_pot_accepts_chinese_and_english_and_falls_back(self):
+        cases = {
+            "自动": "auto",
+            "总是": "always",
+            "从不": "never",
+            " ALWAYS ": "always",
+            "never": "never",
+            "": "auto",
+            None: "auto",
+            "有时": "auto",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    ConfigManager._parse_fetch_pot(raw), expected
+                )
+
     def test_youtube_cookie_alert_options_are_parsed(self):
         config = ConfigManager(
             {

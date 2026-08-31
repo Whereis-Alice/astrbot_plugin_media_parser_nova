@@ -540,6 +540,8 @@ class YouTubeConfig:
     ytdlp_js_runtime: str = "auto"
     ytdlp_timeout: int = 60
     ytdlp_runtime_dir: str = ""
+    ytdlp_pot_provider: str = ""
+    ytdlp_fetch_pot: str = "auto"
 
 
 @dataclass
@@ -1246,6 +1248,12 @@ class ConfigManager:
                 cache_dir,
                 enabled=cache_dir_available,
             ),
+            ytdlp_pot_provider=str(
+                youtube_raw.get("ytdlp_pot_provider", "") or ""
+            ).strip(),
+            ytdlp_fetch_pot=self._parse_fetch_pot(
+                youtube_raw.get("ytdlp_fetch_pot", "")
+            ),
         )
 
         # --- proxy ---
@@ -1455,6 +1463,8 @@ class ConfigManager:
                 ytdlp_js_runtime=self.youtube.ytdlp_js_runtime,
                 ytdlp_timeout=self.youtube.ytdlp_timeout,
                 ytdlp_cookie_dir=self.youtube.ytdlp_runtime_dir,
+                ytdlp_pot_provider=self.youtube.ytdlp_pot_provider,
+                ytdlp_fetch_pot=self.youtube.ytdlp_fetch_pot,
             )
             parsers.append(self.youtube_parser)
 
@@ -1673,6 +1683,24 @@ class ConfigManager:
             return max(0, int(value))
         except (OverflowError, TypeError, ValueError):
             return max(0, int(default))
+
+    @staticmethod
+    def _parse_fetch_pot(value) -> str:
+        """把 PO Token 取用策略配置归一成 yt-dlp 认得的英文枚举值。
+
+        WebUI 里给的是中文选项，非法值一律回落 auto——这一项只影响性能与
+        成功率，不该因为拼错就让整份配置解析失败。
+        """
+        text = str(value or "").strip().lower()
+        mapping = {
+            "自动": "auto",
+            "总是": "always",
+            "从不": "never",
+            "auto": "auto",
+            "always": "always",
+            "never": "never",
+        }
+        return mapping.get(text, "auto")
 
     @staticmethod
     def _parse_youtube_max_height(value) -> int:

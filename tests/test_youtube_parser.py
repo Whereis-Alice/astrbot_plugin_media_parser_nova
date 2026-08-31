@@ -40,6 +40,7 @@ from nova_core.parser.platform.youtube import (
     thumbnail_candidates,
 )
 from nova_core.parser.platform.youtube import _Deadline
+from nova_core.parser.platform import youtube as youtube_platform
 from nova_core.parser.runtime_manager.youtube import (
     JS_RUNTIME_PREFERENCE,
     YouTubeCookieRuntime,
@@ -881,6 +882,32 @@ class ParserWiringTest(unittest.TestCase):
         self.assertIsNone(parser._ytdlp_resolver())
         # 关掉兜底时降级告警要提示用户存在这个开关。
         self.assertIn("ytdlp_fallback", parser._ytdlp_advice())
+
+    def test_ytdlp_pot_settings_reach_the_resolver(self):
+        parser = YouTubeParser(
+            ytdlp_pot_provider=" http://127.0.0.1:4416 ",
+            ytdlp_fetch_pot=" always ",
+        )
+        resolver = parser._ytdlp_resolver()
+        self.assertIsNotNone(resolver)
+        self.assertEqual(resolver.pot_provider, "http://127.0.0.1:4416")
+        self.assertEqual(resolver.fetch_pot, "always")
+
+    def test_ytdlp_advice_suggests_pot_provider_when_absent(self):
+        parser = YouTubeParser()
+        with mock.patch.object(
+            youtube_platform,
+            "probe_ytdlp_environment",
+            return_value=_ytdlp_env(),
+        ):
+            advice = parser._ytdlp_advice()
+        self.assertIn("bgutil-ytdlp-pot-provider", advice)
+        with mock.patch.object(
+            youtube_platform,
+            "probe_ytdlp_environment",
+            return_value=_ytdlp_env(pot_providers=("getpot_bgutil_script",)),
+        ):
+            self.assertEqual(parser._ytdlp_advice(), "")
 
     def test_ytdlp_resolver_inherits_stream_preferences(self):
         parser = YouTubeParser(
@@ -1866,6 +1893,68 @@ class YtDlpEnvironmentTest(unittest.TestCase):
             probe_ytdlp_environment("deno")
         self.assertEqual(calls, ["node", "deno"])
 
+    def test_pot_providers_are_reported_in_summary(self):
+        env = _ytdlp_env(
+            pot_providers=("getpot_bgutil_script", "getpot_bgutil_http")
+        )
+        summary = env.summary()
+        self.assertIn("POT 提供方", summary)
+        self.assertIn("bgutil_script", summary)
+        self.assertIn("bgutil_http", summary)
+
+    def test_missing_pot_provider_is_reported_but_still_ready(self):
+        # PO Token 提供方是可选增强件，缺它不该让兜底链路变成不可用。
+        env = _ytdlp_env()
+        self.assertTrue(env.ready)
+        self.assertIn("无 POT 提供方", env.summary())
+        self.assertEqual(env.advice(), "")
+        advice = env.pot_advice()
+        self.assertIn("bgutil-ytdlp-pot-provider", advice)
+
+    def test_pot_advice_empty_once_provider_present(self):
+        env = _ytdlp_env(pot_providers=("getpot_bgutil_script",))
+        self.assertEqual(env.pot_advice(), "")
+
+    @staticmethod
+    def _fake_plugin_namespace():
+        """伪造 yt_dlp_plugins.extractor 命名空间包（父包也要在 sys.modules）。"""
+        parent = types.ModuleType("yt_dlp_plugins")
+        parent.__path__ = ["/fake/plugins"]
+        child = types.ModuleType("yt_dlp_plugins.extractor")
+        child.__path__ = ["/fake/plugins/extractor"]
+        parent.extractor = child
+        return {
+            "yt_dlp_plugins": parent,
+            "yt_dlp_plugins.extractor": child,
+        }
+
+    def test_probe_pot_providers_picks_matching_modules(self):
+        listed = [
+            types.SimpleNamespace(name="getpot_bgutil_script"),
+            types.SimpleNamespace(name="getpot_bgutil_http"),
+            types.SimpleNamespace(name="some_other_plugin"),
+        ]
+        with mock.patch.dict(
+            sys.modules, self._fake_plugin_namespace()
+        ), mock.patch.object(
+            ytdlp_runtime.pkgutil, "iter_modules", return_value=listed
+        ):
+            found = ytdlp_runtime._probe_pot_providers()
+        self.assertEqual(
+            found, ("getpot_bgutil_http", "getpot_bgutil_script")
+        )
+
+    def test_probe_pot_providers_swallows_errors(self):
+        def boom(paths):
+            raise RuntimeError("坏掉的第三方插件目录")
+
+        with mock.patch.dict(
+            sys.modules, self._fake_plugin_namespace()
+        ), mock.patch.object(
+            ytdlp_runtime.pkgutil, "iter_modules", boom
+        ):
+            self.assertEqual(ytdlp_runtime._probe_pot_providers(), ())
+
     def test_runtime_preference_puts_deno_first(self):
         # 与 yt-dlp 官方顺序一致，便于对照上游文档排查。
         self.assertEqual(JS_RUNTIME_PREFERENCE[0], "deno")
@@ -2257,6 +2346,56 @@ class YtDlpOptionsTest(unittest.TestCase):
             options = resolver.build_options("/tmp/jar.txt")
         self.assertEqual(options["proxy"], "http://127.0.0.1:7890")
         self.assertEqual(options["cookiefile"], "/tmp/jar.txt")
+
+    def test_default_passes_no_extractor_args(self):
+        # auto + 未填地址时不该干扰 yt-dlp 与 provider 各自的默认判断。
+        options = self._options(
+            _ytdlp_env(pot_providers=("getpot_bgutil_script",))
+        )
+        self.assertNotIn("extractor_args", options)
+
+    def test_always_requires_a_provider_to_take_effect(self):
+        env = _ytdlp_env(pot_providers=("getpot_bgutil_script",))
+        options = self._options(env, fetch_pot="always")
+        self.assertEqual(
+            options["extractor_args"]["youtube"], {"fetch_pot": ["always"]}
+        )
+        # 没有提供方却强制取令牌只会让 yt-dlp 直接报错，所以不传。
+        self.assertNotIn(
+            "extractor_args", self._options(_ytdlp_env(), fetch_pot="always")
+        )
+
+    def test_never_always_passes_through(self):
+        options = self._options(_ytdlp_env(), fetch_pot="NEVER")
+        self.assertEqual(
+            options["extractor_args"]["youtube"], {"fetch_pot": ["never"]}
+        )
+
+    def test_unknown_fetch_pot_falls_back_to_auto(self):
+        resolver = YtDlpStreamResolver(fetch_pot="有时")
+        self.assertEqual(resolver.fetch_pot, "auto")
+
+    def test_http_provider_address_maps_to_base_url(self):
+        options = self._options(
+            _ytdlp_env(), pot_provider=" http://127.0.0.1:4416 "
+        )
+        args = options["extractor_args"]
+        self.assertEqual(
+            args["youtubepot-bgutilhttp"],
+            {"base_url": ["http://127.0.0.1:4416"]},
+        )
+        self.assertNotIn("youtubepot-bgutilscript", args)
+
+    def test_script_provider_path_maps_to_server_home(self):
+        options = self._options(
+            _ytdlp_env(), pot_provider="/root/bgutil-ytdlp-pot-provider/server"
+        )
+        args = options["extractor_args"]
+        self.assertEqual(
+            args["youtubepot-bgutilscript"],
+            {"server_home": ["/root/bgutil-ytdlp-pot-provider/server"]},
+        )
+        self.assertNotIn("youtubepot-bgutilhttp", args)
 
 
 class YtDlpResolveTest(unittest.TestCase):
