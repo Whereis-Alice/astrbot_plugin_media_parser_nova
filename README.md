@@ -379,7 +379,7 @@ YouTube 解析主路走官方 Innertube 接口，**不依赖任何第三方镜�
 | Innertube 客户端顺序 | `ios,android_vr` | 逗号分隔，按顺序试到拿到可下载的流为止 |
 | 单次解析总时间预算 | 45 秒 | 三层**共享**这一个预算，而不是每层各自超时 |
 | Cookie | 空 | 公开视频不需要。填入登录 Cookie 可绕过机器人验证、解析年龄限制内容 |
-| Cookie 失效时私聊管理员 | 开 | 检测到 Cookie 掉登录态时，向管理员私聊发一条带步骤的提醒（不打扰群聊） |
+| Cookie 失效时私聊管理员 | 开 | 检测到 Cookie 掉登录态时，向管理员私聊发一条带步骤的提醒（不打扰群聊）。若插件从没见过管理员的私聊会话，会退而发到管理员最近说话的那个会话，避免提醒彻底送不出去 |
 | Cookie 失效提醒冷却 | 120 分钟 | 两次提醒之间的最短间隔，避免刷屏 |
 | 自动跟进 Cookie 轮换 | 开 | 像真实浏览器一样吸收服务端下发的新 Cookie 并落盘，让手工导出的那份长期免维护 |
 | Cookie 保鲜间隔 | 6 小时 | 长期没有解析请求时主动触发一次轮换并体检登录态；填 0 关闭 |
@@ -449,7 +449,22 @@ pip install -U yt-dlp yt-dlp-ejs
 
 实测：装齐三件套但不带 Cookie，被门禁的视频依旧是 `Sign in to confirm you're not a bot`。兜底解决的是「拿不到直链」，不是「进不了门」——门还是得靠 Cookie 或住宅代理开。两者配齐才是完整方案。
 
-插件会把当前登录态（含自动吸收的轮换值）写成一份 Netscape cookies.txt 交给 yt-dlp，文件放在缓存目录下、权限 `0600`，只在 Cookie 真的发生轮换后才重写。你不需要额外为 yt-dlp 准备一份 Cookie。
+插件会把当前登录态（含自动吸收的轮换值）写成一份 Netscape cookies.txt 交给 yt-dlp，文件放在缓存目录下、权限 `0600`，**每次兜底前都按运行时的权威 Cookie 重写一遍**。你不需要额外为 yt-dlp 准备一份 Cookie。
+
+> 为什么必须每次重写：yt-dlp 收到 `cookiefile` 后，会在收工时把它自己的 cookie 罐**存回同一个文件**。如果这一趟 YouTube 下发过删除指令，`SID` / `SAPISID` / `LOGIN_INFO` 这些登录核心项就会被就地抹掉，文件从 24 项缩到 13 项——之后只要复用这份文件，兜底就永远按匿名跑，日志表现是「明明填了 Cookie 却一直 `Sign in to confirm you’re not a bot`」。插件自己的 `cookie.json` 是权威来源，yt-dlp 那份只是每次现生成的副本。
+
+#### 想彻底摆脱 Cookie：装一个 PO token provider
+
+「Sign in to confirm you’re not a bot」本质上是 YouTube 在要 **PO token**（BotGuard 出的证明令牌）。Cookie 只是绕开它的一种方式，而且在机房 IP 上很容易被吊销。社区的标准解是给 yt-dlp 装一个 PO token provider 插件，让它自己现场生成令牌：
+
+```bash
+pip install -U bgutil-ytdlp-pot-provider
+# 再按上游 README 起一个本地 provider 服务（Node，默认监听 4416）
+```
+
+装好后 yt-dlp 会自动发现它，插件这边**不需要任何配置改动**——第 ④ 层兜底照常调用 yt-dlp，只是它这次能自己过门禁。相比 Cookie 的好处是不会过期、也不用绑一个可能被风控的小号。代价是多跑一个常驻 Node 服务。
+
+插件自己仍然不实现 PO token（要跑一整套 BotGuard 虚拟机），这条只是把选择权交给你。
 
 #### 行为细节
 
@@ -492,7 +507,7 @@ pip install -U yt-dlp yt-dlp-ejs
 
 - **吸收**：每次 YouTube 响应里的 `Set-Cookie` 都会被合并回内存中的 Cookie 罐，后续请求发的是服务端最新认可的那份值。4xx 响应也会先吸收再报错——门禁响应同样会带新 Cookie。
 - **落盘**：合并结果原子写入缓存目录下的 `runtime_manager/youtube/cookie.json`（权限 `0600`），插件重载、AstrBot 重启后接着用轮换后的新值，而不是回退到配置里那份越来越旧的文本。
-- **保鲜**：默认每 6 小时主动向 `youtube.com` 发一次带登录态的轻量请求，主动触发一次轮换，顺带体检登录态。这样长期没人发 YouTube 链接的实例也不会把 Cookie 放到腐烂。
+- **保鲜**：默认每 6 小时主动向 `youtube.com` 首页发一次带登录态的轻量请求，主动触发一次轮换，顺带体检登录态：页面里的 `LOGGED_IN` 字段、或者被甩到 Google 登录页这件事本身，都会被判成「已掉登录态」并触发提醒。这样长期没人发 YouTube 链接的实例既不会把 Cookie 放到腐烂，也不会在 Cookie 已经死掉之后还一直沉默。
 
 几个刻意的设计约束：
 

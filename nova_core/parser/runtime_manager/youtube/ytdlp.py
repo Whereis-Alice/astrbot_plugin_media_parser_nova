@@ -372,7 +372,6 @@ class YtDlpStreamResolver:
         self.js_runtime = (js_runtime or "auto").strip().lower() or "auto"
         self.cookie_dir = (cookie_dir or "").strip()
         self._jar_path = ""
-        self._jar_token: Tuple[int, int] = (-1, -1)
         # yt-dlp 一次解析会起子进程并跑 JS，串行化避免并发请求把 CPU 打满。
         self._gate = asyncio.Semaphore(1)
 
@@ -386,8 +385,13 @@ class YtDlpStreamResolver:
     def _ensure_cookie_jar(self, cookie_header: str, revision: int) -> str:
         """把当前 Cookie 头落成 Netscape jar 供 yt-dlp 使用。
 
-        用 Cookie 运行时的 revision 做缓存键：只有真的发生过轮换才重写文件，
-        免得每次解析都做一次磁盘写。
+        每次调用都按运行时的权威 Cookie 重写文件，不做任何复用。原因：
+        yt-dlp 拿到 ``cookiefile`` 后会在收工时把它自己的 jar 存回同一个
+        路径，服务端下发过删除指令的条目（SID / SAPISID / LOGIN_INFO 等
+        登录核心）会被就地抹掉。一旦复用这份被削过的文件，兜底解析就会
+        永久按匿名跑。相比一次网络请求，写 2KB 磁盘的开销可以忽略。
+
+        ``revision`` 只为兼容调用方保留，不再参与任何缓存判定。
         """
         # 调用方通常给的是已规范化的 Cookie 头，但配置里也可能是整段
         # cookies.txt（WebUI 会把换行压成空格）。这里再兜一次，避免把一整
@@ -395,13 +399,6 @@ class YtDlpStreamResolver:
         header = normalize_cookie_input(cookie_header)
         if not header:
             return ""
-        token = (_as_int(revision), len(header))
-        if (
-            self._jar_path
-            and self._jar_token == token
-            and os.path.exists(self._jar_path)
-        ):
-            return self._jar_path
         cookies = parse_cookie_header(header)
         if not cookies:
             return ""
@@ -439,7 +436,6 @@ class YtDlpStreamResolver:
         path = self._write_jar(text)
         if path:
             self._jar_path = path
-            self._jar_token = token
         return path
 
     def _write_jar(self, text: str) -> str:

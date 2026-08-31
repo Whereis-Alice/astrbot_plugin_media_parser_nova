@@ -65,13 +65,14 @@ class YouTubeCookieNoticeManager(AdminAssistManager):
             now = time.monotonic()
             if now - self._last_request_at < self.request_cooldown_seconds:
                 return
-            origin: Optional[str] = self._admin_private_origin
+            origin: Optional[str] = self._admin_notify_origin()
             if not origin:
                 logger.warning(
-                    "[youtube] 检测到 Cookie 失效，但没有可用的管理员私聊会话，"
-                    "无法发送提醒（请让管理员先私聊机器人一次）"
+                    "[youtube] 检测到 Cookie 失效，但还没见过管理员的任何会话，"
+                    "无法发送提醒（请让管理员先跟机器人说一句话）"
                 )
                 return
+            fallback = origin != self._admin_private_origin
             previous_request_at = self._last_request_at
             self._last_request_at = now
 
@@ -90,6 +91,12 @@ class YouTubeCookieNoticeManager(AdminAssistManager):
                 f"本提醒 {cooldown_minutes} 分钟内只发一次。",
             ]
         )
+        if fallback:
+            # 没见过管理员私聊，只能发到他最近说话的会话（可能是群）。
+            text += (
+                "\n（没有可用的管理员私聊会话，本条发到了当前会话；"
+                "私聊机器人一次即可改为私聊提醒。）"
+            )
         try:
             await self._send_private_text(origin, text)
         except Exception:

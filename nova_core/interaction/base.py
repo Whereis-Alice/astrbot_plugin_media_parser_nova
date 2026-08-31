@@ -30,6 +30,9 @@ class AdminAssistManager(ABC):
         self.request_cooldown_seconds = max(1, int(request_cooldown_minutes) * 60)
 
         self._admin_private_origin: Optional[str] = None
+        # 兜底会话：管理员最近一次说话的任意会话（可能是群聊）。私聊会话在
+        # 进程重启后就没了，管理员若从不私聊机器人，单向通知会彻底送不出去。
+        self._admin_last_origin: Optional[str] = None
         self._waiting_confirm = False
         self._confirm_deadline = 0.0
         self._last_request_at = 0.0
@@ -70,11 +73,23 @@ class AdminAssistManager(ABC):
         except (AttributeError, TypeError):
             return False
 
+    def _is_admin_event(self, event: AstrMessageEvent) -> bool:
+        """判断事件是否由管理员发出（不限私聊）。"""
+        sender_id = self._normalize_sender_id(event.get_sender_id())
+        return bool(self.admin_id and sender_id == self.admin_id)
+
     def try_update_admin_origin(self, event: AstrMessageEvent) -> None:
-        """若消息来自管理员私聊，更新可用的私聊会话标识。"""
-        if self._is_admin_private_event(event) and self._is_user_message_event(event):
+        """记录管理员的可用会话标识：优先私聊，另存一个任意会话兜底。"""
+        if not self._is_admin_event(event) or not self._is_user_message_event(event):
+            return
+        self._admin_last_origin = event.unified_msg_origin
+        if event.is_private_chat():
             self._admin_private_origin = event.unified_msg_origin
             logger.debug("已更新管理员私聊会话标识")
+
+    def _admin_notify_origin(self) -> Optional[str]:
+        """取一个可用于单向通知的会话：私聊优先，其次管理员最近会话。"""
+        return self._admin_private_origin or self._admin_last_origin
 
     def _new_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
         """登记后台任务并在任务结束后自动回收引用。"""

@@ -45,6 +45,7 @@ __all__ = [
     "YouTubeCookieRuntime",
     "build_sapisid_authorization",
     "collect_set_cookie_headers",
+    "detect_logged_in_from",
     "normalize_cookie_input",
     "parse_cookie_header",
 ]
@@ -52,7 +53,10 @@ __all__ = [
 
 YOUTUBE_ORIGIN = "https://www.youtube.com"
 
-_KEEPALIVE_URL = "https://www.youtube.com/account"
+# 保鲜请求打首页而不是 /account：实测登录态失效时 /account 仍回 200，但
+# 页面里根本不带 ytcfg 的 LOGGED_IN 字段，导致保鲜永远「未读出登录态」，
+# Cookie 早就被吊销也无法提前预警。首页则稳定输出 "LOGGED_IN":true/false。
+_KEEPALIVE_URL = "https://www.youtube.com/"
 _KEEPALIVE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -112,6 +116,16 @@ _LOGGED_IN_PATTERNS = (
     re.compile(r'"loggedIn"\s*:\s*(true|false)'),
 )
 _LOGGED_IN_TRUE = frozenset(("true", "1"))
+
+# 会话已死时 YouTube 往往直接把请求甩到 Google 登录页；最终 URL 命中这些
+# 片段就可以直接判未登录，不必等页面里那个可能缺席的 LOGGED_IN 字段。
+_SIGNED_OUT_URL_HINTS = (
+    "accounts.google.com",
+    "accounts.youtube.com",
+    "servicelogin",
+    "/signin",
+    "consent.youtube.com",
+)
 
 
 # ── Cookie 基础操作 ──────────────────────────────────────
@@ -343,6 +357,21 @@ def _detect_logged_in(html: str) -> Optional[bool]:
         if match:
             return match.group(1).lower() in _LOGGED_IN_TRUE
     return None
+
+
+def _is_signed_out_url(url: str) -> bool:
+    """最终落地 URL 是否是登录/同意页。"""
+    lowered = (url or "").lower()
+    if not lowered:
+        return False
+    return any(hint in lowered for hint in _SIGNED_OUT_URL_HINTS)
+
+
+def detect_logged_in_from(html: str, final_url: str = "") -> Optional[bool]:
+    """综合页面内容与最终 URL 判断登录态；仍然读不出才返回 None。"""
+    if _is_signed_out_url(final_url):
+        return False
+    return _detect_logged_in(html)
 
 
 class YouTubeCookieRuntime:
@@ -607,6 +636,7 @@ class YouTubeCookieRuntime:
             ) as response:
                 rotated = self.absorb_response(response)
                 status = response.status
+                final_url = str(response.url)
                 html = await response.text()
         except asyncio.CancelledError:
             raise
@@ -616,14 +646,17 @@ class YouTubeCookieRuntime:
 
         await self.flush()
         self._last_keepalive_at = time.time()
-        logged_in = _detect_logged_in(html)
+        logged_in = detect_logged_in_from(html, final_url)
         self._last_keepalive_ok = logged_in
         detail = [f"HTTP {status}"]
         detail.append("已吸收轮换" if rotated else "无新轮换")
         if logged_in is True:
             detail.append("服务端确认已登录")
         elif logged_in is False:
-            detail.append("服务端判定未登录（Cookie 可能已失效）")
+            if _is_signed_out_url(final_url):
+                detail.append("被重定向到登录页（Cookie 已失效）")
+            else:
+                detail.append("服务端判定未登录（Cookie 可能已失效）")
         else:
             detail.append("未读出登录态")
         return logged_in, "，".join(detail)
