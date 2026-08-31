@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..card import (
+    AUTO_THEME_KEY,
     LAYOUT_KEYS,
     PLATFORM_ACCENTS,
     THEME_KEYS,
     TypeSetter,
     build_model,
     clean_text,
+    is_auto_theme,
     limit_chars,
     parse_stats,
     render_card_image,
@@ -48,7 +50,8 @@ DEFAULT_WATERMARK_TAG = "Nova解析"
 
 #: 卡片样式版本：视觉变化时必须 +1，否则用户侧已缓存的旧卡片不会重新渲染。
 #: 19 = 全新 nova_core.card 设计系统（主题 / 布局 / 深浅色三者全部生效）。
-_CARD_STYLE_VERSION = "24"
+#: 25 = 修复「跟随平台」被提前归一成极光；通用皮肤眉标去掉平台徽章与类型标签。
+_CARD_STYLE_VERSION = "25"
 
 #: 布局与风格枚举（直接取自设计系统，避免两处枚举漂移）
 LAYOUT_NAMES: tuple[str, ...] = LAYOUT_KEYS
@@ -121,7 +124,9 @@ class ShareCardRenderer:
         self.width = max(520, min(1080, width_value))
         self.theme_name = resolve_mode(theme)
         self.layout_name = resolve_layout_key(layout)
-        self.skin_name = resolve_theme_key(skin)
+        # 「跟随平台」是哨兵而不是真皮肤：必须原样带到 render_card_image，
+        # 由 build_context 结合 model.platform_key 现场决定，不能在这里归一掉。
+        self.skin_name = AUTO_THEME_KEY if is_auto_theme(skin) else resolve_theme_key(skin)
         self.font_path = font_path
         self.show_play_button = bool(show_play_button)
         self.cover_full_size = bool(cover_full_size)

@@ -995,6 +995,69 @@ def test_auto_theme_follows_the_link_platform() -> None:
 
 
 @pytest.mark.parametrize(
+    ("skin_value", "platform", "expected"),
+    (
+        ("跟随平台", "bilibili", "bilibili"),
+        ("auto", "twitter", "x"),
+        ("跟随平台", "x", "x"),
+        ("跟随平台", "youtube", "youtube"),
+        ("跟随平台", "weibo", "bilibili"),
+        ("跟随平台", "pixiv", "aurora"),
+        ("nocturne", "bilibili", "nocturne"),
+        ("哔哩哔哩", "pixiv", "bilibili"),
+    ),
+)
+def test_renderer_hands_the_auto_sentinel_to_the_engine(
+    tmp_path: Path, skin_value: str, platform: str, expected: str
+) -> None:
+    """ShareCardRenderer 不能把「跟随平台」提前归一掉。
+
+    这是一条真实回归：曾经 __init__ 里直接调 resolve_theme_key(skin)，它不认识
+    auto 哨兵，于是兜底成极光——用户选了"跟随平台"却只拿到极光皮肤 + 平台强调色。
+    所以这里必须从 renderer 一路断言到 build_context 定下的 theme.key。
+    """
+    renderer = ShareCardRenderer(cache_dir=tmp_path, skin=skin_value, width=520)
+    if is_auto_theme(skin_value):
+        assert renderer.skin_name == AUTO_THEME_KEY
+    else:
+        assert renderer.skin_name in THEME_KEYS
+
+    model = build_model(
+        make_result(platform=platform, display_name=platform),
+        {"avatar": None, "hero": None, "grid": []},
+    )
+    ctx = card_engine.build_context(model, width=520, theme_key=renderer.skin_name)
+    assert ctx.theme.key == expected, (
+        f"skin={skin_value!r} platform={platform!r} 应得到 {expected}，实际 {ctx.theme.key}"
+    )
+
+
+#: 五套通用皮肤（不含 bilibili / x / youtube 三套仿站皮肤）
+GENERIC_THEMES = tuple(k for k in THEME_KEYS if k not in ("bilibili", "x", "youtube"))
+
+
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+@pytest.mark.parametrize("theme", GENERIC_THEMES)
+def test_generic_skins_drop_platform_badge_and_type_tag(
+    rich_model: Any, theme: str, layout: str
+) -> None:
+    """通用皮肤的左上角不再贴平台徽章与「视频 / 图文」标签。
+
+    站点身份由页脚的完整链接表达，内容类型由媒体区块本身表达；两者都堆在标题
+    上方只会把卡片顶部变成标签墙。眉标退化为「记号 + 发布时间」，时间必须还在。
+    """
+    probe = render_probe(rich_model, width=MATRIX_WIDTH, theme_key=theme, layout_key=layout)
+
+    assert "推特" not in probe.texts, f"{theme}/{layout} 仍在画平台徽章：{probe.texts}"
+    assert "图文" not in probe.texts, f"{theme}/{layout} 仍在画内容类型标签：{probe.texts}"
+    stamp = rich_model.time_text
+    assert stamp
+    assert any(stamp in text for text in probe.texts), (
+        f"{theme}/{layout} 去掉徽章后连发布时间都没了：{probe.texts}"
+    )
+
+
+@pytest.mark.parametrize(
     "kind",
     ("heart", "check", "repost", "export", "bookmark", "comment", "sort", "play"),
 )
@@ -1027,6 +1090,20 @@ def test_x_chrome_swaps_furniture_for_the_platform(x_model: Any) -> None:
     # 输入框占位与 B 站不同。
     assert "发布你的回复" in probe.texts
     assert "点我发评论" not in joined
+
+
+@pytest.mark.parametrize("theme", ("bilibili", "x", "youtube"))
+def test_x_furniture_keeps_its_own_brand_colors(x_model: Any, theme: str) -> None:
+    """X 的家具自带配色：已赞粉心与蓝勾角标不许被皮肤的辅助强调色染掉。
+
+    这是一条真实回归：心形原先取 ctx.accent_alt，于是「哔哩哔哩皮肤 + X 家具」
+    把 X 的粉心画成了 B 站蓝；蓝勾同理。家具属于平台，与皮肤无关。
+    """
+    probe = render_probe(x_model, width=800, theme_key=theme, layout_key="feed")
+    palette = {px for px in probe.image.convert("RGB").getdata()}
+
+    assert card_blocks.X_LIKE_PINK in palette, f"{theme} 皮肤下 X 的已赞心形被染色了"
+    assert card_blocks.X_VERIFIED_BLUE in palette, f"{theme} 皮肤下 X 的认证角标被染色了"
 
 
 def test_x_chrome_time_row_leads_with_time_and_says_views(x_model: Any) -> None:

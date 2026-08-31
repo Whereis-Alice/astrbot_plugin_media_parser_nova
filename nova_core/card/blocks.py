@@ -191,8 +191,9 @@ class ChromeAction:
     :param solid: 是否用品牌色实心图标（对应客户端里"已互动"的观感）。
     :param always_show: 既没有数值也没有文案时是否仍画出图标。X 的分享箭头
         就是这种纯图标动作，缺了它操作栏会少一枚、和原版对不上。
-    :param alt_tint: 实心时用辅助强调色而不是主强调色。X 的已赞心形是粉色
-        #F91880，而它的主强调色是蓝色，两者不能混用。
+    :param tint: 实心时强行使用的品牌色。这是「家具自带的颜色」，与皮肤无关：
+        X 的已赞心形永远是粉色 #F91880，哪怕当前皮肤的辅助色是 B 站蓝，
+        也不能被染色。留 None 表示跟随皮肤主强调色。
     """
 
     kind: str
@@ -200,7 +201,7 @@ class ChromeAction:
     label: str = ""
     solid: bool = False
     always_show: bool = False
-    alt_tint: bool = False
+    tint: RGB | None = None
 
     def resolve_stats(self) -> tuple[str, ...]:
         return self.stats or (self.kind,)
@@ -243,6 +244,10 @@ class ChromeProfile:
     :param identity_sub: 作者行第二行放什么，``time`` 或 ``handle``。X 的名字
         下面是灰色 @handle，时间被挪到补充说明行。
     :param verified_glyph: 头像认证角标里的图标种类（X / YouTube 是对勾）。
+    :param verified_tint: 认证角标的圆底颜色。它跟图标一样属于家具本身——X 的
+        蓝勾在任何皮肤下都是 X 蓝，YouTube 的是灰勾——所以不跟皮肤的辅助强调色
+        走。``None`` 表示沿用皮肤的辅助强调色（中文社交那枚蓝闪电就是
+        这样）。
     :param comment_head: 评论区的 (标题, 排序文案)。
     :param comment_actions: 每条评论正文下方的迷你操作行图标种类；空元组表示
         改用「名字右侧一枚赞」的中文社交样式。
@@ -260,10 +265,20 @@ class ChromeProfile:
     ipnote_lead_time: bool = False
     identity_sub: str = "time"
     verified_glyph: str = "bolt"
+    verified_tint: RGB | None = None
     comment_head: tuple[str, str] = ("热门评论", "按热度")
     comment_actions: tuple[str, ...] = ()
     cover_meta: bool = True
 
+
+#: X 客户端里「已赞」心形的粉色。它属于 X 这套家具本身，任何皮肤下都不变色。
+X_LIKE_PINK: RGB = (249, 24, 128)
+
+#: X 的认证蓝勾底色。同理属于家具，与皮肤无关。
+X_VERIFIED_BLUE: RGB = (29, 155, 240)
+
+#: YouTube 的认证角标是灰底白勾（不是蓝的），照原版取中性灰。
+YT_VERIFIED_GREY: RGB = (144, 144, 144)
 
 #: 中文社交动态（B 站 / 微博 / 小红书…）的通用 chrome，也是未知平台的兜底。
 #: 形态严格照 B 站客户端详情页最底部那条：纯数字，没有文案。
@@ -292,6 +307,7 @@ CHROME_YOUTUBE = ChromeProfile(
     comment_hint="添加评论…",
     action_style="pill",
     verified_glyph="check",
+    verified_tint=YT_VERIFIED_GREY,
     comment_head=("评论", "排序依据"),
 )
 
@@ -309,7 +325,7 @@ CHROME_X = ChromeProfile(
     actions=(
         ChromeAction("comment"),
         ChromeAction("repost", stats=("share",)),
-        ChromeAction("heart", stats=("like",), solid=True, alt_tint=True),
+        ChromeAction("heart", stats=("like",), solid=True, tint=X_LIKE_PINK),
         ChromeAction("bookmark", stats=("star",), always_show=True),
         ChromeAction("export", always_show=True),
     ),
@@ -321,6 +337,7 @@ CHROME_X = ChromeProfile(
     ipnote_lead_time=True,
     identity_sub="handle",
     verified_glyph="check",
+    verified_tint=X_VERIFIED_BLUE,
     comment_head=("回复", "相关"),
     comment_actions=("comment", "repost", "heart"),
     cover_meta=False,
@@ -480,10 +497,13 @@ def _cover_meta(ctx: Any) -> list[tuple[str, str]]:
 
 
 def _meta_parts(ctx: Any) -> list[str]:
+    """眉标右侧的次要信息。
+
+    只保留时间与在线人数：内容类型（视频 / 图文）已由媒体区块自身表达，站点
+    身份由页脚的完整链接表达，再贴一遍只会让卡片顶部变成标签墙。
+    """
     model = ctx.model
     parts: list[str] = []
-    if model.content_type:
-        parts.append(model.content_type)
     if model.time_text:
         parts.append(model.time_text)
     if model.online:
@@ -585,115 +605,127 @@ class EyebrowBlock(Block):
 
     def draw(self, ctx: Any, layer: Any, x: int, y: int, width: int) -> None:
         m, model, th = ctx.m, ctx.model, ctx.theme
-        label = model.platform_name or "网页"
-        if th.uppercase_eyebrow:
-            label = label.upper()
-        tracking = th.tracking_eyebrow
-        meta = " · ".join(_meta_parts(ctx))
-        meta_font = ctx.font(m.f_meta)
 
         if self.variant == "bili_top":
             self._draw_bili_top(ctx, layer, x, y, width)
             return
 
-        if self.variant == "chip":
-            cursor = x
-            cursor += _chip(
-                ctx,
+        # 通用皮肤的眉标只做两件事：给版面一个开场记号，报出发布时间。
+        # 平台徽章与「视频 / 图文」标签都已去掉——站点身份由页脚的完整链接
+        # 表达，内容类型由媒体区块本身表达，贴在左上角只会显得违和。
+        meta_font = ctx.font(m.f_meta)
+        tracking = th.tracking_eyebrow
+        stamp = model.time_text or ""
+        if stamp and th.uppercase_eyebrow:
+            stamp = stamp.upper()
+        aside = f"在线 {model.online}" if model.online else ""
+        aside_lh = ctx.ts.line_height(meta_font, 1.0)
+
+        def draw_aside(row_h: int) -> None:
+            """把在线人数右对齐到同一行，四个变体共用一套几何。"""
+            if not aside:
+                return
+            aside_w = ctx.ts.width(aside, meta_font)
+            ctx.text(
                 layer,
-                cursor,
-                y,
-                label,
-                fill=alpha(ctx.accent, 255),
-                ink=ctx.accent_ink,
-                font=ctx.font(m.f_eyebrow, bold=True),
-                tracking=tracking,
-                bold=True,
+                (x + width - aside_w, y + (row_h - aside_lh) // 2),
+                aside,
+                meta_font,
+                ctx.ink_muted,
             )
-            if model.content_type:
-                cursor += m.gap_xs
-                cursor += _chip(
-                    ctx,
+
+        if self.variant == "chip":
+            # 极光：一枚强调色圆点起手，后面跟一条同色渐隐短线，像时间轴的节点
+            font = ctx.font(m.f_eyebrow, bold=True)
+            lh = ctx.ts.line_height(font, 1.0)
+            dot = max(5, int(round(m.unit * 1.5)))
+            cy = y + m.chip_h // 2
+            surface.panel(
+                layer,
+                (x, cy - dot // 2, x + dot, cy - dot // 2 + dot),
+                dot // 2,
+                fill=alpha(ctx.accent, 255),
+            )
+            cursor = x + dot + m.gap_sm
+            if stamp:
+                cursor += ctx.text(
                     layer,
-                    cursor,
-                    y,
-                    model.content_type,
-                    fill=alpha(ctx.accent, ctx.pal.accent_wash),
-                    ink=ctx.accent_text,
-                    border=ctx.hair,
-                    font=ctx.font(m.f_eyebrow),
+                    (cursor, y + (m.chip_h - lh) // 2),
+                    stamp,
+                    font,
+                    ctx.accent_text,
+                    tracking=tracking,
+                    bold=True,
                 )
-            tail = " · ".join(p for p in (model.time_text, f"在线 {model.online}" if model.online else "") if p)
-            if tail:
-                tw = ctx.ts.width(tail, meta_font)
-                if cursor + m.gap_sm + tw <= x + width:
-                    ty = y + (m.chip_h - ctx.ts.line_height(meta_font, 1.0)) // 2
-                    ctx.text(layer, (x + width - tw, ty), tail, meta_font, ctx.ink_muted)
+                cursor += m.gap_sm
+            aside_w = (ctx.ts.width(aside, meta_font) + m.gap_sm) if aside else 0
+            tail_end = x + width - aside_w
+            if tail_end - cursor > m.gap_md:
+                surface.hairline(layer, cursor, cy, tail_end, alpha(ctx.accent, 90))
+            draw_aside(m.chip_h)
             return
 
         if self.variant == "plate":
+            # 展陈 / 夜曲：强调色竖条 + 日期，下面压一条发丝线当基座
             font = ctx.font(m.f_eyebrow, bold=True)
             bar_w = max(3, m.unit)
             surface.panel(layer, (x, y, x + bar_w, y + m.chip_h), 0, fill=alpha(ctx.accent, 255))
-            ty = y + (m.chip_h - ctx.ts.line_height(font, 1.0)) // 2
-            ctx.text(layer, (x + bar_w + m.gap_sm, ty), label, font, ctx.ink, tracking=tracking, bold=True)
-            if meta:
-                mw = ctx.ts.width(meta, meta_font)
+            if stamp:
+                ty = y + (m.chip_h - ctx.ts.line_height(font, 1.0)) // 2
                 ctx.text(
                     layer,
-                    (x + width - mw, y + (m.chip_h - ctx.ts.line_height(meta_font, 1.0)) // 2),
-                    meta,
-                    meta_font,
-                    ctx.ink_muted,
+                    (x + bar_w + m.gap_sm, ty),
+                    stamp,
+                    font,
+                    ctx.ink,
+                    tracking=tracking,
+                    bold=True,
                 )
+            draw_aside(m.chip_h)
             surface.hairline(layer, x, y + m.chip_h + m.gap_xs, x + width, ctx.hair)
             return
 
         if self.variant == "bracket":
+            # 测控：日期夹在强调色方括号里，配虚线，读起来像一条遥测记录
             font = ctx.font(m.f_eyebrow, bold=True)
             lh = ctx.ts.line_height(font, 1.0)
             cursor = x
-            cursor += ctx.text(layer, (cursor, y), "[", font, alpha(ctx.accent, 235)) + m.gap_2xs * 2
-            cursor += ctx.text(layer, (cursor, y), label, font, ctx.accent_text, tracking=tracking, bold=True)
+            cursor += ctx.text(layer, (cursor, y), "[", font, alpha(ctx.accent, 235))
             cursor += m.gap_2xs * 2
-            cursor += ctx.text(layer, (cursor, y), "]", font, alpha(ctx.accent, 235))
-            if model.content_type:
-                cursor += m.gap_sm
-                cursor += ctx.text(layer, (cursor, y), "/ " + model.content_type, font, ctx.ink_dim, tracking=tracking * 0.5)
-            tail = model.time_text
-            if tail:
-                tw = ctx.ts.width(tail, meta_font)
-                ctx.text(layer, (x + width - tw, y), tail, meta_font, ctx.ink_muted)
-            surface.hairline(layer, x, y + lh + m.gap_xs, x + width, ctx.hair, dash=max(3, m.unit))
+            if stamp:
+                cursor += ctx.text(
+                    layer, (cursor, y), stamp, font, ctx.accent_text, tracking=tracking, bold=True
+                )
+                cursor += m.gap_2xs * 2
+            ctx.text(layer, (cursor, y), "]", font, alpha(ctx.accent, 235))
+            draw_aside(lh)
+            surface.hairline(
+                layer, x, y + lh + m.gap_xs, x + width, ctx.hair, dash=max(3, m.unit)
+            )
             return
 
-        # rule：报章式细规则线 + 极宽字距
+        # rule：报章式实心方块 + 极宽字距的日期 + 一条重一点的规则线
         font = ctx.font(m.f_eyebrow, bold=True)
         lh = ctx.ts.line_height(font, 1.0)
         row_h = max(m.unit * 2, lh)
         square = max(4, int(m.unit * 1.6))
-        surface.panel(layer, (x, y + (row_h - square) // 2, x + square, y + (row_h + square) // 2), 0, fill=alpha(ctx.accent, 255))
-        cursor = x + square + m.gap_sm
-        cursor += ctx.text(layer, (cursor, y + (row_h - lh) // 2), label, font, ctx.ink, tracking=tracking, bold=True)
-        if model.content_type:
-            cursor += m.gap_sm
+        surface.panel(
+            layer,
+            (x, y + (row_h - square) // 2, x + square, y + (row_h + square) // 2),
+            0,
+            fill=alpha(ctx.accent, 255),
+        )
+        if stamp:
             ctx.text(
                 layer,
-                (cursor, y + (row_h - lh) // 2),
-                model.content_type,
-                ctx.font(m.f_eyebrow),
-                ctx.ink_muted,
-                tracking=tracking * 0.6,
+                (x + square + m.gap_sm, y + (row_h - lh) // 2),
+                stamp,
+                font,
+                ctx.ink,
+                tracking=tracking,
+                bold=True,
             )
-        if model.time_text:
-            tw = ctx.ts.width(model.time_text, meta_font)
-            ctx.text(
-                layer,
-                (x + width - tw, y + (row_h - ctx.ts.line_height(meta_font, 1.0)) // 2),
-                model.time_text,
-                meta_font,
-                ctx.ink_muted,
-            )
+        draw_aside(row_h)
         surface.hairline(layer, x, y + row_h + m.gap_xs, x + width, alpha(ctx.ink, 150))
 
 
@@ -768,17 +800,19 @@ class IdentityBlock(Block):
     def _bili_badge(self, ctx: Any, layer: Any, x: int, y: int, size: int) -> None:
         """头像右下角的认证角标：品牌色圆底 + 底色描边 + 平台自己的图标。
 
-        图标种类按平台 chrome 取：中文社交是闪电，X / YouTube 是对勾。
+        图标种类与底色都按平台 chrome 取：中文社交是蓝闪电，X 是蓝勾，
+        YouTube 是灰勾。只有中文社交那枚会跟着皮肤的辅助强调色走。
         """
         m = ctx.m
         bs = max(11, int(size * 0.30))
         bx1, by1 = x + size, y + size
         box = (bx1 - bs, by1 - bs, bx1, by1)
+        badge_tint = _chrome(ctx).verified_tint or ctx.accent_alt or ctx.accent
         surface.panel(
             layer,
             box,
             bs // 2,
-            fill=alpha(ctx.accent_alt or ctx.accent, 255),
+            fill=alpha(badge_tint, 255),
             border=alpha(ctx.panel_bg, 255),
             border_width=max(1, int(m.hairline * 2)),
         )
@@ -900,8 +934,10 @@ class IdentityBlock(Block):
             ty = y + m.gap_sm
             ctx.text(layer, (tx, ty), ctx.ts.ellipsize(name, name_f, avail), name_f, ctx.ink, bold=True)
             ty += ctx.ts.line_height(name_f, 1.0)
-            sub = handle or (model.platform_name + " · " + model.content_type if model.content_type else model.platform_name)
-            ctx.text(layer, (tx, ty), ctx.ts.ellipsize(sub, meta_f, avail), meta_f, ctx.ink_muted)
+            # 没有 @handle 时退回发布时间，而不是再贴一遍平台名 + 内容类型
+            sub = handle or model.time_text
+            if sub:
+                ctx.text(layer, (tx, ty), ctx.ts.ellipsize(sub, meta_f, avail), meta_f, ctx.ink_muted)
             del label_f
             return
 
@@ -1518,7 +1554,9 @@ class MediaBlock(Block):
 
         if plan["caption_h"] and self.variant == "framed":
             font = ctx.font(m.f_caption)
-            label = model.content_type or "图像"
+            # 展陈皮肤的博物馆式图注：说明词由实际媒体推出来，而不是复用左上角
+            # 那个已经被去掉的「视频 / 图文」标签。
+            label = "影像" if any(item.is_video for item in model.media) else "图版"
             caption = f"{label} · 共 {model.total_media} 项" if model.total_media > 1 else label
             cy = y + plan["grid_h"] + mat * 2 + ctx.m.gap_xs // 2
             ctx.text(layer, (x, cy), caption, font, ctx.ink_muted, tracking=1.4)
@@ -2663,7 +2701,7 @@ class FooterBlock(Block):
                     "kind": action.kind,
                     "text": text,
                     "solid": action.solid,
-                    "alt_tint": action.alt_tint,
+                    "tint": action.tint,
                     "col": col,
                     "text_w": text_w,
                     "height": item_h,
@@ -2763,9 +2801,10 @@ class FooterBlock(Block):
         num_f = plan["num_f"]
         text = str(item["text"])
         # 实心=品牌色（对应原版"已互动"的观感），其余走中性
-        if item.get("alt_tint"):
-            # X 的已赞心形是粉色，主强调色是蓝色，走辅助色才对得上原版
-            brand = getattr(ctx, "accent_alt", None) or ctx.accent
+        own_color = item.get("tint")
+        if own_color is not None:
+            # 家具自带的品牌色（X 的已赞粉）：与皮肤无关，也不跟随辅助强调色
+            brand = tuple(own_color)
             solid_text = brand
         else:
             brand = ctx.accent
@@ -2986,6 +3025,11 @@ class RowBlock(Block):
             _stack_draw(ctx, layer, self.side, side_x, y, side_w, ctx.m.gap_md)
 
 
+def _hero_rule_h(m: Any) -> int:
+    """沉浸压字区那道强调色短标尺的粗细（_plan 与 draw 共用，避免高度漂移）。"""
+    return max(3, int(round(m.unit * 1.1)))
+
+
 @dataclass
 class ImmersiveHeroBlock(Block):
     """全幅 hero + 底部渐隐压字（沉浸布局）。"""
@@ -3009,7 +3053,7 @@ class ImmersiveHeroBlock(Block):
         lines = ctx.ts.fit(model.title, title_f, inner, 3) if model.title else []
         meta_f = ctx.font(m.f_meta)
         overlay_h = m.gap_lg
-        overlay_h += m.chip_h + m.gap_sm
+        overlay_h += _hero_rule_h(m) + m.gap_sm
         overlay_h += ctx.ts.paragraph_height(lines, title_f, m.lh_tight)
         overlay_h += m.gap_sm + ctx.ts.line_height(meta_f, 1.2)
         overlay_h += m.gap_lg
@@ -3078,36 +3122,17 @@ class ImmersiveHeroBlock(Block):
             h = ctx.ts.paragraph_height(lines, title_f, m.lh_tight)
             base -= m.gap_sm + h
             ctx.para(layer, (inner_x, base), lines, title_f, (255, 255, 255), leading=m.lh_tight, bold=True)
-        label = model.platform_name or "网页"
-        if ctx.theme.uppercase_eyebrow:
-            label = label.upper()
-        base -= m.gap_sm + m.chip_h
-        cursor = inner_x
-        cursor += _chip(
-            ctx,
+        # 压字区不再贴平台徽章与内容类型标签：上面的「作者 · 时间」已经交代了
+        # 出处，站点全名留给页脚的链接。这里只补一道强调色短标尺当视觉起点。
+        rule_h = _hero_rule_h(m)
+        base -= m.gap_sm + rule_h
+        rule_w = max(m.gap_lg, int(round(inner_w * 0.16)))
+        surface.panel(
             layer,
-            cursor,
-            base,
-            label,
+            (inner_x, base, inner_x + rule_w, base + rule_h),
+            rule_h // 2,
             fill=alpha(ctx.accent, 250),
-            ink=ctx.accent_ink,
-            font=ctx.font(m.f_eyebrow, bold=True),
-            tracking=ctx.theme.tracking_eyebrow,
-            bold=True,
         )
-        if model.content_type:
-            cursor += m.gap_xs
-            _chip(
-                ctx,
-                layer,
-                cursor,
-                base,
-                model.content_type,
-                fill=(255, 255, 255, 40),
-                ink=(255, 255, 255),
-                border=(255, 255, 255, 90),
-                font=ctx.font(m.f_eyebrow),
-            )
 
 
 # ============================ 堆叠工具 ============================
