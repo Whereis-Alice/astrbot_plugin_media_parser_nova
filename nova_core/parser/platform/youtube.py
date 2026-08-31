@@ -72,6 +72,11 @@ __all__ = [
 
 # ── 常量 ──────────────────────────────────────────────────
 
+# InnerTube 的 web 客户端 API key。这是 Google 自己内联在每个 youtube.com 页面里的
+# 公开常量，全网所有 YouTube 逆向实现（yt-dlp、youtube.js、pytube 等）都硬编码同一个
+# 值；它不由 Cloud Console 签发，不绑定账号也不绑定计费，因此可以随代码分发。
+# GitHub 的 secret scanning 只按 AIza + 35 字符这个格式匹配，无法区分公开客户端常量
+# 和私有 Cloud key，所以会在这一行报一条 Google API Key 告警——那是误报，无需轮换。
 INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 INNERTUBE_BASE = "https://www.youtube.com/youtubei/v1"
 _COMMENTS_PANEL_ID = "engagement-panel-comments-section"
