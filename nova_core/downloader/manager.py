@@ -16,6 +16,7 @@ from ..logger import logger
 from ..storage import cleanup_directory, cleanup_file
 from .fileio import gather_cancel_on_error, run_blocking
 from .router import download_media
+from .transcode import transcode_video_to_size
 from .utils import check_cache_dir_available, strip_media_prefixes
 from .validator import get_video_size, validate_media_url
 from .handler.video_cover import extract_video_cover_to_cache
@@ -43,6 +44,8 @@ class DownloadManager:
         cache_dir_available: Optional[bool] = None,
         max_concurrent_downloads: int = None,
         video_cover_only: bool = False,
+        transcode_oversize_video: bool = False,
+        transcode_timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
     ):
         self.max_video_size_mb = self._normalize_size_cap(max_video_size_mb)
         self.large_video_threshold_mb = self._normalize_size_cap(
@@ -66,6 +69,10 @@ class DownloadManager:
             concurrency = Config.DOWNLOAD_MANAGER_MAX_CONCURRENT
         self._download_semaphore = asyncio.Semaphore(concurrency)
         self.video_cover_only = bool(video_cover_only)
+        self.transcode_oversize_video = bool(transcode_oversize_video)
+        self.transcode_timeout_seconds = self._normalize_transcode_timeout(
+            transcode_timeout_seconds
+        )
 
         self._active_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
@@ -83,6 +90,18 @@ class DownloadManager:
             return 0.0
         return normalized
 
+    @staticmethod
+    def _normalize_transcode_timeout(value: Any) -> int:
+        """把压缩超时归一化到合理区间，非法值回落默认。"""
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError):
+            seconds = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS
+        return max(
+            Config.MIN_TRANSCODE_TIMEOUT_SECONDS,
+            min(seconds, Config.MAX_TRANSCODE_TIMEOUT_SECONDS),
+        )
+
     def _video_size_limit(self, size_mb: float) -> Tuple[str, float]:
         """返回 (limit_kind, cap_mb)。未超限时 kind 为空串，否则为 max/send。"""
         if self.max_video_size_mb > 0 and size_mb > self.max_video_size_mb:
@@ -97,13 +116,14 @@ class DownloadManager:
         size_mb: float,
         cap_mb: float,
         downloaded: bool = False,
+        transcode_error: Optional[str] = None,
     ) -> str:
         """把体积超限判定渲染成给用户看的跳过原因。"""
         if limit_kind == "send":
-            return (
-                f"视频体积超过可发送上限（{size_mb:.1f}MB > {cap_mb:.1f}MB），"
-                "聊天平台会拒收，已改为只发信息与封面"
-            )
+            head = f"视频体积超过可发送上限（{size_mb:.1f}MB > {cap_mb:.1f}MB）"
+            if transcode_error:
+                return f"{head}，自动压缩未成功：{transcode_error}"
+            return f"{head}，聊天平台会拒收，已改为只发信息与封面"
         prefix = "下载后视频大小超过限制" if downloaded else "视频大小超过限制"
         return f"{prefix}（{size_mb:.1f}MB > {cap_mb:.1f}MB）"
 
@@ -118,9 +138,29 @@ class DownloadManager:
         return min(caps) if caps else 0.0
 
     @property
+    def transcode_enabled(self) -> bool:
+        """是否可以把超过可发送上限的视频压缩后再发送。"""
+        return (
+            self.transcode_oversize_video
+            and self.send_video_max_mb > 0
+            and self.cache_dir_available
+        )
+
+    @property
+    def video_download_cap_mb(self) -> float:
+        """下载阶段的体积上限。开启压缩后只受管理员上限约束。"""
+        if self.transcode_enabled:
+            return self.max_video_size_mb
+        return self.effective_video_cap_mb
+
+    def _send_limit_can_transcode(self, limit_kind: str) -> bool:
+        """命中可发送上限且能压缩时，先放行下载，压完再判断能不能发。"""
+        return limit_kind == "send" and self.transcode_enabled
+
+    @property
     def _send_cap_is_effective(self) -> bool:
         """生效上限是否来自可发送上限（用于改写下载器抛出的硬限制文案）。"""
-        if self.send_video_max_mb <= 0:
+        if self.send_video_max_mb <= 0 or self.transcode_enabled:
             return False
         return (
             self.max_video_size_mb <= 0
@@ -261,7 +301,7 @@ class DownloadManager:
             if not math.isfinite(size_mb) or size_mb <= 0:
                 continue
             limit_kind, cap_mb = self._video_size_limit(size_mb)
-            if limit_kind:
+            if limit_kind and not self._send_limit_can_transcode(limit_kind):
                 limited[idx] = (limit_kind, size_mb, cap_mb)
 
         if not limited:
@@ -430,7 +470,7 @@ class DownloadManager:
                 continue
             if size_mb is not None:
                 limit_kind, cap_mb = self._video_size_limit(size_mb)
-                if limit_kind:
+                if limit_kind and not self._send_limit_can_transcode(limit_kind):
                     size_limit_value = size_mb
                     size_limit_kind = limit_kind
                     size_limit_reason = self._video_size_limit_reason(
@@ -554,8 +594,8 @@ class DownloadManager:
                             headers=headers,
                             proxy=proxy,
                             max_bytes=(
-                                int(self.effective_video_cap_mb * 1024 * 1024)
-                                if kind != "image" and self.effective_video_cap_mb > 0
+                                int(self.video_download_cap_mb * 1024 * 1024)
+                                if kind != "image" and self.video_download_cap_mb > 0
                                 else None
                             ),
                         )
@@ -632,6 +672,43 @@ class DownloadManager:
                 results.append(result)
         return results
 
+    # ── 超限压缩 ────────────────────────────────────────
+
+    async def _fit_video_to_send_limit(
+        self, file_path: str, size_mb: float, cap_mb: float
+    ) -> Dict[str, Any]:
+        """把超过可发送上限的视频压到上限以内。
+
+        Returns:
+            成功时 {"file_path", "size_mb", "note"}，失败时 {"error"}。
+        """
+        target_bytes = int(cap_mb * 1024 * 1024)
+        try:
+            result = await transcode_video_to_size(
+                file_path,
+                target_bytes,
+                timeout_seconds=self.transcode_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"视频压缩异常: {file_path}, 错误: {e}")
+            return {"error": str(e)}
+
+        if not result.file_path or result.size_mb is None:
+            error = result.error or "压缩失败"
+            logger.warning(
+                f"视频压缩未成功（{size_mb:.1f}MB > {cap_mb:.1f}MB）: {error}"
+            )
+            return {"error": error}
+
+        logger.info(f"视频压缩完成: {result.summary}")
+        return {
+            "file_path": result.file_path,
+            "size_mb": result.size_mb,
+            "note": result.note,
+        }
+
     # ── 主入口 ──────────────────────────────────────────
 
     async def process_metadata(
@@ -673,6 +750,7 @@ class DownloadManager:
         video_modes: List[str] = ["skip"] * video_count
         image_modes: List[str] = ["skip"] * image_count
         video_skip_reasons: List[Optional[str]] = [None] * video_count
+        video_transcode_notes: List[Optional[str]] = [None] * video_count
         image_skip_reasons: List[Optional[str]] = [None] * image_count
         image_warnings: List[Optional[str]] = [None] * image_count
         has_access_denied = False
@@ -912,12 +990,33 @@ class DownloadManager:
                     if size_mb is not None
                     else ("", 0.0)
                 )
+                transcode_error: Optional[str] = None
+                if self._send_limit_can_transcode(limit_kind):
+                    # 体积超出平台能收下的范围，但可以先压缩再发。
+                    fitted = await self._fit_video_to_send_limit(
+                        file_path, size_mb, cap_mb
+                    )
+                    if fitted.get("file_path"):
+                        cleanup_file(file_path)
+                        file_path = fitted["file_path"]
+                        size_mb = fitted["size_mb"]
+                        video_sizes[idx] = size_mb
+                        video_transcode_notes[idx] = fitted.get("note") or None
+                        limit_kind, cap_mb = self._video_size_limit(size_mb)
+                    else:
+                        transcode_error = fitted.get("error")
                 if limit_kind:
                     cleanup_file(file_path)
                     file_paths[position] = None
                     video_modes[idx] = "skip"
+                    # 视频最终没发出去，"已压缩"的提示只会让人困惑。
+                    video_transcode_notes[idx] = None
                     video_skip_reasons[idx] = self._video_size_limit_reason(
-                        limit_kind, size_mb, cap_mb, downloaded=True
+                        limit_kind,
+                        size_mb,
+                        cap_mb,
+                        downloaded=True,
+                        transcode_error=transcode_error,
                     )
                     if limit_kind == "send":
                         send_limit_exceeded = True
@@ -954,6 +1053,7 @@ class DownloadManager:
         metadata["video_modes"] = video_modes
         metadata["image_modes"] = image_modes
         metadata["video_skip_reasons"] = video_skip_reasons
+        metadata["video_transcode_notes"] = video_transcode_notes
         metadata["image_skip_reasons"] = image_skip_reasons
         metadata["image_warnings"] = image_warnings
         metadata["media_cache_dir_available"] = self.cache_dir_available

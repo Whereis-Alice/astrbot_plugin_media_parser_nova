@@ -64,6 +64,20 @@ def _append_media_skip_summary(text_parts: List[str], metadata: Dict[str, Any]) 
         text_parts.append(f"图片处理警告[{idx}]：{warning}")
 
 
+def _append_transcode_notes(text_parts: List[str], metadata: Dict[str, Any]) -> None:
+    """把"视频超限已自动压缩"的结果告知用户，避免画质变化显得莫名其妙。"""
+    notes = metadata.get("video_transcode_notes", []) or []
+    compressed = [(idx + 1, note) for idx, note in enumerate(notes) if note]
+    if not compressed:
+        return
+
+    video_count = metadata.get("video_count", len(metadata.get("video_urls", []))) or 0
+    single = video_count <= 1 and len(compressed) <= 1
+    for idx, note in compressed[:5]:
+        prefix = "视频已压缩" if single else f"视频[{idx}]已压缩"
+        text_parts.append(f"{prefix}：{note}")
+
+
 def _append_media_notices(
     text_parts: List[str],
     metadata: Dict[str, Any],
@@ -100,6 +114,7 @@ def _append_media_notices(
                     f"解析失败：视频大小超过限制（{actual_video_size:.1f}MB）"
                 )
 
+    _append_transcode_notes(text_parts, metadata)
     _append_media_skip_summary(text_parts, metadata)
 
 

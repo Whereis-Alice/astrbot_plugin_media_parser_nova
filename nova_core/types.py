@@ -63,6 +63,7 @@ class MediaMetadata(TypedDict, total=False):
     video_modes: List[str]
     image_modes: List[str]
     video_skip_reasons: List[Optional[str]]
+    video_transcode_notes: List[Optional[str]]
     image_skip_reasons: List[Optional[str]]
     media_cache_dir_available: bool
     max_video_size_mb: float

@@ -8,7 +8,8 @@
 | YouTube 只出封面卡片，日志写 `playability=LOGIN_REQUIRED` | 出口 IP 被要求人机验证，或 Cookie 已失效 | 重新导出 Cookie、或换住宅/家宽出口；见 [YouTube → 机器人验证](youtube.md#sign-in-to-confirm-you-are-not-a-bot) |
 | YouTube 有完整元数据但「未取到可下载视频流」，`playability=OK` | 该视频只发 SABR 分段流，官方接口拿不到直连地址 | 装上 yt-dlp 兜底，见 [YouTube → 疑难视频的 yt-dlp 兜底](youtube.md#疑难视频的-yt-dlp-兜底) |
 | YouTube Cookie 隔几天就失效 | 导出时会话没有冻结，浏览器继续用同一会话导致服务端轮换掉旧凭据 | 按 [让 Cookie 长期不用再管](youtube.md#让-cookie-长期不用再管) 重新导出一次 |
-| 只发了信息与封面，没有视频文件 | 预估体积超过生效的发送上限 | 调整 `send_video_max_mb`，见 [视频体积与发送上限](configuration.md#视频体积与发送上限) |
+| 只发了信息与封面，没有视频文件 | 体积超过发送上限且压不下来（未装 ffmpeg、视频太长或压缩超时） | 装好 ffmpeg 并开启 `transcode_oversize_video`，见 [视频体积与发送上限](configuration.md#视频体积与发送上限) |
+| 视频画质比原片明显下降，消息里写「视频已压缩」 | 原片超过可发送上限，已自动降码率/降分辨率换取能发出去 | 属正常行为；想要原画质就调高 `send_video_max_mb`，或关掉 `transcode_oversize_video` 改发封面 |
 | 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端富媒体通道拒收大文件，常在传到一半才拒 | 把 `send_video_max_mb` 调到自己部署的实测值以下 |
 | 高画质视频没有声音，或合并失败 | DASH 音视频轨需要 `ffmpeg` 合并 | 安装 ffmpeg，见 [ffmpeg](configuration.md#ffmpeg) |
 | 图片发不出、B 站高画质拿不到 | 缺少可写缓存目录，无法带 Referer 下载 | 配置缓存目录，见 [缓存目录](configuration.md#缓存目录) |

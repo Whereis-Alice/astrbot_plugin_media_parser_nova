@@ -738,8 +738,23 @@
             "send_video_max_mb": {
                 "description": "可发送视频体积上限（MB）",
                 "type": "float",
-                "hint": "聊天平台能收下的单条视频上限。取流时优先挑放得下的画质，仍超限则跳过视频、只发信息与封面，并在消息里说明原因。QQ 富媒体通道通常在 100 MB 左右开始拒收（报 Highway 102902）；填 0 不限制。",
+                "hint": "聊天平台能收下的单条视频上限。取流时优先挑放得下的画质；仍然超限时按下面的开关先压缩再发，压不下来才跳过视频、只发信息与封面并说明原因。QQ 富媒体通道通常在 100 MB 左右开始拒收（报 Highway 102902）；填 0 不限制。",
                 "default": 100.0
+            },
+            "transcode_oversize_video": {
+                "description": "超限视频自动压缩",
+                "type": "bool",
+                "hint": "视频超过可发送上限时，先用 ffmpeg 按目标体积重新编码（必要时降分辨率和帧率）再发送。需要宿主装有 ffmpeg，压缩期间占用 CPU；压缩失败或视频太长压不出可看画质时，自动退回只发信息与封面。",
+                "default": true
+            },
+            "transcode_timeout_seconds": {
+                "description": "压缩超时（秒）",
+                "type": "int",
+                "hint": "单条视频压缩的最长耗时，超时按压缩失败处理。有效范围 30–3600；非法值回落 600。",
+                "condition": {
+                    "transcode_oversize_video": true
+                },
+                "default": 600
             }
         }
     },

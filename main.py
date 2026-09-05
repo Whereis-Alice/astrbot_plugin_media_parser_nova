@@ -75,6 +75,8 @@ class MediaParserNovaPlugin(Star):
             cache_dir_available=cfg.download.cache_dir_available,
             max_concurrent_downloads=cfg.download.max_concurrent_downloads,
             video_cover_only=cfg.message.media_display.video_cover_only,
+            transcode_oversize_video=cfg.download.transcode_oversize_video,
+            transcode_timeout_seconds=cfg.download.transcode_timeout_seconds,
         )
 
         self.message_sender = MessageSender()

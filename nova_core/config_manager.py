@@ -456,6 +456,8 @@ class DownloadConfig:
     cache_dir: str = ""
     cache_dir_available: bool = False
     max_concurrent_downloads: int = Config.DOWNLOAD_MANAGER_MAX_CONCURRENT
+    transcode_oversize_video: bool = Config.DEFAULT_TRANSCODE_OVERSIZE_VIDEO
+    transcode_timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -939,6 +941,27 @@ class ConfigManager:
             Config.DEFAULT_SEND_VIDEO_MAX_MB,
         )
 
+        transcode_oversize_video = self._parse_bool(
+            download_raw.get(
+                "transcode_oversize_video", Config.DEFAULT_TRANSCODE_OVERSIZE_VIDEO
+            ),
+            Config.DEFAULT_TRANSCODE_OVERSIZE_VIDEO,
+            "download.transcode_oversize_video",
+        )
+        transcode_timeout_seconds = max(
+            Config.MIN_TRANSCODE_TIMEOUT_SECONDS,
+            min(
+                self._parse_positive_int(
+                    download_raw.get(
+                        "transcode_timeout_seconds",
+                        Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
+                    ),
+                    Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
+                ),
+                Config.MAX_TRANSCODE_TIMEOUT_SECONDS,
+            ),
+        )
+
         configured_cache_dir = str(download_raw.get("cache_dir", "") or "").strip()
         if _is_docker_environment():
             cache_dir = configured_cache_dir or Config.DEFAULT_CACHE_DIR
@@ -1066,6 +1089,8 @@ class ConfigManager:
             cache_dir=cache_dir,
             cache_dir_available=cache_dir_available,
             max_concurrent_downloads=max_concurrent,
+            transcode_oversize_video=transcode_oversize_video,
+            transcode_timeout_seconds=transcode_timeout_seconds,
         )
 
         self.message.card_render.save_dir = (
