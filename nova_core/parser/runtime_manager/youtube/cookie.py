@@ -1,4 +1,4 @@
-"""YouTube 登录态运行时：Cookie 轮换吸收、持久化与保鲜。
+"""YouTube 登录态运行时：Cookie 轮换吸收、持久化与体检。
 
 YouTube / Google 的登录 Cookie 不是一张长期不变的令牌，而是一组会被服
 务端持续轮换的凭据：`__Secure-1PSIDTS` / `__Secure-3PSIDTS` / `SIDCC`
@@ -9,12 +9,14 @@ YouTube / Google 的登录 Cookie 不是一张长期不变的令牌，而是一�
 凭据的浏览器，服务端迟早判定会话过期——这才是「YouTube Cookie 很容易失
 效」的真正原因，而不是 Cookie 本身写了个短过期时间。
 
-本运行时因此做三件事，让一份手工导出的 Cookie 可以长期不用再管：
+本运行时因此做四件事，让一份手工导出的 Cookie 可以长期不用再管：
 
 1. 吸收：把每次 YouTube 响应里的 `Set-Cookie` 合并回内存 Cookie 罐；
 2. 持久化：合并结果原子落盘，插件重载/重启后接着用轮换后的新值；
-3. 保鲜：定期向 youtube.com 发一次带登录态的轻量请求主动触发轮换，
-   让长期没有解析请求的实例也不会把 Cookie 放到腐烂。
+3. 续期与体检：按短周期打 Google 账号服务的 `/RotateCookies` 主动换取新的
+   `__Secure-*PSIDTS`，按长周期抓一次首页确认服务端仍然认这份会话；
+4. 隔离：会话真的死了就把健康态记成失效，后续业务请求退回匿名——否则一份
+   死 Cookie 会把本来能成功的匿名链路（含 yt-dlp）一起拖死。
 
 安全约定：运行时文件权限收敛到 0600，只存 Cookie 名值，不写任何日志明
 文；日志里一律只出现 Cookie 名，绝不输出取值。
@@ -38,6 +40,7 @@ from ....logger import logger
 
 
 __all__ = [
+    "GOOGLE_ACCOUNT_COOKIE_NAMES",
     "IDENTITY_COOKIE_NAMES",
     "ROTATING_COOKIE_NAMES",
     "SAPISID_COOKIE_NAMES",
@@ -53,14 +56,21 @@ __all__ = [
 
 YOUTUBE_ORIGIN = "https://www.youtube.com"
 
-# 保鲜请求打首页而不是 /account：实测登录态失效时 /account 仍回 200，但
-# 页面里根本不带 ytcfg 的 LOGGED_IN 字段，导致保鲜永远「未读出登录态」，
+# 体检请求打首页而不是 /account：实测登录态失效时 /account 仍回 200，但
+# 页面里根本不带 ytcfg 的 LOGGED_IN 字段，导致体检永远「未读出登录态」，
 # Cookie 早就被吊销也无法提前预警。首页则稳定输出 "LOGGED_IN":true/false。
 _KEEPALIVE_URL = "https://www.youtube.com/"
 _KEEPALIVE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Google 账号服务的 Cookie 续期端点。浏览器保持长期登录靠的就是它：每隔十
+# 几分钟发一次空请求，服务端顺手下发新的 `__Secure-1PSIDTS` /
+# `__Secure-3PSIDTS`。插件做同一件事，一份手工导出的 Cookie 才能一直活着。
+_ROTATE_URL = "https://accounts.google.com/RotateCookies"
+_ROTATE_ORIGIN = "https://accounts.google.com"
+_ROTATE_BODY = '[000,"-----"]'
 
 # SAPISIDHASH 鉴权用到的 cookie 名，按优先级排列。
 SAPISID_COOKIE_NAMES: Tuple[str, ...] = (
@@ -91,6 +101,9 @@ ROTATING_COOKIE_NAMES: Tuple[str, ...] = (
     "__Secure-3PSIDCC",
     "__Secure-1PSIDTS",
     "__Secure-3PSIDTS",
+    "__Secure-1PSIDRTS",
+    "__Secure-3PSIDRTS",
+    "NID",
     "VISITOR_INFO1_LIVE",
     "VISITOR_PRIVACY_METADATA",
     "YSC",
@@ -99,6 +112,26 @@ ROTATING_COOKIE_NAMES: Tuple[str, ...] = (
     "CONSENT",
     "__Secure-YEC",
     "__Secure-ROLLOUT_TOKEN",
+)
+
+# 续期请求只带账号域真正会用到的 Cookie：多发 YouTube 侧的埋点项没有意义，
+# 还会把请求头撑大，反而更容易撞上风控。
+GOOGLE_ACCOUNT_COOKIE_NAMES: Tuple[str, ...] = (
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+    "SIDCC",
+    "__Secure-1PSIDCC",
+    "__Secure-3PSIDCC",
+    "NID",
 )
 
 _ACCEPTED_COOKIE_NAMES = frozenset(IDENTITY_COOKIE_NAMES + ROTATING_COOKIE_NAMES)
@@ -375,7 +408,7 @@ def detect_logged_in_from(html: str, final_url: str = "") -> Optional[bool]:
 
 
 class YouTubeCookieRuntime:
-    """管理一份 YouTube Cookie 的生命周期：吸收轮换、落盘、定期保鲜。"""
+    """管理一份 YouTube Cookie 的生命周期：吸收轮换、落盘、定期体检。"""
 
     def __init__(
         self,
@@ -398,6 +431,14 @@ class YouTubeCookieRuntime:
         self._last_rotation_at: float = 0.0
         self._last_keepalive_at: float = 0.0
         self._last_keepalive_ok: Optional[bool] = None
+        # 健康态：None 尚未判定 / True 服务端确认可用 / False 已判定失效。
+        # 一旦判 False，带登录态的请求就退回匿名，避免一份死 Cookie 把本来能
+        # 成功的匿名链路一起拖死（yt-dlp 也吃这份 Cookie）。
+        self._alive: Optional[bool] = None
+        self._dead_reason = ""
+        self._dead_since: float = 0.0
+        self._failure_streak = 0
+        self._last_rotate_at: float = 0.0
 
         if self._configured and self.state_path:
             self._load_state()
@@ -419,11 +460,78 @@ class YouTubeCookieRuntime:
         """当前 Cookie 是否足以生成 SAPISIDHASH（即是否算真登录）。"""
         return bool(build_sapisid_authorization(self.header()))
 
+    @property
+    def alive(self) -> Optional[bool]:
+        """已知健康态：True 可用 / False 已判定失效 / None 还没有结论。"""
+        return self._alive
+
+    @property
+    def dead_reason(self) -> str:
+        """最近一次判定失效的原因，未失效时为空串。"""
+        return self._dead_reason
+
+    @property
+    def failure_streak(self) -> int:
+        """连续判定失效的次数，用于告警去重。"""
+        return self._failure_streak
+
+    @property
+    def usable(self) -> bool:
+        """这份 Cookie 现在还值不值得带上（配置齐全、能鉴权、未判死）。"""
+        if not self._configured:
+            return False
+        if self._alive is False:
+            return False
+        return self.authenticated
+
     def header(self) -> str:
-        """返回本次请求应当发送的 Cookie 头。"""
+        """返回这份 Cookie 当前的完整取值（含已吸收的轮换）。"""
         if not self._mutated:
             return self._configured
         return "; ".join(f"{name}={value}" for name, value in self._jar.items())
+
+    def active_header(self) -> str:
+        """业务请求取 Cookie 头的正道：已判定失效时返回空串（退回匿名）。
+
+        探活类请求（续期 / 体检）必须继续用 `header()`，否则死 Cookie 再也
+        没有机会被服务端确认复活。
+        """
+        return self.header() if self.usable else ""
+
+    # ── 健康态 ───────────────────────────────────────────
+
+    def mark_dead(self, reason: str = "") -> bool:
+        """标记为已失效；返回本次是否是状态翻转（首次失效才值得告警）。"""
+        flipped = self._alive is not False
+        self._failure_streak += 1
+        self._alive = False
+        text = (reason or "").strip()
+        if text:
+            self._dead_reason = text
+        if flipped:
+            self._dead_since = time.time()
+        self._dirty = True
+        return flipped
+
+    def mark_alive(self) -> bool:
+        """标记为仍然可用；返回本次是否从失效状态复活。"""
+        revived = self._alive is False
+        if revived or self._alive is None or self._failure_streak:
+            self._dirty = True
+        self._failure_streak = 0
+        self._alive = True
+        self._dead_reason = ""
+        self._dead_since = 0.0
+        return revived
+
+    def account_cookie_header(self) -> str:
+        """挑出账号域 Cookie 拼成请求头，供续期端点使用。"""
+        jar = parse_cookie_header(self.header())
+        return "; ".join(
+            f"{name}={jar[name]}"
+            for name in GOOGLE_ACCOUNT_COOKIE_NAMES
+            if jar.get(name)
+        )
 
     def names(self) -> Tuple[str, ...]:
         """返回当前罐子里的 Cookie 名（只回名字，绝不回取值）。"""
@@ -434,13 +542,18 @@ class YouTubeCookieRuntime:
         if not self._configured:
             return "未配置"
         parts = [f"{len(self._jar)} 项", "已鉴权" if self.authenticated else "缺少 SAPISID"]
+        if self._alive is False:
+            label = "已判定失效，按匿名请求"
+            if self._dead_reason:
+                label += f"（{self._dead_reason}）"
+            parts.append(label)
         if self._revision:
             parts.append(f"已吸收轮换 {self._revision} 次")
         if self._last_rotation_at:
             age = max(0, int(time.time() - self._last_rotation_at))
             parts.append(f"上次轮换 {age // 60} 分钟前")
         if self._last_keepalive_ok is not None:
-            parts.append("保鲜正常" if self._last_keepalive_ok else "保鲜未通过")
+            parts.append("体检正常" if self._last_keepalive_ok else "体检未通过")
         return "，".join(parts)
 
     # ── 轮换吸收 ─────────────────────────────────────────
@@ -514,6 +627,7 @@ class YouTubeCookieRuntime:
                 "[youtube] 配置里的 Cookie 已更换，丢弃旧的运行时轮换状态"
             )
             return
+        self._restore_health(data)
         stored = data.get("cookies")
         if not isinstance(stored, dict):
             return
@@ -538,6 +652,25 @@ class YouTubeCookieRuntime:
             f"[youtube] 已接续运行时 Cookie 轮换状态（{merged} 项较配置更新）"
         )
 
+    def _restore_health(self, data: Dict[str, Any]) -> None:
+        """接续上次落盘的健康态，让重启后不必重新踩一遍失效。"""
+        alive = data.get("alive")
+        if isinstance(alive, bool):
+            self._alive = alive
+        self._dead_reason = str(data.get("dead_reason") or "")
+        for attr, key in (
+            ("_dead_since", "dead_since"),
+            ("_last_rotate_at", "last_rotate_at"),
+        ):
+            try:
+                setattr(self, attr, float(data.get(key) or 0.0))
+            except (TypeError, ValueError):
+                setattr(self, attr, 0.0)
+        try:
+            self._failure_streak = max(0, int(data.get("failure_streak") or 0))
+        except (TypeError, ValueError):
+            self._failure_streak = 0
+
     def _write_state(self) -> None:
         """把当前罐子原子写入运行时文件，权限收敛到 0600。"""
         path = self.state_path
@@ -558,6 +691,11 @@ class YouTubeCookieRuntime:
                 "cookies": dict(self._jar),
                 "updated_at": time.time(),
                 "revision": self._revision,
+                "alive": self._alive,
+                "dead_reason": self._dead_reason,
+                "dead_since": self._dead_since,
+                "failure_streak": self._failure_streak,
+                "last_rotate_at": self._last_rotate_at,
             }
             with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as file_obj:
                 json.dump(payload, file_obj, ensure_ascii=False, indent=2)
@@ -597,7 +735,7 @@ class YouTubeCookieRuntime:
         await self.flush()
         return True
 
-    # ── 保鲜 ─────────────────────────────────────────────
+    # ── 体检 ─────────────────────────────────────────────
 
     async def keepalive(
         self,
@@ -614,7 +752,7 @@ class YouTubeCookieRuntime:
         """
         cookie = self.header()
         if not cookie:
-            return None, "未配置 Cookie，跳过保鲜"
+            return None, "未配置 Cookie，跳过体检"
         headers = {
             "User-Agent": _KEEPALIVE_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -642,7 +780,7 @@ class YouTubeCookieRuntime:
             raise
         except Exception as exc:
             self._last_keepalive_at = time.time()
-            return None, f"保鲜请求失败: {type(exc).__name__}: {exc}"
+            return None, f"体检请求失败: {type(exc).__name__}: {exc}"
 
         await self.flush()
         self._last_keepalive_at = time.time()
@@ -660,3 +798,108 @@ class YouTubeCookieRuntime:
         else:
             detail.append("未读出登录态")
         return logged_in, "，".join(detail)
+
+    async def rotate(
+        self,
+        session: aiohttp.ClientSession,
+        proxy: Optional[str] = None,
+        timeout_seconds: float = 20.0,
+    ) -> Tuple[Optional[bool], str]:
+        """
+        向 Google 账号服务申请一次 Cookie 续期。
+
+        这是浏览器长期不掉登录的原生机制：`/RotateCookies` 会下发新的
+        `__Secure-1PSIDTS` / `__Secure-3PSIDTS`，吸收后写回运行时文件，一份手
+        工导出的 Cookie 就能一直续下去。成本只有一个空 POST，适合高频执行。
+
+        Returns:
+            Tuple[Optional[bool], str]: (Cookie 是否仍然有效, 可读摘要)。
+            服务端下发了新凭据才算强证据 True；HTTP 401 说明会话确已被吊销，
+            判 False；其余情况（含网络失败）返回 None 表示本次无法定论。
+        """
+        if not self.header():
+            return None, "未配置 Cookie，跳过续期"
+        account_cookie = self.account_cookie_header()
+        if not account_cookie:
+            return None, "Cookie 里没有账号域凭据，跳过续期"
+        headers = {
+            "User-Agent": _KEEPALIVE_USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Origin": _ROTATE_ORIGIN,
+            "Referer": f"{_ROTATE_ORIGIN}/",
+            "Cookie": account_cookie,
+        }
+        try:
+            async with session.post(
+                _ROTATE_URL,
+                headers=headers,
+                data=_ROTATE_BODY,
+                timeout=aiohttp.ClientTimeout(total=max(5.0, timeout_seconds)),
+                proxy=proxy,
+                allow_redirects=False,
+            ) as response:
+                rotated = self.absorb_response(response)
+                status = int(getattr(response, "status", 0) or 0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_rotate_at = time.time()
+            return None, f"续期请求失败: {type(exc).__name__}: {exc}"
+
+        self._last_rotate_at = time.time()
+        if rotated:
+            await self.flush()
+        detail = [f"HTTP {status}", "已吸收新凭据" if rotated else "无新凭据下发"]
+        if status in (401, 403):
+            detail.append("账号会话已被吊销")
+            return False, "，".join(detail)
+        if status >= 400:
+            detail.append("续期端点返回异常状态")
+            return None, "，".join(detail)
+        if rotated:
+            return True, "，".join(detail)
+        return None, "，".join(detail)
+
+    async def maintain(
+        self,
+        session: aiohttp.ClientSession,
+        proxy: Optional[str] = None,
+        timeout_seconds: float = 20.0,
+        verify: bool = False,
+    ) -> Tuple[Optional[bool], str]:
+        """
+        跑一轮 Cookie 维护，并据结果更新健康态。
+
+        续期便宜，适合每隔十几分钟跑一次；验证要抓一次首页 HTML，成本高得多，
+        由调用方按更长的周期把 `verify` 置真。已被判定失效时强制验证，好让
+        Cookie 一旦恢复就能立刻复活。
+
+        Returns:
+            Tuple[Optional[bool], str]: (Cookie 是否仍然有效, 可读摘要)。
+        """
+        if not self.header():
+            return None, "未配置 Cookie，跳过维护"
+        force_verify = self._alive is False
+        rotate_ok, rotate_detail = await self.rotate(
+            session, proxy=proxy, timeout_seconds=timeout_seconds
+        )
+        parts = [f"续期: {rotate_detail}"]
+        verdict = rotate_ok
+        if rotate_ok is True:
+            self.mark_alive()
+        elif rotate_ok is False:
+            self.mark_dead("账号会话已被吊销")
+        if verify or force_verify or rotate_ok is None:
+            logged_in, keepalive_detail = await self.keepalive(
+                session, proxy=proxy, timeout_seconds=timeout_seconds
+            )
+            parts.append(f"验证: {keepalive_detail}")
+            if logged_in is True:
+                self.mark_alive()
+                verdict = True
+            elif logged_in is False:
+                self.mark_dead("服务端判定未登录")
+                verdict = False
+        await self.flush()
+        return verdict, "；".join(parts)

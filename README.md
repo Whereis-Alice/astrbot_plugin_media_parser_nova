@@ -17,7 +17,7 @@
 - 标题、正文和热评可翻译；译文可以只用于卡片，也可以同时用于普通文本
 - 热评可直接合并到同一张卡片中
 - B 站支持 Cookie 解析、高画质与管理员协助扫码更新
-- YouTube 走官方 Innertube 接口多层降级，疑难视频可选交给 yt-dlp 兜底，不依赖第三方镜像站
+- YouTube 双腿取流：官方 Innertube 多客户端降级 + yt-dlp，Cookie 后台自动续期，被机器人门禁挡下也能出完整信息卡片
 - 视频按聊天平台能收下的体积挑流，放不下先自动压缩，压不进去才改发封面，发送失败会在会话里说明原因
 - 媒体缓存、媒体中转、ZIP 归档，以及对下载体积、解析频率、缓存清理和公网 URL 的兜底
 
@@ -74,7 +74,7 @@ astrbot_plugin_media_parser_nova
 | --- | --- |
 | [配置说明](docs/configuration.md) | 输出模式、触发方式、聚合、视频体积与超限压缩、翻译、缓存、代理、ffmpeg、ZIP 归档 |
 | [卡片渲染](docs/cards.md) | 八套皮肤、四种布局、家具跟随平台、热评合并，含全部截图 |
-| [YouTube 说明](docs/youtube.md) | 四层解析链路、Cookie 保鲜、yt-dlp 兜底、PO Token provider、代理 |
+| [YouTube 说明](docs/youtube.md) | 取流策略与客户端链、Cookie 自动续期、yt-dlp、PO Token provider、代理 |
 | [平台专项说明](docs/platforms.md) | B 站 Cookie、Twitter/X 的 Nitter、小黑盒热评 |
 | [排查与反馈](docs/troubleshooting.md) | 常见现象对照表、日志分级、反馈须知 |
 | [模块结构](docs/ARCHITECTURE.md) | 目录结构与执行链 |

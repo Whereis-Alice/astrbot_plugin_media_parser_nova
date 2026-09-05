@@ -103,7 +103,7 @@ YouTube 是例外：它只有一个开关，同时管解析和下载，原因见
 
 ## yt-dlp（可选）
 
-`yt-dlp` 刻意**没有**写进 `requirements.txt`：它只在 YouTube 的兜底取流里用到，缺了就安静降级，不装也不影响其他任何平台。安装方式与适用场景见 [YouTube 说明 → 疑难视频的 yt-dlp 兜底](youtube.md#疑难视频的-yt-dlp-兜底)。
+`yt-dlp` 刻意**没有**写进 `requirements.txt`：它只在 YouTube 解析里用到，缺了就安静降级，不装也不影响其他任何平台。它不一定只是兜底——「视频流取用来源」可以让它当主取流器，见 [YouTube 说明 → 谁来出流](youtube.md#谁来出流)；安装三件套的方式见 [yt-dlp 这条腿](youtube.md#yt-dlp-这条腿)。
 
 ## ZIP 归档
 

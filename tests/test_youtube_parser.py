@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -20,6 +21,7 @@ from nova_core.parser.platform.youtube import (
     DEFAULT_PLAYER_CLIENTS,
     INNERTUBE_CLIENTS,
     METADATA_PLAYER_CLIENTS,
+    STREAM_SOURCE_CHOICES,
     YouTubeParser,
     build_sapisid_authorization,
     build_youtube_stats_line,
@@ -52,6 +54,7 @@ from nova_core.parser.runtime_manager.youtube import (
     normalize_cookie_input,
     probe_ytdlp_environment,
     reset_ytdlp_environment_cache,
+    summarize_ytdlp_info,
 )
 from nova_core.parser.runtime_manager.youtube import ytdlp as ytdlp_runtime
 
@@ -1313,7 +1316,10 @@ class CookieAuthTest(unittest.TestCase):
 
     def test_cookie_append_keeps_explicit_order_without_duplicates(self):
         parser = YouTubeParser(cookie=self.COOKIE, player_clients="web,ios")
-        self.assertEqual(parser.player_clients, ("web", "ios", "tv"))
+        self.assertEqual(
+            parser.player_clients,
+            ("web", "ios", "tv_downgraded", "tv"),
+        )
 
     def test_cookie_without_sapisid_changes_nothing(self):
         parser = YouTubeParser(cookie="SID=abc")
@@ -1321,6 +1327,35 @@ class CookieAuthTest(unittest.TestCase):
         self.assertEqual(parser.player_clients, DEFAULT_PLAYER_CLIENTS)
         self.assertNotIn("Cookie", parser._innertube_headers("ios"))
 
+    def test_dead_cookie_drops_the_auth_only_clients(self):
+        parser = YouTubeParser(cookie=self.COOKIE)
+        self.assertEqual(
+            parser.player_clients,
+            DEFAULT_PLAYER_CLIENTS + COOKIE_PLAYER_CLIENTS,
+        )
+        parser.cookie_runtime.mark_dead("被判未登录")
+        self.assertEqual(parser.player_clients, DEFAULT_PLAYER_CLIENTS)
+        self.assertNotIn("Cookie", parser._innertube_headers("web"))
+        self.assertNotIn("Authorization", parser._innertube_headers("web"))
+        self.assertIn("已判定失效", parser._login_label(False))
+        parser.cookie_runtime.mark_alive()
+        self.assertEqual(
+            parser.player_clients,
+            DEFAULT_PLAYER_CLIENTS + COOKIE_PLAYER_CLIENTS,
+        )
+        self.assertEqual(
+            parser._innertube_headers("web")["Cookie"], self.COOKIE
+        )
+
+    def test_dead_cookie_skips_auth_required_client_profiles(self):
+        parser = YouTubeParser(
+            cookie=self.COOKIE, player_clients="tv_downgraded"
+        )
+        self.assertIn("tv_downgraded", parser.player_clients)
+        parser.cookie_runtime.mark_dead("被判未登录")
+        self.assertTrue(
+            INNERTUBE_CLIENTS["tv_downgraded"].get("require_auth")
+        )
     def test_default_clients_are_stream_capable_only(self):
         for client in DEFAULT_PLAYER_CLIENTS:
             with self.subTest(client=client):
@@ -1567,17 +1602,29 @@ class _FakeCookieResponse:
 
 
 class _FakeCookieSession:
-    def __init__(self, response):
+    """按方法分别预置响应：GET 走体检首页，POST 走账号续期端点。"""
+
+    def __init__(self, response=None, post_response=None):
         self._response = response
+        self._post_response = post_response
         self.calls = []
+        self.post_calls = []
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        if self._response is None:
+            raise AssertionError('本用例未预置 GET 响应')
         return self._response
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        if self._post_response is None:
+            raise AssertionError('本用例未预置 POST 响应')
+        return self._post_response
 
 
 class YouTubeCookieRuntimeTest(unittest.TestCase):
-    """Cookie 运行时：轮换吸收、白名单防护、落盘接续与主动保鲜。"""
+    """Cookie 运行时：轮换吸收、白名单防护、落盘接续与主动体检。"""
 
     COOKIE = "SID=abc; SAPISID=SECRET; __Secure-3PSIDTS=old-ts"
 
@@ -1705,7 +1752,17 @@ class YouTubeCookieRuntimeTest(unittest.TestCase):
             data = json.load(file_obj)
         self.assertEqual(
             set(data),
-            {"fingerprint", "cookies", "updated_at", "revision"},
+            {
+                "fingerprint",
+                "cookies",
+                "updated_at",
+                "revision",
+                "alive",
+                "dead_reason",
+                "dead_since",
+                "failure_streak",
+                "last_rotate_at",
+            },
         )
         self.assertEqual(data["cookies"]["SIDCC"], "fresh")
         self.assertNotIn("SECRET", data["fingerprint"])
@@ -1721,7 +1778,7 @@ class YouTubeCookieRuntimeTest(unittest.TestCase):
         runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
         self.assertEqual(runtime.header(), self.COOKIE)
 
-    # ── 保鲜 ──
+    # ── 体检 ──
 
     def test_keepalive_sends_credentials_and_absorbs_rotation(self):
         runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
@@ -1745,7 +1802,7 @@ class YouTubeCookieRuntimeTest(unittest.TestCase):
 
         self.assertIn("__Secure-3PSIDTS=rotated", runtime.header())
         self.assertTrue(os.path.exists(self.state_path))
-        self.assertIn("保鲜正常", runtime.status_line())
+        self.assertIn("体检正常", runtime.status_line())
 
     def test_keepalive_reports_logged_out_state(self):
         runtime = YouTubeCookieRuntime(self.COOKIE)
@@ -1757,7 +1814,7 @@ class YouTubeCookieRuntimeTest(unittest.TestCase):
         logged_in, detail = self._run(runtime.keepalive(session))
         self.assertIs(logged_in, False)
         self.assertIn("未登录", detail)
-        self.assertIn("保鲜未通过", runtime.status_line())
+        self.assertIn("体检未通过", runtime.status_line())
 
     def test_keepalive_treats_login_redirect_as_logged_out(self):
         # 会话被吊销时 YouTube 会把请求甩到 Google 登录页，此时页面里通常
@@ -1776,10 +1833,10 @@ class YouTubeCookieRuntimeTest(unittest.TestCase):
         logged_in, detail = self._run(runtime.keepalive(session))
         self.assertIs(logged_in, False)
         self.assertIn("登录页", detail)
-        self.assertIn("保鲜未通过", runtime.status_line())
+        self.assertIn("体检未通过", runtime.status_line())
 
     def test_keepalive_targets_home_page_not_account_page(self):
-        # /account 在失效时也回 200 但不带 LOGGED_IN，会让保鲜永远读不出
+        # /account 在失效时也回 200 但不带 LOGGED_IN，会让体检永远读不出
         # 登录态；首页才是稳定的判据来源。
         runtime = YouTubeCookieRuntime(self.COOKIE)
         session = _FakeCookieSession(
@@ -1818,6 +1875,228 @@ class YouTubeCookieRuntimeTest(unittest.TestCase):
         logged_in, detail = self._run(runtime.keepalive(_Boom()))
         self.assertIsNone(logged_in)
         self.assertIn("RuntimeError", detail)
+
+    # ── 健康态 ──
+
+    def test_usable_and_active_header_follow_the_health_state(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertIsNone(runtime.alive)
+        self.assertTrue(runtime.usable)
+        self.assertEqual(runtime.active_header(), self.COOKIE)
+
+        self.assertTrue(runtime.mark_dead('被判未登录'))
+        self.assertIs(runtime.alive, False)
+        self.assertFalse(runtime.usable)
+        self.assertEqual(runtime.dead_reason, '被判未登录')
+        # 业务请求退回匿名，但探活请求仍要带凭据，否则再也没法复活。
+        self.assertEqual(runtime.active_header(), '')
+        self.assertEqual(runtime.header(), self.COOKIE)
+
+        self.assertTrue(runtime.mark_alive())
+        self.assertTrue(runtime.usable)
+        self.assertEqual(runtime.active_header(), self.COOKIE)
+        self.assertEqual(runtime.dead_reason, '')
+        self.assertEqual(runtime.failure_streak, 0)
+
+    def test_only_the_first_death_counts_as_a_flip(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertTrue(runtime.mark_dead('第一次'))
+        self.assertFalse(runtime.mark_dead('第二次'))
+        self.assertEqual(runtime.failure_streak, 2)
+        self.assertEqual(runtime.dead_reason, '第二次')
+
+    def test_mark_alive_reports_true_only_on_revival(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        self.assertFalse(runtime.mark_alive())
+        runtime.mark_dead('x')
+        self.assertTrue(runtime.mark_alive())
+        self.assertFalse(runtime.mark_alive())
+
+    def test_cookie_without_sapisid_is_never_usable(self):
+        runtime = YouTubeCookieRuntime('SID=abc')
+        self.assertFalse(runtime.usable)
+        self.assertEqual(runtime.active_header(), '')
+
+    def test_health_state_survives_a_restart(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        runtime.mark_dead('账号会话已被吊销')
+        self._run(runtime.flush())
+
+        second = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        self.assertIs(second.alive, False)
+        self.assertFalse(second.usable)
+        self.assertEqual(second.dead_reason, '账号会话已被吊销')
+        self.assertEqual(second.failure_streak, 1)
+
+    def test_status_line_says_it_fell_back_to_anonymous(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        runtime.mark_dead('被 YouTube 判为未登录')
+        line = runtime.status_line()
+        self.assertIn('已判定失效', line)
+        self.assertIn('被 YouTube 判为未登录', line)
+
+    # ── 续期 ──
+
+    def test_account_cookie_header_drops_youtube_only_pairs(self):
+        runtime = YouTubeCookieRuntime(
+            'SID=abc; SAPISID=SECRET; __Secure-3PSIDTS=old-ts; '
+            'VISITOR_INFO1_LIVE=vvv; YSC=yyy'
+        )
+        header = runtime.account_cookie_header()
+        for expected in ('SID=abc', 'SAPISID=SECRET', '__Secure-3PSIDTS=old-ts'):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, header)
+        for dropped in ('VISITOR_INFO1_LIVE', 'YSC'):
+            with self.subTest(dropped=dropped):
+                self.assertNotIn(dropped, header)
+
+    def test_rotate_absorbs_fresh_credentials_and_reports_alive(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        session = _FakeCookieSession(
+            post_response=_FakeCookieResponse(
+                _FakeMultiHeaders(['__Secure-3PSIDTS=rotated; Path=/'])
+            )
+        )
+        ok, detail = self._run(runtime.rotate(session))
+        self.assertIs(ok, True)
+        self.assertIn('已吸收新凭据', detail)
+
+        url, kwargs = session.post_calls[0]
+        self.assertEqual(url, 'https://accounts.google.com/RotateCookies')
+        self.assertFalse(kwargs['allow_redirects'])
+        self.assertEqual(kwargs['headers']['Origin'], 'https://accounts.google.com')
+        self.assertIn('SAPISID=SECRET', kwargs['headers']['Cookie'])
+
+        self.assertIn('__Secure-3PSIDTS=rotated', runtime.header())
+        self.assertTrue(os.path.exists(self.state_path))
+
+    def test_rotate_reads_401_as_a_revoked_session(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        for status in (401, 403):
+            with self.subTest(status=status):
+                session = _FakeCookieSession(
+                    post_response=_FakeCookieResponse(
+                        _FakeMultiHeaders([]), status=status
+                    )
+                )
+                ok, detail = self._run(runtime.rotate(session))
+                self.assertIs(ok, False)
+                self.assertIn('吊销', detail)
+
+    def test_rotate_without_new_credentials_is_inconclusive(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        for status in (200, 500):
+            with self.subTest(status=status):
+                session = _FakeCookieSession(
+                    post_response=_FakeCookieResponse(
+                        _FakeMultiHeaders([]), status=status
+                    )
+                )
+                self.assertIsNone(self._run(runtime.rotate(session))[0])
+
+    def test_rotate_skips_without_account_domain_credentials(self):
+        runtime = YouTubeCookieRuntime('VISITOR_INFO1_LIVE=vvv')
+        session = _FakeCookieSession()
+        ok, detail = self._run(runtime.rotate(session))
+        self.assertIsNone(ok)
+        self.assertEqual(session.post_calls, [])
+        self.assertIn('跳过', detail)
+
+    def test_rotate_network_failure_is_reported_not_raised(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+
+        class _Boom:
+            def post(self, *args, **kwargs):
+                raise RuntimeError('boom')
+
+        ok, detail = self._run(runtime.rotate(_Boom()))
+        self.assertIsNone(ok)
+        self.assertIn('RuntimeError', detail)
+
+    # ── 维护 ──
+
+    def test_maintain_stays_cheap_when_verification_is_not_due(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE, state_path=self.state_path)
+        session = _FakeCookieSession(
+            _FakeCookieResponse(
+                _FakeMultiHeaders([]), text='{"LOGGED_IN":true}'
+            ),
+            _FakeCookieResponse(
+                _FakeMultiHeaders(['__Secure-3PSIDTS=rotated'])
+            ),
+        )
+        verdict, detail = self._run(runtime.maintain(session))
+        self.assertIs(verdict, True)
+        self.assertEqual(len(session.post_calls), 1)
+        self.assertEqual(session.calls, [])
+        self.assertIn('续期', detail)
+        self.assertIs(runtime.alive, True)
+
+    def test_maintain_verifies_when_rotation_says_nothing(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        session = _FakeCookieSession(
+            _FakeCookieResponse(
+                _FakeMultiHeaders([]), text='{"LOGGED_IN":true}'
+            ),
+            _FakeCookieResponse(_FakeMultiHeaders([])),
+        )
+        verdict, detail = self._run(runtime.maintain(session))
+        self.assertIs(verdict, True)
+        self.assertEqual(len(session.calls), 1)
+        self.assertIn('验证', detail)
+        self.assertTrue(runtime.usable)
+
+    def test_maintain_marks_dead_when_the_server_says_logged_out(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        session = _FakeCookieSession(
+            _FakeCookieResponse(
+                _FakeMultiHeaders([]), text='{"logged_in":"0"}'
+            ),
+            _FakeCookieResponse(_FakeMultiHeaders([])),
+        )
+        verdict, _ = self._run(runtime.maintain(session, verify=True))
+        self.assertIs(verdict, False)
+        self.assertIs(runtime.alive, False)
+        self.assertFalse(runtime.usable)
+
+    def test_maintain_marks_dead_when_rotation_is_rejected(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        session = _FakeCookieSession(
+            post_response=_FakeCookieResponse(
+                _FakeMultiHeaders([]), status=401
+            )
+        )
+        verdict, _ = self._run(runtime.maintain(session))
+        self.assertIs(verdict, False)
+        self.assertIs(runtime.alive, False)
+        # 已经拿到确定结论，不必再花一次首页请求。
+        self.assertEqual(session.calls, [])
+
+    def test_maintain_force_verifies_a_dead_cookie_to_let_it_revive(self):
+        runtime = YouTubeCookieRuntime(self.COOKIE)
+        runtime.mark_dead('此前被判未登录')
+        session = _FakeCookieSession(
+            _FakeCookieResponse(
+                _FakeMultiHeaders([]), text='{"LOGGED_IN":true}'
+            ),
+            _FakeCookieResponse(
+                _FakeMultiHeaders(['__Secure-3PSIDTS=rotated'])
+            ),
+        )
+        verdict, _ = self._run(runtime.maintain(session))
+        self.assertIs(verdict, True)
+        # 续期已经给出肯定结论，但判死状态必须靠一次真验证才敢收回。
+        self.assertEqual(len(session.calls), 1)
+        self.assertTrue(runtime.usable)
+
+    def test_maintain_without_cookie_touches_nothing(self):
+        runtime = YouTubeCookieRuntime('')
+        session = _FakeCookieSession()
+        verdict, detail = self._run(runtime.maintain(session, verify=True))
+        self.assertIsNone(verdict)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(session.post_calls, [])
+        self.assertIn('跳过', detail)
 
     # ── 安全约定 ──
 
@@ -2664,6 +2943,13 @@ class YtDlpResolveTest(unittest.TestCase):
             YtDlpStreamResolver, "_extract_sync", staticmethod(extract)
         ):
             return asyncio.run(resolver.resolve(VID, **kwargs))
+    def _run_full(self, resolver, env, extract, **kwargs):
+        with mock.patch.object(
+            ytdlp_runtime, "probe_ytdlp_environment", return_value=env
+        ), mock.patch.object(
+            YtDlpStreamResolver, "_extract_sync", staticmethod(extract)
+        ):
+            return asyncio.run(resolver.resolve_full(VID, **kwargs))
 
     def test_blank_video_id_short_circuits(self):
         calls = []
@@ -2741,3 +3027,221 @@ class YtDlpResolveTest(unittest.TestCase):
         self.assertIsNone(
             self._run(YtDlpStreamResolver(), _ytdlp_env(), extract)
         )
+
+    def test_resolve_full_returns_info_even_without_stream(self):
+        info = {
+            "title": "只剩元数据",
+            "uploader": "某频道",
+            "formats": [_ytdlp_fmt(protocol="sabr", vcodec="vp9")],
+        }
+
+        def extract(video_id, options):
+            return info
+
+        stream, raw = self._run_full(
+            YtDlpStreamResolver(), _ytdlp_env(), extract
+        )
+        self.assertIsNone(stream)
+        self.assertEqual(raw["title"], "只剩元数据")
+        self.assertEqual(
+            summarize_ytdlp_info(raw),
+            {"title": "只剩元数据", "author": "某频道"},
+        )
+
+    def test_resolve_full_returns_both_stream_and_info(self):
+        def extract(video_id, options):
+            return {"title": "有流也有元数据", "formats": [PROGRESSIVE_FMT]}
+
+        stream, raw = self._run_full(
+            YtDlpStreamResolver(allow_dash=False), _ytdlp_env(), extract
+        )
+        self.assertEqual(stream.kind, "progressive")
+        self.assertEqual(raw["title"], "有流也有元数据")
+
+    def test_resolve_full_swallows_extract_errors(self):
+        def extract(video_id, options):
+            raise RuntimeError("Sign in to confirm you are not a bot")
+
+        self.assertEqual(
+            self._run_full(YtDlpStreamResolver(), _ytdlp_env(), extract),
+            (None, {}),
+        )
+
+    def test_resolve_full_short_circuits_on_blank_video_id(self):
+        calls = []
+
+        def extract(video_id, options):
+            calls.append(video_id)
+            return {}
+
+        with mock.patch.object(
+            YtDlpStreamResolver, "_extract_sync", staticmethod(extract)
+        ):
+            self.assertEqual(
+                asyncio.run(YtDlpStreamResolver().resolve_full("  ")),
+                (None, {}),
+            )
+        self.assertEqual(calls, [])
+
+
+class StreamSourcePlanTest(unittest.TestCase):
+    """取流策略：配置归一化、门禁连败冷却与 auto 档自适应切换。"""
+
+    def _parser(self, **kwargs):
+        parser = YouTubeParser(**kwargs)
+        # 计划阶段只关心「兜底链路可用」这个事实，不需要真的 yt-dlp。
+        parser._ytdlp = object()
+        return parser
+
+    def test_choices_cover_exactly_the_three_modes(self):
+        self.assertEqual(
+            set(STREAM_SOURCE_CHOICES),
+            {"auto", "innertube", "ytdlp_only"},
+        )
+
+    def test_stream_source_is_normalized(self):
+        cases = {
+            "auto": "auto",
+            " INNERTUBE ": "innertube",
+            "ytdlp_only": "ytdlp_only",
+            " YTDLP-ONLY ": "ytdlp_only",
+            "胡说": "auto",
+            "": "auto",
+            None: "auto",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                parser = YouTubeParser(stream_source=raw)
+                self.assertEqual(parser.stream_source, expected)
+
+    def test_auto_starts_from_innertube(self):
+        self.assertEqual(self._parser()._plan_stream_source(), "innertube")
+
+    def test_explicit_modes_are_honoured(self):
+        self.assertEqual(
+            self._parser(stream_source="innertube")._plan_stream_source(),
+            "innertube",
+        )
+        self.assertEqual(
+            self._parser(stream_source="ytdlp_only")._plan_stream_source(),
+            "ytdlp_only",
+        )
+
+    def test_ytdlp_only_falls_back_when_fallback_is_disabled(self):
+        parser = YouTubeParser(
+            stream_source="ytdlp_only", ytdlp_fallback=False
+        )
+        self.assertIsNone(parser._ytdlp_resolver())
+        self.assertEqual(parser._plan_stream_source(), "innertube")
+
+    def test_single_gate_does_not_switch_yet(self):
+        parser = self._parser()
+        parser._note_gate_result(True)
+        self.assertFalse(parser._innertube_cooling_down())
+        self.assertEqual(parser._plan_stream_source(), "innertube")
+
+    def test_two_consecutive_gates_hand_streaming_to_ytdlp(self):
+        parser = self._parser()
+        parser._note_gate_result(True)
+        parser._note_gate_result(True)
+        self.assertTrue(parser._innertube_cooling_down())
+        self.assertEqual(parser._plan_stream_source(), "ytdlp_only")
+
+    def test_one_success_clears_the_cooldown(self):
+        parser = self._parser()
+        parser._note_gate_result(True)
+        parser._note_gate_result(True)
+        parser._note_gate_result(False)
+        self.assertFalse(parser._innertube_cooling_down())
+        self.assertEqual(parser._gate_streak, 0)
+        self.assertEqual(parser._plan_stream_source(), "innertube")
+
+    def test_cooldown_expires_on_its_own(self):
+        parser = self._parser()
+        parser._note_gate_result(True)
+        parser._note_gate_result(True)
+        parser._gate_until = time.monotonic() - 1
+        self.assertFalse(parser._innertube_cooling_down())
+        self.assertEqual(parser._plan_stream_source(), "innertube")
+
+    def test_innertube_mode_ignores_the_cooldown(self):
+        parser = self._parser(stream_source="innertube")
+        parser._note_gate_result(True)
+        parser._note_gate_result(True)
+        self.assertTrue(parser._innertube_cooling_down())
+        self.assertEqual(parser._plan_stream_source(), "innertube")
+
+
+class YtDlpInfoSummaryTest(unittest.TestCase):
+    """yt-dlp info 的元数据收敛：只回填读到的字段，空值一律省略。"""
+
+    def test_full_info_maps_every_field(self):
+        summary = summarize_ytdlp_info({
+            "title": "  キュアアルカナ 変身シーン  ",
+            "uploader": "せんのう利休の洗脳道",
+            "channel": "别用我",
+            "uploader_url": "https://www.youtube.com/@example",
+            "description": " 概要欄 ",
+            "duration": 321.7,
+            "view_count": 12345,
+            "like_count": 678,
+            "comment_count": 90,
+            "upload_date": "20260822",
+            "thumbnails": [
+                {"url": "https://i.ytimg.com/small.jpg", "width": 120,
+                 "height": 90},
+                {"url": "https://i.ytimg.com/max.jpg", "width": 1920,
+                 "height": 1080},
+                {"url": "ftp://i.ytimg.com/bad.jpg", "width": 3840,
+                 "height": 2160},
+            ],
+        })
+        self.assertEqual(summary, {
+            "title": "キュアアルカナ 変身シーン",
+            "author": "せんのう利休の洗脳道",
+            "author_url": "https://www.youtube.com/@example",
+            "description": "概要欄",
+            "duration": 321,
+            "views": 12345,
+            "likes": 678,
+            "comments": 90,
+            "publish_date": "2026-08-22",
+            "cover": "https://i.ytimg.com/max.jpg",
+        })
+
+    def test_channel_backfills_a_missing_uploader(self):
+        summary = summarize_ytdlp_info({
+            "channel": "频道名",
+            "channel_url": "https://www.youtube.com/channel/UC1",
+        })
+        self.assertEqual(summary["author"], "频道名")
+        self.assertEqual(
+            summary["author_url"], "https://www.youtube.com/channel/UC1"
+        )
+
+    def test_direct_thumbnail_wins_over_the_list(self):
+        summary = summarize_ytdlp_info({
+            "thumbnail": " https://i.ytimg.com/direct.jpg ",
+            "thumbnails": [
+                {"url": "https://i.ytimg.com/max.jpg", "width": 1920,
+                 "height": 1080},
+            ],
+        })
+        self.assertEqual(summary["cover"], "https://i.ytimg.com/direct.jpg")
+
+    def test_blank_and_invalid_values_are_dropped(self):
+        for info in (
+            {},
+            None,
+            "不是字典",
+            {
+                "title": "  ",
+                "duration": 0,
+                "view_count": 0,
+                "like_count": -3,
+                "upload_date": "2026",
+                "thumbnail": "ftp://x/y.jpg",
+            },
+        ):
+            with self.subTest(info=info):
+                self.assertEqual(summarize_ytdlp_info(info), {})

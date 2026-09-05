@@ -38,6 +38,7 @@ from ..runtime_manager.youtube import (
     build_sapisid_authorization,
     parse_cookie_header,
     probe_ytdlp_environment,
+    summarize_ytdlp_info,
 )
 from ..utils import build_request_headers
 
@@ -48,6 +49,7 @@ __all__ = [
     "DEFAULT_PLAYER_CLIENTS",
     "INNERTUBE_CLIENTS",
     "METADATA_PLAYER_CLIENTS",
+    "STREAM_SOURCE_CHOICES",
     "build_sapisid_authorization",
     "build_youtube_stats_line",
     "detect_youtube_login_state",
@@ -123,6 +125,23 @@ _WEB_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 )
 
+# Cobalt 是 YouTube 官方 TV 端的浏览器内核，TVHTML5 系客户端必须报它的 UA，
+# 报成 PlayStation 浏览器会被当作过期客户端。取值与 yt-dlp 上游保持一致。
+_COBALT_USER_AGENT = (
+    "Mozilla/5.0 (ChromiumStylePlatform) "
+    "Cobalt/25.lts.30.1034943-gold (unlike Gecko) "
+    "Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)"
+)
+_COBALT_LEGACY_USER_AGENT = (
+    "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+)
+
+# watch 页面里的访客身份令牌。Innertube 响应会在 responseContext 里给同样的
+# 值，两处都读得到就都读，谁先到用谁。
+_VISITOR_DATA_RE = re.compile(
+    r"\"(?:VISITOR_DATA|visitorData)\"\s*:\s*\"([^\"]{8,})\""
+)
+
 # Innertube 客户端档案。
 #
 # 客户端能力表。2026-08 实测（Innertube player 端点）结论：
@@ -185,14 +204,25 @@ INNERTUBE_CLIENTS: Dict[str, Dict[str, Any]] = {
         "client_id": 7,
         "media": True,
         "cookies": True,
-        "user_agent": (
-            "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
-            "Safari/605.1.15"
-        ),
+        "user_agent": _COBALT_USER_AGENT,
         "context": {
             "clientName": "TVHTML5",
-            "clientVersion": "7.20250312.16.00",
+            "clientVersion": "7.20260114.12.00",
+            "platform": "TV",
+        },
+    },
+    # TVHTML5 的降级版本号。上游 yt-dlp 把它列为「已登录场景的首选客户端」：
+    # 老版本号的 TV 客户端不要求 PO Token，且对带 Cookie 的请求最宽容。
+    # require_auth=True 表示它只在 Cookie 确实可用时才值得跑，匿名请求必被拒。
+    "tv_downgraded": {
+        "client_id": 7,
+        "media": True,
+        "cookies": True,
+        "require_auth": True,
+        "user_agent": _COBALT_LEGACY_USER_AGENT,
+        "context": {
+            "clientName": "TVHTML5",
+            "clientVersion": "5.20260114",
             "platform": "TV",
         },
     },
@@ -248,8 +278,12 @@ DEFAULT_PLAYER_CLIENTS: Tuple[str, ...] = (
     "android_vr",
 )
 
-# 配置了 cookie 时自动追加的鉴权客户端（顺序即尝试顺序）。
+# Cookie 可用时自动追加的鉴权客户端（顺序即尝试顺序）。
+#
+# tv_downgraded 排第一：它是上游 yt-dlp 在已登录场景下的首选客户端，
+# 不需要 PO Token，对 Cookie 鉴权最宽容。tv / web 依次兜底。
 COOKIE_PLAYER_CLIENTS: Tuple[str, ...] = (
+    "tv_downgraded",
     "tv",
     "web",
 )
@@ -294,6 +328,23 @@ _PLAYABILITY_LABELS = {
     "LIVE_STREAM_OFFLINE": "直播未开始",
     "CONTENT_CHECK_REQUIRED": "敏感内容",
 }
+
+# 取流策略。
+#
+#   auto        自适应：默认先走 Innertube（快、无子进程），连续被门禁挡下后
+#               自动进入冷却期，冷却期内直接由 yt-dlp 出流，省掉必失败的一趟。
+#   innertube   只用官方接口，不启用 yt-dlp（不装 yt-dlp 时的等价行为）。
+#   ytdlp_only  始终由 yt-dlp 出流，Innertube 只用来补元数据/头像/热评。
+#               配了 PO Token 提供方的部署选这档最稳。
+STREAM_SOURCE_CHOICES: Tuple[str, ...] = (
+    "auto",
+    "innertube",
+    "ytdlp_only",
+)
+
+# auto 档下连续多少次被门禁挡下才切到 yt-dlp，以及冷却时长（秒）。
+_GATE_STREAK_THRESHOLD = 2
+_GATE_COOLDOWN_SECONDS = 1800.0
 
 
 # ── URL 解析 ──────────────────────────────────────────────
@@ -1447,6 +1498,7 @@ class YouTubeParser(BaseVideoParser):
         ytdlp_pot_provider: str = "",
         ytdlp_fetch_pot: str = "auto",
         send_video_max_mb: float = 0.0,
+        stream_source: str = "auto",
     ):
         super().__init__("youtube")
         self.cookie = (cookie or "").strip()
@@ -1468,7 +1520,9 @@ class YouTubeParser(BaseVideoParser):
             if float(send_video_max_mb or 0) > 0
             else 0
         )
-        self.player_clients = self._resolve_clients(player_clients)
+        # 只存配置基线；实际链路由 player_clients 属性按当前 Cookie 健康态
+        # 现算，Cookie 判失效后自动摘掉鉴权客户端，不必重建解析器。
+        self._base_player_clients = self._normalize_clients(player_clients)
         self.hot_comment_count = max(0, _as_int(hot_comment_count))
         self.total_budget_seconds = max(8.0, float(total_budget_seconds or 45))
         self.allow_dash = bool(allow_dash)
@@ -1484,6 +1538,14 @@ class YouTubeParser(BaseVideoParser):
         self.ytdlp_pot_provider = (ytdlp_pot_provider or "").strip()
         self.ytdlp_fetch_pot = (ytdlp_fetch_pot or "auto").strip() or "auto"
         self._ytdlp: Optional[YtDlpStreamResolver] = None
+        self.stream_source = self._normalize_stream_source(stream_source)
+        # auto 档的自适应状态：连续被门禁挡下的次数与冷却截止时刻。
+        self._gate_streak = 0
+        self._gate_until = 0.0
+        # 访客身份令牌：从任意一次 Innertube/watch 响应里顺手捞到，之后所有
+        # 请求带上它，让 YouTube 把这些请求看成同一个会话而不是一堆散客。
+        # 只驻内存不落盘——它本身是短期票据，跨重启复用没有意义。
+        self._visitor_data = ""
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         if self.cookie and not self.cookie_authenticated:
             recognized = len(parse_cookie_header(self.cookie))
@@ -1497,9 +1559,24 @@ class YouTubeParser(BaseVideoParser):
 
     _NA = "n/a"
 
-    def _client_chain(self) -> str:
+    @property
+    def player_clients(self) -> Tuple[str, ...]:
+        """当前该尝试的 Innertube 客户端链。
+
+        鉴权客户端只在 Cookie 真正可用时才挂上去：Cookie 一旦被判失效，
+        带着它去请求 tv / web 只会让 yt-dlp 之前那条匿名链也被拖下水。
+        """
+        clients = list(self._base_player_clients)
+        if self.cookie_runtime.usable:
+            for key in COOKIE_PLAYER_CLIENTS:
+                if key not in clients:
+                    clients.append(key)
+        return tuple(clients)
+
+    def _client_chain(self, clients: Optional[Sequence[str]] = None) -> str:
         """返回本次实际尝试的 Innertube 客户端链，便于定位门禁来源。"""
-        return " > ".join(self.player_clients) or self._NA
+        chain = tuple(clients) if clients is not None else self.player_clients
+        return " > ".join(chain) or self._NA
 
     def _login_label(self, cookie_expired: bool) -> str:
         """把当前登录态压缩成一个可读标签。"""
@@ -1509,6 +1586,8 @@ class YouTubeParser(BaseVideoParser):
             return "cookie(缺少 SAPISID，按匿名处理)"
         if cookie_expired:
             return "cookie(已失效)"
+        if not self.cookie_runtime.usable:
+            return "cookie(已判定失效，按匿名请求)"
         return "cookie(已鉴权)"
 
     def _proxy_label(self) -> str:
@@ -1560,35 +1639,88 @@ class YouTubeParser(BaseVideoParser):
             )
         return self._ytdlp
 
-    async def _resolve_with_ytdlp(self, video_id: str) -> Optional[YtDlpStream]:
-        """走 yt-dlp 兜底取流：成功打一行摘要，失败只返回 None 继续降级。"""
+    @staticmethod
+    def _normalize_stream_source(raw: Any) -> str:
+        """规范化取流策略；无法识别时回落 auto。"""
+        value = str(raw or "").strip().lower().replace("-", "_")
+        return value if value in STREAM_SOURCE_CHOICES else "auto"
+
+    def _innertube_cooling_down(self) -> bool:
+        """Innertube 是否正处在门禁冷却期内。"""
+        return self._gate_until > time.monotonic()
+
+    def _note_gate_result(self, gated: bool) -> None:
+        """记一次 Innertube 取流结果，用于 auto 档的自适应切换。
+
+        连续被门禁挡下说明这个出口 IP 已经进了黑名单，短时间内重试没有任何
+        意义；进冷却期后直接让 yt-dlp 出流，省掉每次必失败的那一趟请求。
+        一次成功就立刻清零——出口信誉是会恢复的。
+        """
+        if not gated:
+            if self._gate_streak or self._gate_until:
+                logger.debug("[youtube] Innertube 取流恢复，解除门禁冷却")
+            self._gate_streak = 0
+            self._gate_until = 0.0
+            return
+        self._gate_streak += 1
+        if self._gate_streak < _GATE_STREAK_THRESHOLD:
+            return
+        if not self._innertube_cooling_down():
+            logger.info(
+                f"[youtube] Innertube 连续 {self._gate_streak} 次被门禁挡下，"
+                f"接下来 {int(_GATE_COOLDOWN_SECONDS / 60)} 分钟内直接由 "
+                "yt-dlp 出流"
+            )
+        self._gate_until = time.monotonic() + _GATE_COOLDOWN_SECONDS
+
+    def _plan_stream_source(self) -> str:
+        """决定本次由谁出流，返回 innertube / ytdlp_only。"""
+        if self.stream_source == "innertube":
+            return "innertube"
+        if self._ytdlp_resolver() is None:
+            # 兜底链路没开或不可用，只能走官方接口。
+            return "innertube"
+        if self.stream_source == "ytdlp_only":
+            return "ytdlp_only"
+        return "ytdlp_only" if self._innertube_cooling_down() else "innertube"
+
+    async def _resolve_with_ytdlp(
+        self,
+        video_id: str,
+    ) -> Tuple[Optional[YtDlpStream], Dict[str, Any]]:
+        """走 yt-dlp 取流，返回 (流, 元数据摘要)。
+
+        即便没挑出可用流，info 里的标题/作者/时长往往还是完整的，所以元数据
+        摘要独立返回——Innertube 被全线拦下时它就是卡片唯一的信息来源。
+        """
         resolver = self._ytdlp_resolver()
         if resolver is None:
-            return None
+            return None, {}
         started = time.time()
         try:
-            stream = await resolver.resolve(
+            stream, info = await resolver.resolve_full(
                 video_id,
-                cookie_header=self.cookie_runtime.header(),
+                cookie_header=self.cookie_runtime.active_header(),
                 cookie_revision=self.cookie_runtime.revision,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
-                f"[youtube] yt-dlp 兜底异常: video_id={video_id}; "
+                f"[youtube] yt-dlp 取流异常: video_id={video_id}; "
                 f"{type(exc).__name__}: {exc}"
             )
-            return None
+            return None, {}
+        summary = summarize_ytdlp_info(info)
         if stream is None:
-            return None
+            return None, summary
         logger.info(
-            f"[youtube] yt-dlp 兜底取流成功: video_id={video_id} "
+            f"[youtube] yt-dlp 取流成功: video_id={video_id} "
             f"流={stream.kind}@{stream.height}p "
             f"格式={stream.detail or self._NA} "
             f"耗时={time.time() - started:.2f}s"
         )
-        return stream
+        return stream, summary
 
     def consume_cookie_alert(self) -> Optional[str]:
         """读取并消费一次待通知的 Cookie 失效原因。"""
@@ -1603,15 +1735,6 @@ class YouTubeParser(BaseVideoParser):
             return
         self._cookie_alert_pending = True
         self._cookie_alert_reason = reason or "cookie_expired"
-
-    def _resolve_clients(self, raw: Any) -> Tuple[str, ...]:
-        """规范化配置的客户端列表，并在配了 cookie 时追加鉴权客户端。"""
-        clients = list(self._normalize_clients(raw))
-        if self.cookie_authenticated:
-            for key in COOKIE_PLAYER_CLIENTS:
-                if key not in clients:
-                    clients.append(key)
-        return tuple(clients)
 
     @staticmethod
     def _normalize_clients(raw: Any) -> Tuple[str, ...]:
@@ -1639,6 +1762,25 @@ class YouTubeParser(BaseVideoParser):
 
     # ── Innertube 请求 ────────────────────────────────────
 
+    def _remember_visitor_data(self, value: Any) -> None:
+        """记住服务端下发的访客身份令牌（首个即用，不覆盖）。
+
+        YouTube 对「没有任何身份的裸请求」风控最狠。带上一次响应里给的
+        visitorData 之后，同一次解析的多个请求会被看成同一个会话，
+        比每一层都当散客上门要顺很多，而且不需要额外发任何请求。
+        """
+        text = str(value or "").strip()
+        if text and not self._visitor_data:
+            self._visitor_data = text
+
+    def _absorb_visitor_data(self, payload: Any) -> None:
+        """从 Innertube 响应的 responseContext 里捞访客身份令牌。"""
+        if self._visitor_data or not isinstance(payload, dict):
+            return
+        context = payload.get("responseContext")
+        if isinstance(context, dict):
+            self._remember_visitor_data(context.get("visitorData"))
+
     def _innertube_headers(self, client_key: str) -> Dict[str, str]:
         profile = INNERTUBE_CLIENTS.get(client_key) or INNERTUBE_CLIENTS["web"]
         context = profile.get("context") or {}
@@ -1654,9 +1796,13 @@ class YouTubeParser(BaseVideoParser):
                 context.get("clientVersion") or "2.20250312.04.00"
             ),
         }
+        if self._visitor_data:
+            headers["X-Goog-Visitor-Id"] = self._visitor_data
         # 原生移动客户端不接受鉴权，带 Cookie 反而可能触发额外风控，
         # 所以只给显式声明 cookies=True 的客户端带上登录态。
-        cookie_header = self.cookie_runtime.header()
+        # 用 active_header：Cookie 已判失效时一律按匿名请求，绝不把死凭据
+        # 递上去——带着死 Cookie 反而会让本来能过的匿名链路一起被拒。
+        cookie_header = self.cookie_runtime.active_header()
         if cookie_header and profile.get("cookies"):
             headers["Cookie"] = cookie_header
             authorization = build_sapisid_authorization(cookie_header)
@@ -1676,6 +1822,8 @@ class YouTubeParser(BaseVideoParser):
         client["hl"] = hl
         client["gl"] = "US"
         client["userAgent"] = profile.get("user_agent") or _WEB_USER_AGENT
+        if self._visitor_data:
+            client["visitorData"] = self._visitor_data
         body: Dict[str, Any] = {
             "context": {"client": client},
             "contentCheckOk": True,
@@ -1712,6 +1860,7 @@ class YouTubeParser(BaseVideoParser):
             data = await response.json(content_type=None)
         if not isinstance(data, dict):
             raise RuntimeError(f"Innertube {endpoint} 返回非对象响应")
+        self._absorb_visitor_data(data)
         return data
 
     async def _fetch_oembed(
@@ -1747,6 +1896,11 @@ class YouTubeParser(BaseVideoParser):
         """依次尝试各 Innertube 客户端，返回第一个带可用媒体流的结果。"""
         best: Tuple[Dict[str, Any], str] = ({}, "")
         for client_key in self.player_clients:
+            profile = INNERTUBE_CLIENTS.get(client_key) or {}
+            if profile.get("require_auth") and not self.cookie_runtime.usable:
+                # 这类客户端匿名请求必被拒，没必要白烧一趟预算。
+                failures.append(f"{client_key} -> 跳过（需要登录态）")
+                continue
             if deadline.expired():
                 failures.append(f"{client_key} -> 跳过（总预算耗尽）")
                 break
@@ -1838,6 +1992,26 @@ class YouTubeParser(BaseVideoParser):
             failures.append(f"{client_key}(元数据) -> 无 videoDetails")
         return {}
 
+    async def _fetch_player_light(
+        self,
+        session: aiohttp.ClientSession,
+        video_id: str,
+        deadline: _Deadline,
+        failures: List[str],
+    ) -> Tuple[Dict[str, Any], str]:
+        """由 yt-dlp 出流时用的轻量 player 请求：只取元数据，不选流。
+
+        取流既然交给 yt-dlp，就不该再把整条出流客户端链跑一遍——那是几趟注定
+        被门禁拒掉的请求。这里只跑元数据客户端，把标题/时长/播放量拿回来。
+        """
+        player = await self._fetch_player_metadata(
+            session, video_id, deadline, failures
+        )
+        details = player.get("videoDetails")
+        if isinstance(details, dict) and details.get("title"):
+            return player, METADATA_PLAYER_CLIENTS[0]
+        return player, ""
+
     async def _fetch_watch_html(
         self,
         session: aiohttp.ClientSession,
@@ -1850,7 +2024,9 @@ class YouTubeParser(BaseVideoParser):
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        cookie_header = self.cookie_runtime.header()
+        if self._visitor_data:
+            headers["X-Goog-Visitor-Id"] = self._visitor_data
+        cookie_header = self.cookie_runtime.active_header()
         if cookie_header:
             headers["Cookie"] = cookie_header
         async with session.get(
@@ -1862,6 +2038,9 @@ class YouTubeParser(BaseVideoParser):
             self.cookie_runtime.absorb_response(response)
             response.raise_for_status()
             html = await response.text()
+        matched = _VISITOR_DATA_RE.search(html)
+        if matched:
+            self._remember_visitor_data(matched.group(1))
         return parse_watch_html(html)
 
     async def _fetch_next(
@@ -1908,11 +2087,29 @@ class YouTubeParser(BaseVideoParser):
         session: aiohttp.ClientSession,
         timeout_seconds: float = 20.0,
     ) -> Tuple[Optional[bool], str]:
-        """主动跑一次 Cookie 保鲜请求，返回 (登录态, 可读摘要)。"""
+        """主动跑一次 Cookie 体检请求，返回 (登录态, 可读摘要)。"""
         return await self.cookie_runtime.keepalive(
             session,
             proxy=self.proxy,
             timeout_seconds=timeout_seconds,
+        )
+
+    async def maintain_cookie(
+        self,
+        session: aiohttp.ClientSession,
+        timeout_seconds: float = 20.0,
+        verify: bool = False,
+    ) -> Tuple[Optional[bool], str]:
+        """跑一轮 Cookie 维护（轮换 + 按需验证），返回 (登录态, 摘要)。
+
+        浏览器里 __Secure-1PSIDTS 每十几分钟就换一次，凭据放着不动反而更容易
+        被判失效。verify=False 时只做轻量轮换，需要确认登录态时再传 True。
+        """
+        return await self.cookie_runtime.maintain(
+            session,
+            proxy=self.proxy,
+            timeout_seconds=timeout_seconds,
+            verify=verify,
         )
 
     def cookie_status_line(self) -> str:
@@ -1933,12 +2130,23 @@ class YouTubeParser(BaseVideoParser):
         canonical = f"https://www.youtube.com/watch?v={video_id}"
         failures: List[str] = []
 
+        # 本次由谁出流先定下来：ytdlp_only 时不再跑那条注定被门禁拒掉的
+        # 出流客户端链，只用官方接口补元数据、头像与热评。
+        cookie_used = self.cookie_runtime.usable
+        clients_tried = self.player_clients
+        plan = self._plan_stream_source()
+        stream_from_innertube = plan != "ytdlp_only"
+
         # 第 1 层：元数据与媒体流并发拉取，互不阻塞。
         oembed_task = asyncio.ensure_future(
             self._fetch_oembed(session, video_id, deadline)
         )
         player_task = asyncio.ensure_future(
             self._fetch_player(session, video_id, deadline, failures)
+            if stream_from_innertube
+            else self._fetch_player_light(
+                session, video_id, deadline, failures
+            )
         )
         oembed_result, player_result = await asyncio.gather(
             oembed_task, player_task, return_exceptions=True
@@ -1968,11 +2176,17 @@ class YouTubeParser(BaseVideoParser):
         details = player.get("videoDetails")
         details = details if isinstance(details, dict) else {}
         initial_data: Optional[Dict[str, Any]] = None
+        # 轻量分支已经跑过元数据客户端了，别再跑第二遍。
+        metadata_probe_done = not stream_from_innertube
 
         # 第 1 层兜底：门禁吞掉 videoDetails 时，用元数据专用客户端补回
         # 标题/作者/时长/播放量。playabilityStatus 仍沿用出流客户端的结果，
         # 否则「被机器人验证挡下」会退化成含糊的「无法播放」。
-        if not details.get("title") and not deadline.expired():
+        if (
+            not metadata_probe_done
+            and not details.get("title")
+            and not deadline.expired()
+        ):
             meta_player = await self._fetch_player_metadata(
                 session, video_id, deadline, failures
             )
@@ -2009,8 +2223,23 @@ class YouTubeParser(BaseVideoParser):
                 else:
                     failures.append("watch_html -> 页面未内嵌可用 player 数据")
 
-        title = str(details.get("title") or "") or str(
-            oembed.get("title") or ""
+        # yt-dlp 提前出手的两种情形：
+        #   1) 本次就该由它出流（ytdlp_only 档，或 auto 档进了门禁冷却期）；
+        #   2) 官方接口连标题都没拿到——此时它的 info 是卡片唯一的信息来源，
+        #      早跑一步就能把「元数据获取失败」变成一张完整的封面卡片。
+        ytdlp_tried = False
+        ytdlp_stream: Optional[YtDlpStream] = None
+        ytdlp_meta: Dict[str, Any] = {}
+        if not stream_from_innertube or not (
+            details.get("title") or oembed.get("title")
+        ):
+            ytdlp_tried = True
+            ytdlp_stream, ytdlp_meta = await self._resolve_with_ytdlp(video_id)
+
+        title = (
+            str(details.get("title") or "")
+            or str(oembed.get("title") or "")
+            or str(ytdlp_meta.get("title") or "")
         )
         if not title:
             raise RuntimeError(
@@ -2019,18 +2248,24 @@ class YouTubeParser(BaseVideoParser):
                 + "）"
             )
 
-        # 第 2 层：挑选媒体流。
-        (
-            media_url,
-            media_kind,
-            media_height,
-            media_size_bytes,
-        ) = select_youtube_media_detailed(
-            player,
-            max_height=self.max_height,
-            allow_dash=self.allow_dash,
-            max_bytes=self.stream_max_bytes,
-        )
+        # 第 2 层：挑选媒体流。交给 yt-dlp 出流时跳过，省一次无意义的遍历。
+        media_url = ""
+        media_kind = ""
+        media_height = 0
+        media_size_bytes = 0
+        if stream_from_innertube:
+            (
+                media_url,
+                media_kind,
+                media_height,
+                media_size_bytes,
+            ) = select_youtube_media_detailed(
+                player,
+                max_height=self.max_height,
+                allow_dash=self.allow_dash,
+                max_bytes=self.stream_max_bytes,
+            )
+        innertube_stream_ok = bool(media_url)
 
         covers = thumbnail_candidates(video_id)
         oembed_cover = oembed.get("thumbnail_url")
@@ -2125,41 +2360,78 @@ class YouTubeParser(BaseVideoParser):
         if not avatar_url:
             avatar_url = upscale_avatar_url(self._extract_avatar_url(player))
 
-        # 第 4 层：Innertube 一路都没拿到流时，交给 yt-dlp 兜底。
+        # 第 4 层：yt-dlp 取流。
         #
-        # YouTube 现在给 Web 端下发的基本都是 SABR 流与带签名挑战的流，必须
-        # 真的执行播放器 JS 才能还原直链。这活儿借 yt-dlp 做，比自己追着上游
-        # 改签名算法划算得多。刻意放在增强层之后：兜底要跑数秒并拉起 JS 运行
-        # 时子进程，先把头像/热评拿到手，才不会因为兜底耗时把卡片内容拖没。
+        # YouTube 给 Web 端下发的基本都是 SABR 流与带签名挑战的流，必须真的
+        # 执行播放器 JS 才能还原直链；这活儿借 yt-dlp 做，比自己追着上游改
+        # 签名算法划算得多。前面没跑过就在这里补一趟：刻意排在增强层之后，
+        # 它要跑数秒并拉起 JS 运行时子进程，先把头像/热评拿到手更稳妥。
+        if not media_url and not ytdlp_tried:
+            ytdlp_tried = True
+            ytdlp_stream, ytdlp_meta = await self._resolve_with_ytdlp(video_id)
+
         used_ytdlp = False
         ytdlp_detail = ""
-        if not media_url:
-            stream = await self._resolve_with_ytdlp(video_id)
-            if stream is not None and stream.url:
-                media_url = stream.url
-                media_kind = stream.kind
-                media_height = stream.height
-                media_size_bytes = max(0, _as_int(stream.filesize))
-                ytdlp_detail = stream.detail
-                used_ytdlp = True
-                if stream.user_agent:
-                    # yt-dlp 的直链与它取链时用的 UA 绑定，换 UA 会被 403。
-                    video_headers = build_request_headers(
-                        is_video=True,
-                        referer="https://www.youtube.com/",
-                        origin="https://www.youtube.com",
-                        user_agent=stream.user_agent,
-                    )
+        if not media_url and ytdlp_stream is not None and ytdlp_stream.url:
+            media_url = ytdlp_stream.url
+            media_kind = ytdlp_stream.kind
+            media_height = ytdlp_stream.height
+            media_size_bytes = max(0, _as_int(ytdlp_stream.filesize))
+            ytdlp_detail = ytdlp_stream.detail
+            used_ytdlp = True
+            if ytdlp_stream.user_agent:
+                # yt-dlp 的直链与它取链时用的 UA 绑定，换 UA 会被 403。
+                video_headers = build_request_headers(
+                    is_video=True,
+                    referer="https://www.youtube.com/",
+                    origin="https://www.youtube.com",
+                    user_agent=ytdlp_stream.user_agent,
+                )
+
+        # 官方接口被门禁吞掉的字段用 yt-dlp 的 info 补齐：同一趟请求换来的
+        # 附赠品，不补就白丢。只填空位，已有值一律不动。
+        if ytdlp_meta:
+            author = author or str(ytdlp_meta.get("author") or "")
+            desc = desc or str(ytdlp_meta.get("description") or "")
+            length_seconds = length_seconds or _as_int(
+                ytdlp_meta.get("duration")
+            )
+            view_count = view_count or _as_int(ytdlp_meta.get("views"))
+            like_count = like_count or _as_int(ytdlp_meta.get("likes"))
+            comment_count = comment_count or _as_int(
+                ytdlp_meta.get("comments")
+            )
+            ytdlp_cover = str(ytdlp_meta.get("cover") or "")
+            if ytdlp_cover.startswith("http") and ytdlp_cover not in covers:
+                covers.append(ytdlp_cover)
+
+        timestamp = extract_youtube_publish_date(player, next_payload) or str(
+            ytdlp_meta.get("publish_date") or ""
+        )
+
+        # playabilityStatus 无论有没有取到流都要读：它是「本次是否被门禁
+        # 拦下」的唯一依据，冷却决策与 Cookie 健康判定都靠它。
+        status = player.get("playabilityStatus")
+        status_code = ""
+        if isinstance(status, dict):
+            status_code = str(status.get("status") or "")
+
+        status_label = _PLAYABILITY_LABELS.get(status_code, "")
+        # 官方接口本次没负责出流时，playabilityStatus 讲的是「网页端能不能
+        # 播」，拿它解释「为什么没有视频」会张冠李戴。
+        restriction_label = status_label if stream_from_innertube else ""
+
+        # 门禁计数只统计官方接口真的下场出流的那几趟，否则冷却期会被自己
+        # 的降级结果无限续下去。
+        if stream_from_innertube:
+            self._note_gate_result(
+                not innertube_stream_ok
+                and status_code in _GATED_STATUS_CODES
+            )
 
         # 无可下载流时退化为封面卡片，并说明原因。
         limit_warnings: List[str] = []
-        status_code = ""
-        restriction_label = ""
         if not media_url:
-            status = player.get("playabilityStatus")
-            if isinstance(status, dict):
-                status_code = str(status.get("status") or "")
-            restriction_label = _PLAYABILITY_LABELS.get(status_code, "")
             if restriction_label:
                 limit_warnings.append(f"{restriction_label}，仅展示封面与信息")
             elif is_live:
@@ -2180,7 +2452,7 @@ class YouTubeParser(BaseVideoParser):
             "author": author,
             "avatar_url": avatar_url,
             "desc": desc,
-            "timestamp": extract_youtube_publish_date(player, next_payload),
+            "timestamp": timestamp,
             "platform": "youtube",
             "parser_name": self.name,
             "video_urls": video_urls,
@@ -2212,35 +2484,53 @@ class YouTubeParser(BaseVideoParser):
             metadata["access_message"] = limit_warnings[0]
             if status_code and status_code != "OK":
                 metadata["access_status"] = status_code
-                metadata["restriction_label"] = restriction_label or status_code
+                metadata["restriction_label"] = status_label or status_code
                 metadata["can_access_full_video"] = False
 
         metadata["youtube_video_id"] = video_id
         metadata["youtube_channel_id"] = channel_id
         metadata["youtube_stream_kind"] = media_kind
         metadata["youtube_player_client"] = player_client
-        metadata["youtube_stream_source"] = "ytdlp" if used_ytdlp else "innertube"
+        if used_ytdlp:
+            stream_source_label = f"yt-dlp {ytdlp_detail}".strip()
+            metadata["youtube_stream_source"] = "ytdlp"
+        elif media_url:
+            stream_source_label = "innertube"
+            metadata["youtube_stream_source"] = "innertube"
+        else:
+            stream_source_label = "无"
+            metadata["youtube_stream_source"] = "none"
 
-        # 登录态诊断：cookie 被服务端当成未登录时必须显式告警，否则用户只会
-        # 看到一张「仅展示封面」的卡片，日志里却毫无线索。
+        # 登录态诊断：Cookie 被服务端当成未登录时要显式告警，否则用户只会
+        # 看到一张「仅展示封面」的卡片，日志里却毫无线索。但只在健康态真的
+        # 由「有效」翻成「失效」的那一次开口——一旦判失效，后续请求已改走
+        # 匿名链，再刷同一条告警只是噪音。
         cookie_expired = bool(
-            self.cookie_authenticated
+            cookie_used
             and (login_state is False or status_code == "LOGIN_REQUIRED")
         )
+        cookie_flipped = False
         if cookie_expired:
-            reason = (
-                "player_login_required"
-                if status_code == "LOGIN_REQUIRED"
-                else "innertube_logged_out"
+            cookie_flipped = self.cookie_runtime.mark_dead(
+                "被 YouTube 判为未登录"
             )
-            self._mark_cookie_alert(reason)
+            if cookie_flipped:
+                self._mark_cookie_alert(
+                    "player_login_required"
+                    if status_code == "LOGIN_REQUIRED"
+                    else "innertube_logged_out"
+                )
+        elif cookie_used and login_state is True:
+            # 服务端确认在线，把之前的失效判定收回来。
+            self.cookie_runtime.mark_alive()
 
         chain = "; ".join(failures) if failures else "无"
         diagnosis = ", ".join(
             [
                 f"video_id={video_id}",
                 f"playability={status_code or self._NA}",
-                f"客户端={self._client_chain()}",
+                f"客户端={self._client_chain(clients_tried)}",
+                f"取流策略={plan}",
                 f"登录态={self._login_label(cookie_expired)}",
                 f"代理={self._proxy_label()}",
             ]
@@ -2249,15 +2539,15 @@ class YouTubeParser(BaseVideoParser):
             logger.warning(
                 f"[youtube] 未取到可下载视频流，已降级为封面卡片: "
                 f"{limit_warnings[0]}（{diagnosis}）"
-                f"{self._gate_advice(status_code, cookie_expired)}"
+                f"{self._gate_advice(status_code, cookie_flipped)}"
                 f"{self._ytdlp_advice()}"
                 f"；降级链: {chain}"
             )
         else:
-            if cookie_expired:
+            if cookie_flipped:
                 logger.warning(
                     f"[youtube] 当前 Cookie 已被服务端视为未登录，"
-                    f"随时可能触发机器人验证（{diagnosis}）"
+                    f"后续请求改走匿名链（{diagnosis}）"
                     f"；处理建议: 重新导出 YouTube Cookie"
                 )
             if failures:
@@ -2273,7 +2563,7 @@ class YouTubeParser(BaseVideoParser):
             f"[youtube] 解析完成 video_id={video_id} "
             f"标题={title[:40]} 作者={author} "
             f"流={media_kind}@{media_height}p{size_label} "
-            f"取流={'yt-dlp ' + ytdlp_detail if used_ytdlp else 'innertube'} "
+            f"取流={stream_source_label} "
             f"client={player_client or self._NA} "
             f"热评={len(hot_comments)} 耗时={time.time() - started:.2f}s"
         )

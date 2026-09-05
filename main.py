@@ -48,6 +48,11 @@ from .nova_core.translation import MetadataTranslator, build_card_metadata_list
     "1.7.1",
 )
 class MediaParserNovaPlugin(Star):
+    # Google 侧的登录凭据大约每 10 分钟就会换一茬。轮换请求本身极轻（一个
+    # 空 POST），跑得比 Cookie 老化更快才追得上；重的登录态体检仍按配置的
+    # 体检间隔来，两者共用同一个后台任务。
+    _YOUTUBE_ROTATE_INTERVAL = 20 * 60
+
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.logger = logger
@@ -270,10 +275,10 @@ class MediaParserNovaPlugin(Star):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    # ── YouTube Cookie 保鲜 ─────────────────────────────
+    # ── YouTube Cookie 维护 ─────────────────────────────
 
     def _youtube_keepalive_enabled(self) -> bool:
-        """只有配置了 Cookie 且保鲜间隔为正数时才需要后台保鲜任务。"""
+        """只有配置了 Cookie 且体检间隔为正数时才需要后台维护任务。"""
         if self.youtube_parser is None:
             return False
         cfg = self.config_manager
@@ -292,8 +297,15 @@ class MediaParserNovaPlugin(Star):
             hours = 6
         return max(1, min(hours, 168)) * 3600
 
-    async def _youtube_cookie_keepalive_once(self) -> None:
-        """跑一次保鲜请求：吸收服务端轮换并顺带体检登录态。"""
+    async def _youtube_cookie_keepalive_once(
+        self,
+        verify: bool = True,
+    ) -> None:
+        """跑一次 Cookie 维护。
+
+        verify=False 时只做轻量轮换（吸收服务端下发的新凭据），不额外发起
+        登录态体检；verify=True 时补上体检，用来确认凭据是否还被认账。
+        """
         parser = self.youtube_parser
         if parser is None:
             return
@@ -309,32 +321,45 @@ class MediaParserNovaPlugin(Star):
             await connector.close()
             raise
         async with session:
-            logged_in, detail = await parser.keepalive_cookie(session)
-        summary = f"[youtube] Cookie 保鲜: {detail}；{parser.cookie_status_line()}"
+            logged_in, detail = await parser.maintain_cookie(
+                session, verify=verify
+            )
+        summary = f"[youtube] Cookie 维护: {detail}；{parser.cookie_status_line()}"
         if logged_in is False:
             self.logger.warning(summary + "；请重新导出 YouTube Cookie")
             self.youtube_cookie_notice.trigger_assist_request(
                 "keepalive_logged_out"
             )
-        else:
+        elif verify or logged_in is True:
             self.logger.info(summary)
+        else:
+            # 纯轮换轮次没有新结论时不占用日志。
+            self.logger.debug(summary)
 
     async def _youtube_cookie_keepalive_loop(self) -> None:
         try:
+            verify_interval = self._youtube_keepalive_interval()
+            # 首轮就带体检：既校验 Cookie 健康度，也把长时间沉默期间积累的
+            # 轮换一并补上。
+            elapsed = verify_interval
             while True:
-                # 启动后先立刻跑一次，既能校验 Cookie 健康度，
-                # 也能把长时间沉默期间积累的轮换补上。
+                verify = elapsed >= verify_interval
                 try:
-                    await self._youtube_cookie_keepalive_once()
+                    await self._youtube_cookie_keepalive_once(verify=verify)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"[youtube] Cookie 保鲜失败: {e!r}")
-                await asyncio.sleep(self._youtube_keepalive_interval())
+                    logger.warning(f"[youtube] Cookie 维护失败: {e!r}")
+                if verify:
+                    elapsed = 0
+                    # 间隔可能被热改，每轮体检后重新读一次。
+                    verify_interval = self._youtube_keepalive_interval()
+                await asyncio.sleep(self._YOUTUBE_ROTATE_INTERVAL)
+                elapsed += self._YOUTUBE_ROTATE_INTERVAL
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(f"[youtube] Cookie 保鲜任务异常退出: {e!r}")
+            logger.warning(f"[youtube] Cookie 维护任务异常退出: {e!r}")
 
     def _start_youtube_cookie_keepalive(self) -> None:
         task = self._youtube_keepalive_task

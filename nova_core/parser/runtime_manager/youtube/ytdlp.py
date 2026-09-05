@@ -60,6 +60,7 @@ __all__ = [
     "YtDlpStreamResolver",
     "probe_ytdlp_environment",
     "reset_ytdlp_environment_cache",
+    "summarize_ytdlp_info",
 ]
 
 
@@ -99,6 +100,9 @@ _PROBE_LOCK = threading.Lock()
 _PROBE_CACHE: Dict[str, "YtDlpEnvironment"] = {}
 # 缺件告警只出一次，避免每条链接都刷一遍相同的安装建议。
 _WARNED_PROBLEMS: set = set()
+# 环境摘要也只播报一次：既让人知道 POT 提供方到底有没有生效，又不至于每条
+# 链接都刷一遍同样的一行。
+_ANNOUNCED_ENVIRONMENTS: set = set()
 
 
 def _as_int(value: Any) -> int:
@@ -377,6 +381,83 @@ def reset_ytdlp_environment_cache() -> None:
     with _PROBE_LOCK:
         _PROBE_CACHE.clear()
         _WARNED_PROBLEMS.clear()
+        _ANNOUNCED_ENVIRONMENTS.clear()
+
+
+# ── 元数据兜底 ────────────────────────────────────────────
+
+def _iso_date(text: Any) -> str:
+    """把 yt-dlp 的 20260822 形式的日期转成 2026-08-22。"""
+    digits = "".join(ch for ch in str(text or "") if ch.isdigit())
+    if len(digits) != 8:
+        return ""
+    return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+
+
+def _pick_thumbnail(info: Dict[str, Any]) -> str:
+    """挑一张封面：优先 info 自带的首选项，否则取分辨率最高的那张。"""
+    direct = str(info.get("thumbnail") or "").strip()
+    if direct.startswith(("http://", "https://")):
+        return direct
+    best = ""
+    best_area = -1
+    for item in info.get("thumbnails") or ():
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        area = _as_int(item.get("width")) * _as_int(item.get("height"))
+        if area > best_area:
+            best, best_area = url, area
+    return best
+
+
+def summarize_ytdlp_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    """把 yt-dlp 的 info 收敛成插件用得上的元数据子集。
+
+    Innertube 侧被人机验证全线拦下时，yt-dlp 往往仍能拿到完整元数据。把它
+    正规化成统一形状，卡片就还能照常出，而不是因为缺标题直接失败。只回填确
+    实读到的字段，空值一律省略，方便调用方做「缺什么补什么」。
+    """
+    if not isinstance(info, dict):
+        return {}
+    summary: Dict[str, Any] = {}
+    for key, source in (
+        ("title", "title"),
+        ("author", "uploader"),
+        ("description", "description"),
+    ):
+        text = str(info.get(source) or "").strip()
+        if text:
+            summary[key] = text
+    if not summary.get("author"):
+        channel = str(info.get("channel") or "").strip()
+        if channel:
+            summary["author"] = channel
+    author_url = str(
+        info.get("uploader_url") or info.get("channel_url") or ""
+    ).strip()
+    if author_url:
+        summary["author_url"] = author_url
+    duration = _as_int(info.get("duration"))
+    if duration > 0:
+        summary["duration"] = duration
+    for key, source in (
+        ("views", "view_count"),
+        ("likes", "like_count"),
+        ("comments", "comment_count"),
+    ):
+        value = _as_int(info.get(source))
+        if value > 0:
+            summary[key] = value
+    cover = _pick_thumbnail(info)
+    if cover:
+        summary["cover"] = cover
+    published = _iso_date(info.get("upload_date"))
+    if published:
+        summary["publish_date"] = published
+    return summary
 
 
 # ── 取流 ──────────────────────────────────────────────────
@@ -654,20 +735,49 @@ class YtDlpStreamResolver:
             f"疑难视频只能出封面卡片{env.advice()}"
         )
 
-    async def resolve(
+    def _announce(self, env: YtDlpEnvironment) -> None:
+        """首次真正用到 yt-dlp 时播报一次环境，之后降级为 debug。"""
+        signature = f"{env.summary()}|{self.pot_target_label()}"
+        if signature in _ANNOUNCED_ENVIRONMENTS:
+            logger.debug(f"[youtube] yt-dlp 取流环境: {signature}")
+            return
+        _ANNOUNCED_ENVIRONMENTS.add(signature)
+        logger.info(
+            f"[youtube] yt-dlp 取流就绪: {env.summary()}，"
+            f"POT 取令牌策略={self.fetch_pot}，{self.pot_target_label()}"
+        )
+
+    def pot_target_label(self) -> str:
+        """说明 PO Token 提供方按哪种模式、指向哪里，便于排障。"""
+        if not self.pot_provider:
+            return "POT 地址=默认"
+        if _POT_URL_RE.match(self.pot_provider):
+            return f"POT 模式=HTTP 服务，地址={self.pot_provider}"
+        return f"POT 模式=生成脚本，目录={self.pot_provider}"
+
+    async def resolve_full(
         self,
         video_id: str,
         cookie_header: str = "",
         cookie_revision: int = 0,
-    ) -> Optional[YtDlpStream]:
-        """解析一条视频；任何失败都只返回 None，由调用方继续降级。"""
+    ) -> Tuple[Optional[YtDlpStream], Dict[str, Any]]:
+        """解析一条视频，同时把 yt-dlp 读到的原始 info 一并交回。
+
+        取流失败并不等于一无所获：Innertube 全线被人机验证拦下时，这里的
+        info 往往还带着完整标题、作者与统计数字，足够撑起一张封面卡片。
+
+        Returns:
+            Tuple[Optional[YtDlpStream], Dict[str, Any]]: (选中的流, 原始 info)。
+            任何失败都不抛错，由调用方继续降级。
+        """
         video_id = (video_id or "").strip()
         if not video_id:
-            return None
+            return None, {}
         env = probe_ytdlp_environment(self.js_runtime)
         if not env.ready:
             self._warn_unready(env)
-            return None
+            return None, {}
+        self._announce(env)
         jar = self._ensure_cookie_jar(cookie_header, cookie_revision)
         options = self.build_options(jar)
         try:
@@ -680,21 +790,35 @@ class YtDlpStreamResolver:
             raise
         except asyncio.TimeoutError:
             logger.warning(
-                f"[youtube] yt-dlp 兜底超时（上限 {self.timeout:.0f}s）: "
+                f"[youtube] yt-dlp 取流超时（上限 {self.timeout:.0f}s）: "
                 f"video_id={video_id}"
             )
-            return None
+            return None, {}
         except Exception as exc:
             logger.warning(
-                f"[youtube] yt-dlp 兜底解析失败: video_id={video_id}; "
+                f"[youtube] yt-dlp 取流失败: video_id={video_id}; "
                 f"{type(exc).__name__}: {exc}"
             )
-            return None
+            return None, {}
         stream = self.select(info)
         if stream is None:
             logger.warning(
-                f"[youtube] yt-dlp 兜底未挑到可直连流: video_id={video_id}"
+                f"[youtube] yt-dlp 未挑到可直连流: video_id={video_id}"
             )
+        return stream, info if isinstance(info, dict) else {}
+
+    async def resolve(
+        self,
+        video_id: str,
+        cookie_header: str = "",
+        cookie_revision: int = 0,
+    ) -> Optional[YtDlpStream]:
+        """只要一路可直连流的薄封装；任何失败都返回 None。"""
+        stream, _info = await self.resolve_full(
+            video_id,
+            cookie_header=cookie_header,
+            cookie_revision=cookie_revision,
+        )
         return stream
 
     # ── 选流 ─────────────────────────────────────────────

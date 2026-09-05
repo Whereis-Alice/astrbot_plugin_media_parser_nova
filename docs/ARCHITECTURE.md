@@ -21,7 +21,7 @@
 - 小黑盒：支持 视频 / 图片 / 文本；覆盖游戏详情页和 BBS/link 帖子。
 - Twitter/X：支持 视频 / 图片 / 文本；优先 FxTwitter/FxEmbed，服务不可用时回退 Guest GraphQL。
 - Pixiv：支持 图片 / 文本；覆盖插画和漫画作品页、多页原图候选、Cookie 访问限制与解析/图片代理。
-- YouTube：支持 视频 / 图片 / 文本 / 热评；走官方 Innertube（player / next）多层降级，多客户端取流、共享时间预算、可选 yt-dlp 兜底取流，取不到流时退化为封面卡片。
+- YouTube：支持 视频 / 图片 / 文本 / 热评；官方 Innertube（player / next）多客户端降级与 yt-dlp 两条取流腿，配比由「视频流取用来源」决定，共享单次解析时间预算；Cookie 后台续期保活并在判死后退回匿名，两条腿都取不到流时退化为封面卡片。
 
 ### 1.2 核心模块结构
 
@@ -47,10 +47,13 @@ astrbot_plugin_media_parser_nova/
     │   ├── router.py                # LinkRouter，链接提取、去重、直播过滤
     │   ├── utils.py                 # 通用工具、卡片 URL 提取、直播判断、请求头构建
     │   ├── runtime_manager/
-    │   │   └── bilibili/auth.py     # BilibiliAuthRuntime，Cookie 校验与扫码登录
+    │   │   ├── bilibili/auth.py     # BilibiliAuthRuntime，Cookie 校验与扫码登录
+    │   │   └── youtube/
+    │   │       ├── cookie.py        # YouTubeCookieRuntime，鉴权头、轮换吸收、续期与健康态
+    │   │       └── ytdlp.py         # yt-dlp 取流与元数据摘要、PO Token provider 探测
     │   └── platform/                # 各平台解析器
     │       ├── pixiv.py             # Pixiv 插画/漫画解析器
-    │       ├── youtube.py           # YouTube Innertube 解析器（多层降级）
+    │       ├── youtube.py           # YouTube 解析器（Innertube 降级 + yt-dlp）
     │       ├── xianyu.py            # 闲鱼商品页解析器
     │       └── toutiao.py           # 今日头条文章/微头条/视频解析器
     ├── downloader/
@@ -157,7 +160,8 @@ cache/runtime_manager/bilibili/cookie.json
 - 监听所有消息事件。
 - 执行权限检查、触发判断、卡片 URL 和回复 URL 提取。
 - 协调解析限流、解析、下载、文件 Token 注册、节点构建、发送与清理。
-- 在 `terminate()` 中关闭周期清理、延迟清理、管理员交互和下载任务；仍处于 Token TTL 内的已标记文件由下次加载后的过期扫描回收。
+- 维护 YouTube Cookie 后台任务：每 20 分钟跑一次续期，按「Cookie 体检间隔」补跑登录态体检，判死时触发管理员私聊提醒。
+- 在 `terminate()` 中关闭周期清理、延迟清理、管理员交互、YouTube Cookie 维护和下载任务；仍处于 Token TTL 内的已标记文件由下次加载后的过期扫描回收。
 
 管理员私聊发送 `admin.clean_cache_keyword`，且发送者为 `permissions.admin_id` 时，会触发 `cleanup_marked_in(cache_dir)` 主动清理媒体缓存。
 
@@ -174,7 +178,7 @@ cache/runtime_manager/bilibili/cookie.json
 - `ProxyConfig`：全局代理、TikTok、小黑盒、Twitter/X、Pixiv、YouTube 代理开关。
 - `BilibiliEnhancedConfig`：Cookie、最高画质、运行时文件、管理员协助登录与主动更新指令。
 - `PixivConfig`：Pixiv Web Ajax API 使用的可选 Cookie。
-- `YouTubeConfig`：画质上限、是否允许 dash 分离流、Innertube 客户端顺序、单次解析总时间预算、可选 Cookie。
+- `YouTubeConfig`：画质上限、是否允许 dash 分离流、视频流取用来源、Innertube 客户端顺序、单次解析总时间预算、可选 Cookie 与其维护参数、yt-dlp 与 PO Token provider 参数。
 - `MediaRelayConfig`：文件 Token 中转开关、回调地址、TTL。
 - `TranslationConfig`：翻译开关、翻译范围、目标语言、AstrBot 内置或自定义大模型配置。输入/输出上限固定为 4000，超时固定为 60 秒，随机性固定为 0。
 - `AdminConfig`：清理关键词和 debug 模式。
@@ -201,6 +205,14 @@ cache/runtime_manager/bilibili/cookie.json
 
 `BaseVideoParser` 定义 `can_parse()`、`extract_links()`、`parse()` 接口，并提供 `_add_range_prefix_to_video_urls()`，可给普通视频候选 URL 或 DASH 子流增加 `range:` 前缀。
 
+`YouTubeCookieRuntime`（`runtime_manager/youtube/cookie.py`）管理 YouTube 登录态：
+
+- 解析配置里的 Netscape / `k=v` 两种 Cookie 格式，生成 SAPISIDHASH 鉴权头，并把服务端下发的轮换凭据按白名单吸收后原子落盘。
+- 维护健康态：向 `accounts.google.com/RotateCookies` 续期拿到新凭据即判活，会话被吊销或体检判定未登录即判死。判死后 `active_header()` 返回空，Innertube 不再挂鉴权客户端，yt-dlp 也拿不到 cookie jar，取流整体退回匿名链。
+- `status_line()` 输出可读状态摘要，不含任何 Cookie 取值。
+
+`runtime_manager/youtube/ytdlp.py` 封装 yt-dlp：探测可执行文件与 PO Token provider、按体积预算挑流、把 `info_dict` 摘要成插件用的元数据字段。它既可作为官方接口的兜底，也可由「视频流取用来源」配置成主取流器。
+
 ### 2.4 B站运行时与管理员交互
 
 `BilibiliAuthRuntime` 管理 Cookie 来源和扫码登录：
@@ -209,6 +221,7 @@ cache/runtime_manager/bilibili/cookie.json
 - 通过 B站 nav 接口校验登录态，并对有效/无效结果做短 TTL 缓存。
 - 运行时 Cookie 失效时会清空本地凭据，再尝试配置 Cookie。
 - 可生成登录链接，在本地生成二维码 PNG，轮询扫码结果，并原子保存新凭据；登录令牌不会发送到第三方二维码服务。
+
 `BilibiliAdminCookieAssistManager` 是插件运行时的非阻塞协助流程：
 
 - 只有管理员私聊过机器人后，才有可主动发送的私聊会话标识。

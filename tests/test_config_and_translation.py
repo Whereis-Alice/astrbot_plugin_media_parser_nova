@@ -68,6 +68,29 @@ class ConfigAndTranslationTests(unittest.TestCase):
         for key in (CARD_SKIN_X, CARD_SKIN_YOUTUBE, CARD_SKIN_AUTO):
             self.assertIn(key, CARD_SKINS)
 
+    def test_youtube_stream_source_is_parsed(self):
+        config = ConfigManager({"youtube": {"stream_source": "仅 yt-dlp"}})
+        self.assertEqual(config.youtube.stream_source, "ytdlp_only")
+        self.assertEqual(ConfigManager({}).youtube.stream_source, "auto")
+
+    def test_stream_source_accepts_chinese_and_english_and_falls_back(self):
+        cases = {
+            "自动": "auto",
+            "auto": "auto",
+            "优先官方接口": "innertube",
+            " INNERTUBE ": "innertube",
+            "仅 yt-dlp": "ytdlp_only",
+            "仅yt-dlp": "ytdlp_only",
+            "ytdlp-only": "ytdlp_only",
+            "": "auto",
+            None: "auto",
+            "随便": "auto",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    ConfigManager._parse_stream_source(raw), expected
+                )
     def test_youtube_pot_options_are_parsed(self):
         config = ConfigManager(
             {

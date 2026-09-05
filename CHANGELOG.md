@@ -2,6 +2,45 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.15.0 (2026-09-06)
+
+手工导出的 YouTube Cookie 常常撑不过几个小时，日志反复写「服务端判定未登录」。更麻烦的是这份死 Cookie 还会被原样塞给 yt-dlp——yt-dlp 一旦认定处于登录态就会摘掉所有不支持 Cookie 的客户端，本来靠匿名 + PO Token 能出流的视频也跟着一起失败。这一版把 Cookie 交给 Google 自己的续期机制养着，并把 yt-dlp 从「最后兜底」提升为一等取流器。
+
+### 新增
+
+- **Cookie 自动续期**：后台每 20 分钟向 `accounts.google.com/RotateCookies` 发一次空 POST（浏览器长期不掉登录用的就是这套机制），吸收服务端下发的新 `__Secure-1PSIDTS` / `__Secure-3PSIDTS` 并落盘，导出一次的 Cookie 可以一直续下去
+  - 续期请求只带账号域凭据（15 个白名单 Cookie 名），不把 YouTube 的埋点 Cookie 一起送出去
+  - 续期便宜（一个空 POST），登录态体检要抓一次首页 HTML，按「Cookie 体检间隔」的周期单独跑；插件启动后的第一轮就带体检，顺便把停机期间积压的轮换补上
+  - HTTP 401/403 视为账号会话已被吊销，直接判死；网络失败等情况不下结论
+- **Cookie 健康态**：运行时记录存活标记、判死原因、判死时间与连败次数，`status_line` 会把这些写进日志（不含任何 Cookie 取值）。判死后自动退回匿名链，续期拿到新凭据或体检确认在线时立刻复活
+- **`youtube.stream_source`（视频流取用来源，默认「自动」）**：三档可选——「自动」按情况择优、「优先官方接口」保持 Innertube 先行、「仅 yt-dlp」跳过官方接口
+  - 「自动」下官方接口连续 2 次撞上机器人门禁会进入 30 分钟冷却，冷却期内直接交给 yt-dlp，到期自动恢复
+- **`tv_downgraded` Innertube 客户端**：上游 yt-dlp 在已登录场景下的首选客户端，不要求 PO Token、对 Cookie 鉴权最宽容；Cookie 可用时的客户端顺序为 `tv_downgraded > tv > web`
+
+### 改进
+
+- **死 Cookie 不再拖垮 yt-dlp**：判死后既不写进 yt-dlp 的 cookie jar，也不再往 Innertube 挂鉴权客户端，匿名 + PO Token 这条路得以保留（这是「明明装了 PO Token provider 却全线 `LOGIN_REQUIRED`」的真正原因）
+- **yt-dlp 可以提前出手**：不再只在官方接口失败后才兜底，按取流策略提前探测；官方接口只拿到半份元数据时，用 yt-dlp 的结果补齐标题、作者、时长、播放量、封面等字段
+- **鉴权客户端按需挂载**：只有 Cookie 真正可用时才把需要登录态的客户端排进降级链，避免制造无意义的 `LOGIN_REQUIRED` 记录
+- **日志降噪**：Cookie 从「有效」翻转成「失效」的那一次才打 WARNING，之后按匿名工作属常态，只在解析摘要的 `登录态=` 字段体现；纯续期轮次没有新结论时降到 DEBUG
+- **`cookie_keepalive_hours` 语义收敛为「Cookie 体检间隔」**：续期由固定的 20 分钟周期负责，这个配置项只管体检频率，填 0 关闭整个后台维护。日志与提醒文案里的「保鲜」一律改称「体检」，摘要行前缀为 `Cookie 维护`
+
+### 修复
+
+- **`tv` 客户端参数修正**：TVHTML5 系客户端必须报 Cobalt（YouTube 官方 TV 端内核）的 UA，此前报的是 PlayStation 浏览器 UA、客户端版本号也过期，导致这条链几乎必然返回 `UNPLAYABLE`
+
+### 文档
+
+- `docs/youtube.md` 整篇重写：按「谁来出流 / 为什么默认只有两个客户端 / 机器人门禁 / yt-dlp 这条腿 / PO Token provider / 让 Cookie 长期不用再管 / 代理 / 取不到视频流时」重排；Cookie 保活写成三层——冻结会话导出一次、插件自动续期、住宅代理
+- `docs/troubleshooting.md`：修掉两个失效锚点，补「判定失效按匿名请求」「策略是自动却走 ytdlp_only」「Cookie 维护例行日志」三条现象
+- `docs/configuration.md`：yt-dlp 章节写清它不止是兜底，可以配置成主取流器
+- `docs/ARCHITECTURE.md`：补上 `runtime_manager/youtube/` 下的 Cookie 运行时与 yt-dlp 桥接模块、后台维护任务与新配置字段
+- README 的 YouTube 一条改为「双腿取流」表述，文档导航同步
+
+### 测试
+
+- 新增 `YouTubeCookieRuntimeTest`（21 例）、`StreamSourcePlanTest`（11 例）、`YtDlpInfoSummaryTest`（4 例），以及 `resolve_full` 与「鉴权客户端按需摘除」相关 6 例
+
 ## v1.14.0 (2026-09-06)
 
 超过可发送上限的视频此前只能改发封面：129 MB 的 1080P 视频下载了 90 秒，最后群里只有一张卡片。现在放不进上限的视频会先用 ffmpeg 压到上限以内再发，压不下来才降级。
@@ -28,6 +67,7 @@
 - `docs/configuration.md`：「视频体积与发送上限」补齐两个新配置项与完整处理顺序，`ffmpeg` 章节增列压缩用途
 - `docs/troubleshooting.md`：补「只发信息与封面」的新成因与「画质下降」现象
 - `docs/ARCHITECTURE.md`：目录树补 `downloader/transcode.py`，下载器章节写清探测 → 规划 → 两轮压缩的链路
+
 ## v1.13.1 (2026-09-06)
 
 纯文档整理，无代码改动。
@@ -103,6 +143,7 @@
 
 - README 补上「为什么 yt-dlp 的 cookies.txt 必须每次重写」，并新增一节 **PO token provider**（`bgutil-ytdlp-pot-provider`）：这是目前对付「Sign in to confirm you’re not a bot」的社区标准解，不依赖 Cookie、不会过期，装好后插件侧零配置即可生效。插件自己依旧不实现 BotGuard，只是把这条路指出来
 - 保鲜与失效提醒两处说明按新行为更新
+
 ## v1.11.0 (2026-08-31)
 
 这一版全部围绕卡片视觉：修掉一条「选了『跟随平台』其实一直只出极光皮肤」的硬伤，把五套通用皮肤的标题眉标整个重做，并把平台家具自带的品牌色从皮肤配色里剥出来。
@@ -242,6 +283,7 @@ AstrBot WebUI 里 `type=string` 的配置项是单行输入框，把多行 cooki
 
 - 新增 23 个用例：Cookie 轮换吸收（多值 / 单值响应头、白名单过滤、删除指令忽略、修订号递增）、状态文件读写（原子写、权限、指纹隔离、损坏文件容错）、保鲜请求的登录 / 未登录 / 网络异常三条路径、未轮换时逐字节回放原配置串，以及两个新配置项的默认值 / 关闭 / 越界钳制 / 非法值回退
 - 全量 342 passed + 78 subtests
+
 ## v1.8.3 (2026-08-29)
 
 ### 被机器人门禁挡下的 YouTube 视频，卡片不再只剩一句话

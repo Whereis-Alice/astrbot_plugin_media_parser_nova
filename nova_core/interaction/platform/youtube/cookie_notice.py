@@ -16,7 +16,7 @@ _REASON_TEXTS = {
     "player_login_required": "视频仍被 YouTube 机器人验证挡下（playabilityStatus=LOGIN_REQUIRED）",
     "innertube_logged_out": "Innertube 返回 loggedOut=true，服务端已把当前 Cookie 当成未登录",
     "keepalive_logged_out": (
-        "定期 Cookie 保鲜请求被 YouTube 判定为未登录，"
+        "定期 Cookie 体检请求被 YouTube 判定为未登录，"
         "说明这份 Cookie 已经无法靠自动跟进轮换救回来"
     ),
 }

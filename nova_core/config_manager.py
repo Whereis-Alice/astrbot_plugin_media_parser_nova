@@ -545,6 +545,7 @@ class YouTubeConfig:
     ytdlp_runtime_dir: str = ""
     ytdlp_pot_provider: str = ""
     ytdlp_fetch_pot: str = "auto"
+    stream_source: str = "auto"
 
 
 @dataclass
@@ -1288,6 +1289,9 @@ class ConfigManager:
             ytdlp_fetch_pot=self._parse_fetch_pot(
                 youtube_raw.get("ytdlp_fetch_pot", "")
             ),
+            stream_source=self._parse_stream_source(
+                youtube_raw.get("stream_source", "")
+            ),
         )
 
         # --- proxy ---
@@ -1499,6 +1503,7 @@ class ConfigManager:
                 ytdlp_cookie_dir=self.youtube.ytdlp_runtime_dir,
                 ytdlp_pot_provider=self.youtube.ytdlp_pot_provider,
                 ytdlp_fetch_pot=self.youtube.ytdlp_fetch_pot,
+                stream_source=self.youtube.stream_source,
                 send_video_max_mb=self.download.send_video_max_mb,
             )
             parsers.append(self.youtube_parser)
@@ -1718,6 +1723,26 @@ class ConfigManager:
             return max(0, int(value))
         except (OverflowError, TypeError, ValueError):
             return max(0, int(default))
+
+    @staticmethod
+    def _parse_stream_source(value) -> str:
+        """把取流来源配置归一成解析器认得的英文枚举值。
+
+        WebUI 里给的是中文选项，非法值一律回落 auto——这一项只影响取流路径
+        的选择顺序，不该因为拼错就让整份配置解析失败。
+        """
+        text = str(value or "").strip().lower()
+        mapping = {
+            "自动": "auto",
+            "auto": "auto",
+            "优先官方接口": "innertube",
+            "innertube": "innertube",
+            "仅 yt-dlp": "ytdlp_only",
+            "仅yt-dlp": "ytdlp_only",
+            "ytdlp_only": "ytdlp_only",
+            "ytdlp-only": "ytdlp_only",
+        }
+        return mapping.get(text, "auto")
 
     @staticmethod
     def _parse_fetch_pot(value) -> str:

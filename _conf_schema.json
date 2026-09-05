@@ -942,7 +942,7 @@
     "youtube": {
         "description": "YouTube 设置",
         "type": "object",
-        "hint": "解析主路走 YouTube 官方 Innertube 接口，轻量且不依赖外部程序；官方接口拿不到可直连流时（现在相当常见，YouTube 大量改用 SABR 分发）再交给 yt-dlp 兜底，见下面的「疑难视频用 yt-dlp 兜底取流」。dash 分离流需要服务器安装 ffmpeg（与 B 站共用同一依赖）；两条路都取不到流时会退化成封面卡片而不是报错。机房 IP 上较容易撞到 YouTube 的机器人门禁，建议配合下面的 Cookie 或住宅代理使用。",
+        "hint": "YouTube 有两条取流腿：官方 Innertube 接口轻量、不依赖外部程序；yt-dlp 会执行播放器 JS，吃得下只发 SABR 分段流的视频。用哪条由「视频流取用来源」决定，默认「自动」会自行择优，官方接口连续撞上机器人门禁时会暂时改走 yt-dlp。dash 分离流需要服务器安装 ffmpeg（与 B 站共用同一依赖）；两条腿都取不到流时退化成封面卡片而不是报错。机房 IP 容易撞上机器人门禁，建议配合下面的 Cookie（导出一次后插件会自动续期保活）或住宅代理使用。",
         "items": {
             "max_height": {
                 "description": "画质上限",
@@ -965,10 +965,21 @@
                 "hint": "开启后优先选择音视频分离流并用 ffmpeg 合并，可拿到 1080P 及以上画质。服务器没装 ffmpeg 请关闭，届时只使用 360P/720P 的单文件流。",
                 "default": true
             },
+            "stream_source": {
+                "description": "视频流取用来源",
+                "type": "string",
+                "options": [
+                    "自动",
+                    "优先官方接口",
+                    "仅 yt-dlp"
+                ],
+                "hint": "决定由谁负责取可下载的视频流。自动：先走官方 Innertube 接口，连续两次被人机验证挡下后进入 30 分钟冷却期，冷却期内直接交给 yt-dlp 出流，省掉每次必失败的那一趟请求，一次成功即解除冷却，推荐保持。优先官方接口：永远先试 Innertube，只在它取不到流时才兜底，适合出口 IP 干净、不想拉起 JS 运行时子进程的环境。仅 yt-dlp：跳过 Innertube 出流，官方接口只用来补元数据、头像与热评，适合机房 IP 长期被门禁盯上的服务器（需要 yt-dlp 兜底可用）。",
+                "default": "自动"
+            },
             "player_clients": {
                 "description": "Innertube 客户端顺序",
                 "type": "string",
-                "hint": "逗号分隔，按顺序尝试直到拿到可下载的流。可选：ios、android_vr、tv、mweb、web。实测只有 ios 与 android_vr 在匿名状态下能真正返回可直连的媒体流，所以默认只跑这两个；tv/mweb/web 匿名时一律拿不到流，仅在填写了下面的 Cookie 后才有意义（tv、web 会被自动追加，无需手填）。除非某个客户端被针对性封禁，否则保持默认。",
+                "hint": "逗号分隔，按顺序尝试直到拿到可下载的流。可选：ios、android_vr、tv、tv_downgraded、mweb、web。实测只有 ios 与 android_vr 在匿名状态下能真正返回可直连的媒体流，所以默认只跑这两个；tv/tv_downgraded/mweb/web 匿名时一律拿不到流，仅在填写了下面的 Cookie 后才有意义（Cookie 有效时 tv_downgraded、tv、web 会被自动追加，无需手填；Cookie 被判失效后又会自动摘掉，让匿名客户端继续可用）。除非某个客户端被针对性封禁，否则保持默认。",
                 "default": "ios,android_vr"
             },
             "total_budget_seconds": {
@@ -1002,9 +1013,9 @@
                 "default": true
             },
             "cookie_keepalive_hours": {
-                "description": "Cookie 保鲜间隔（小时，0=关闭）",
+                "description": "Cookie 体检间隔（小时，0=关闭维护）",
                 "type": "int",
-                "hint": "长时间没有 YouTube 解析请求时，插件会按这个间隔主动向 youtube.com 发一次带登录态的轻量请求，触发并吸收服务端的 Cookie 轮换，避免会话因长期沉默被判过期；同时会顺带检查登录态，失效时按上面的设置提醒管理员。默认 6 小时，最大 168；填 0 关闭主动保鲜（仍会在每次解析时跟进轮换）。",
+                "hint": "登录态体检的间隔。后台维护任务分两档跑：每 20 分钟向 Google 的凭据轮换端点发一个空请求，把服务端下发的新凭据吸收下来（这是浏览器永不掉登录的原理，也是长期免维护的关键）；每到这里设定的间隔再额外做一次登录态体检，失效时按上面的设置提醒管理员。默认 6 小时，最大 168；填 0 会连轮换一起关掉，Cookie 将只在每次解析时被动跟进轮换，寿命明显变短。",
                 "default": 6
             },
             "ytdlp_fallback": {
