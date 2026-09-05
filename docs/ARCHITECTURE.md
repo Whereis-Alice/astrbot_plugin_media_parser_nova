@@ -1,6 +1,6 @@
 # 架构文档
 
-本文件按当前项目真实实现描述插件边界、模块职责和主流程。平台解析细节见 `docs/PARSER_METHOD_MEMO.md`。
+本文件按当前项目真实实现描述插件边界、模块职责和主流程。平台解析细节见 [解析思路备忘](PARSER_METHOD_MEMO.md)，配置与使用说明见 [配置说明](configuration.md)。
 
 ## 一、整体框架
 
@@ -21,7 +21,7 @@
 - 小黑盒：支持 视频 / 图片 / 文本；覆盖游戏详情页和 BBS/link 帖子。
 - Twitter/X：支持 视频 / 图片 / 文本；优先 FxTwitter/FxEmbed，服务不可用时回退 Guest GraphQL。
 - Pixiv：支持 图片 / 文本；覆盖插画和漫画作品页、多页原图候选、Cookie 访问限制与解析/图片代理。
-- YouTube：支持 视频 / 图片 / 文本 / 热评；走官方 Innertube（player / next）三层降级，多客户端取流、共享时间预算、取不到流时退化为封面卡片。
+- YouTube：支持 视频 / 图片 / 文本 / 热评；走官方 Innertube（player / next）多层降级，多客户端取流、共享时间预算、可选 yt-dlp 兜底取流，取不到流时退化为封面卡片。
 
 ### 1.2 核心模块结构
 
@@ -31,7 +31,12 @@ astrbot_plugin_media_parser_nova/
 ├── _conf_schema.json                # AstrBot 配置 schema
 ├── docs/
 │   ├── ARCHITECTURE.md              # 当前架构文档
-│   └── PARSER_METHOD_MEMO.md        # 平台解析方法说明
+│   ├── PARSER_METHOD_MEMO.md        # 平台解析方法说明
+│   ├── configuration.md             # 配置说明
+│   ├── cards.md                     # 卡片渲染（皮肤 / 布局 / 家具）
+│   ├── youtube.md                   # YouTube 解析链路与 Cookie
+│   ├── platforms.md                 # 平台专项说明
+│   └── troubleshooting.md           # 排查与反馈
 └── nova_core/
     ├── config_manager.py            # 配置解析、默认值、解析器工厂
     ├── constants.py                 # 常量与默认路径/超时/并发值
@@ -45,7 +50,7 @@ astrbot_plugin_media_parser_nova/
     │   │   └── bilibili/auth.py     # BilibiliAuthRuntime，Cookie 校验与扫码登录
     │   └── platform/                # 各平台解析器
     │       ├── pixiv.py             # Pixiv 插画/漫画解析器
-    │       ├── youtube.py           # YouTube Innertube 解析器（三层降级）
+    │       ├── youtube.py           # YouTube Innertube 解析器（多层降级）
     │       ├── xianyu.py            # 闲鱼商品页解析器
     │       └── toutiao.py           # 今日头条文章/微头条/视频解析器
     ├── downloader/

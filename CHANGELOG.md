@@ -2,6 +2,43 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.13.1 (2026-09-06)
+
+纯文档整理，无代码改动。
+
+### 文档
+
+- **README 精简重构**：从 665 行压到 106 行，只保留简介、功能概览、支持平台、安装、快速开始、卡片渲染摘要、文档导航、安全与隐私、致谢与许可
+- **新增 5 份专题文档**，原 README 的长章节按主题拆分外迁：
+  - `docs/configuration.md`：输出模式、触发方式、文本字段、消息聚合、视频体积与发送上限、翻译、缓存、代理、ffmpeg、yt-dlp、ZIP 归档、限制与清理
+  - `docs/cards.md`：卡片模式、皮肤 × 配色 × 布局三轴、八套皮肤截图、皮肤与家具跟随平台、排版行为、署名与原链接、热评合并
+  - `docs/youtube.md`：四层解析链路、配置项、机器人门禁、yt-dlp 兜底、PO Token provider、Cookie 三层保鲜、代理
+  - `docs/platforms.md`：B 站 Cookie、Twitter/X 的 Nitter、小黑盒热评、其他平台索引
+  - `docs/troubleshooting.md`：常见现象对照表、日志分级、反馈须知
+- **去掉文档里的版本叙事**：「现在 / 此前 / 不再 / 旧配置」这类相对上一版的描述改写成稳态说明，去掉正文里的实测日期与依赖版本号；变更记录统一只留在本文件
+- **补上此前漏记的配置项**：卡片的「自定义字体路径」
+- **修正 `docs/ARCHITECTURE.md`**：docs 目录树补齐新文档，YouTube 的「三层降级」按实际实现改为「多层降级（含 yt-dlp 兜底）」
+- **补记 v1.13.0 的更新日志**：上一版只升了 `metadata.yaml` 的版本号，本文件漏了对应条目
+
+## v1.13.0 (2026-09-06)
+
+129 MB 的 YouTube 视频下载成功后被 QQ Highway 通道在 52 MiB 处拒收（`retcode=1200` / `code 102902`），但插件只写了一条 WARNING，群里静默丢弃——用户白等 90 秒只看到一张卡片。
+
+### 新增
+
+- **`download.send_video_max_mb`（可发送视频体积上限，默认 100 MB，填 0 不限制）**：下载阶段的生效上限取 `max_video_size_mb` 与它的更小者，预估超限时直接跳过视频，改发信息 + 封面并写明实际体积与上限
+- **YouTube 取流带体积预算**：InnerTube 与 yt-dlp 两条链路都先估算候选格式体积（`contentLength` / `filesize`，缺失时用 `tbr × 时长` 反推），在预算内取最高画质，全部超限时退回最小一档；DASH 音轨体积先占位再算视频预算
+
+### 修复
+
+- 部分内容发送失败时，除后台日志外还会向会话补一条原因提示并附原始链接
+- 「仅卡片」模式也会带上媒体降级说明
+- 大媒体提示文案不再硬编码 50 MB，改用生效上限
+
+### 测试
+
+- 新增 `tests/test_download_limits.py`，补 `YtDlpBudgetSelectionTest`、`CardOnlyNoticeTests`、`DownloadConfigSchemaTests`
+
 ## v1.12.0 (2026-08-31)
 
 这一版把 **PO Token**（YouTube 的 BotGuard 证明令牌）这条路接通：插件仍然不实现 BotGuard，但现在会**探测**当前 Python 环境里装没装社区 provider 插件，并把地址与取用策略**透传**给 yt-dlp。同时把上一版 README 里那段过于乐观的说法按真机实测改写。
