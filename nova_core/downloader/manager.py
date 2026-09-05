@@ -38,20 +38,17 @@ class DownloadManager:
         self,
         max_video_size_mb: float = 0.0,
         large_video_threshold_mb: float = Config.DEFAULT_LARGE_VIDEO_THRESHOLD_MB,
+        send_video_max_mb: float = 0.0,
         cache_dir: str = Config.DEFAULT_CACHE_DIR,
         cache_dir_available: Optional[bool] = None,
         max_concurrent_downloads: int = None,
         video_cover_only: bool = False,
     ):
-        try:
-            normalized_max_size = float(max_video_size_mb)
-            self.max_video_size_mb = (
-                normalized_max_size
-                if math.isfinite(normalized_max_size) and normalized_max_size > 0
-                else 0.0
-            )
-        except (TypeError, ValueError):
-            self.max_video_size_mb = 0.0
+        self.max_video_size_mb = self._normalize_size_cap(max_video_size_mb)
+        self.large_video_threshold_mb = self._normalize_size_cap(
+            large_video_threshold_mb
+        )
+        self.send_video_max_mb = self._normalize_size_cap(send_video_max_mb)
         self.cache_dir = cache_dir
         self.cache_dir_available = (
             bool(cache_dir_available)
@@ -74,6 +71,61 @@ class DownloadManager:
         self._shutting_down = False
 
     # ── 决策辅助 ────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_size_cap(value: Any) -> float:
+        """把体积上限归一化为正浮点，非法或非正一律视为不限制（0.0）。"""
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(normalized) or normalized <= 0:
+            return 0.0
+        return normalized
+
+    def _video_size_limit(self, size_mb: float) -> Tuple[str, float]:
+        """返回 (limit_kind, cap_mb)。未超限时 kind 为空串，否则为 max/send。"""
+        if self.max_video_size_mb > 0 and size_mb > self.max_video_size_mb:
+            return "max", self.max_video_size_mb
+        if self.send_video_max_mb > 0 and size_mb > self.send_video_max_mb:
+            return "send", self.send_video_max_mb
+        return "", 0.0
+
+    @staticmethod
+    def _video_size_limit_reason(
+        limit_kind: str,
+        size_mb: float,
+        cap_mb: float,
+        downloaded: bool = False,
+    ) -> str:
+        """把体积超限判定渲染成给用户看的跳过原因。"""
+        if limit_kind == "send":
+            return (
+                f"视频体积超过可发送上限（{size_mb:.1f}MB > {cap_mb:.1f}MB），"
+                "聊天平台会拒收，已改为只发信息与封面"
+            )
+        prefix = "下载后视频大小超过限制" if downloaded else "视频大小超过限制"
+        return f"{prefix}（{size_mb:.1f}MB > {cap_mb:.1f}MB）"
+
+    @property
+    def effective_video_cap_mb(self) -> float:
+        """下载阶段真正生效的体积上限：管理员上限与可发送上限取更小者。"""
+        caps = [
+            cap
+            for cap in (self.max_video_size_mb, self.send_video_max_mb)
+            if cap > 0
+        ]
+        return min(caps) if caps else 0.0
+
+    @property
+    def _send_cap_is_effective(self) -> bool:
+        """生效上限是否来自可发送上限（用于改写下载器抛出的硬限制文案）。"""
+        if self.send_video_max_mb <= 0:
+            return False
+        return (
+            self.max_video_size_mb <= 0
+            or self.send_video_max_mb <= self.max_video_size_mb
+        )
 
     @staticmethod
     def _normalize_url_groups(value: Any) -> List[List[str]]:
@@ -177,6 +229,58 @@ class DownloadManager:
             list(cover_groups[idx]) if idx < len(cover_groups) else []
             for idx in range(video_count)
         ]
+
+    def _plan_size_limited_videos(
+        self,
+        metadata: Dict[str, Any],
+        video_urls: List[List[str]],
+        image_urls: List[List[str]],
+    ) -> Dict[int, Tuple[str, float, float]]:
+        """按解析器给出的体积预估提前拦下必然超限的视频。
+
+        解析器可通过 metadata["video_size_estimates"]（单位 MB，与 video_urls
+        对齐）声明预估体积。命中上限的视频不再下载，改为把它的封面追加到图片
+        列表末尾（追加不会打乱 video_cover_fallback_indexes 的既有下标）。
+
+        Returns:
+            {video_index: (limit_kind, size_mb, cap_mb)}
+        """
+        estimates = metadata.get("video_size_estimates")
+        if not video_urls or not isinstance(estimates, list):
+            return {}
+
+        limited: Dict[int, Tuple[str, float, float]] = {}
+        for idx in range(len(video_urls)):
+            if idx >= len(estimates):
+                break
+            raw = estimates[idx]
+            try:
+                size_mb = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(size_mb) or size_mb <= 0:
+                continue
+            limit_kind, cap_mb = self._video_size_limit(size_mb)
+            if limit_kind:
+                limited[idx] = (limit_kind, size_mb, cap_mb)
+
+        if not limited:
+            return {}
+
+        cover_groups = self._normalize_video_cover_url_groups(
+            metadata, len(video_urls)
+        )
+        existing = {url for group in image_urls for url in group}
+        for idx in sorted(limited):
+            covers = [
+                url
+                for url in (cover_groups[idx] if idx < len(cover_groups) else [])
+                if url not in existing
+            ]
+            if covers:
+                image_urls.append(covers)
+                existing.update(covers)
+        return limited
 
     def _apply_video_cover_only_mode(
         self,
@@ -292,14 +396,14 @@ class DownloadManager:
         metadata: Dict[str, Any],
         proxy_addr: str = None,
         require_accessible_for_direct: bool = False,
-    ) -> Tuple[Optional[float], Optional[int], Optional[str], bool]:
+    ) -> Tuple[Optional[float], Optional[int], Optional[str], bool, str]:
         """预检普通视频大小与可访问性。
 
         Returns:
-            (size_mb, status_code, skip_reason, access_denied)
+            (size_mb, status_code, skip_reason, access_denied, limit_kind)
         """
         if not url_list:
-            return None, None, "未找到视频URL", False
+            return None, None, "未找到视频URL", False, ""
 
         headers = metadata.get("video_headers", {})
         proxy = self._proxy_for(metadata, "video", proxy_addr)
@@ -308,6 +412,7 @@ class DownloadManager:
         denied_seen = False
         size_limit_reason = None
         size_limit_value = None
+        size_limit_kind = ""
         invalid_reason = "直链不可访问或不是有效视频"
 
         for candidate_index, candidate in enumerate(list(url_list)):
@@ -323,17 +428,15 @@ class DownloadManager:
             if status_code == 403:
                 denied_seen = True
                 continue
-            if (
-                size_mb is not None
-                and self.max_video_size_mb > 0
-                and size_mb > self.max_video_size_mb
-            ):
-                size_limit_value = size_mb
-                size_limit_reason = (
-                    f"视频大小超过限制（{size_mb:.1f}MB > "
-                    f"{self.max_video_size_mb:.1f}MB）"
-                )
-                continue
+            if size_mb is not None:
+                limit_kind, cap_mb = self._video_size_limit(size_mb)
+                if limit_kind:
+                    size_limit_value = size_mb
+                    size_limit_kind = limit_kind
+                    size_limit_reason = self._video_size_limit_reason(
+                        limit_kind, size_mb, cap_mb
+                    )
+                    continue
 
             if require_accessible_for_direct and size_mb is None:
                 is_valid, validate_status = await validate_media_url(
@@ -350,13 +453,19 @@ class DownloadManager:
 
             if candidate_index != 0:
                 url_list.insert(0, url_list.pop(candidate_index))
-            return size_mb, status_code, None, False
+            return size_mb, status_code, None, False, ""
 
         if denied_seen:
-            return None, last_status_code, "媒体访问被拒绝(403 Forbidden)", True
+            return None, last_status_code, "媒体访问被拒绝(403 Forbidden)", True, ""
         if size_limit_reason:
-            return (size_limit_value, last_status_code, size_limit_reason, False)
-        return None, last_status_code, invalid_reason, False
+            return (
+                size_limit_value,
+                last_status_code,
+                size_limit_reason,
+                False,
+                size_limit_kind,
+            )
+        return None, last_status_code, invalid_reason, False, ""
 
     # ── 下载执行 ────────────────────────────────────────
 
@@ -401,8 +510,8 @@ class DownloadManager:
                             headers=headers,
                             proxy=proxy,
                             max_bytes=(
-                                int(self.max_video_size_mb * 1024 * 1024)
-                                if self.max_video_size_mb > 0
+                                int(self.effective_video_cap_mb * 1024 * 1024)
+                                if self.effective_video_cap_mb > 0
                                 else None
                             ),
                         )
@@ -445,8 +554,8 @@ class DownloadManager:
                             headers=headers,
                             proxy=proxy,
                             max_bytes=(
-                                int(self.max_video_size_mb * 1024 * 1024)
-                                if kind != "image" and self.max_video_size_mb > 0
+                                int(self.effective_video_cap_mb * 1024 * 1024)
+                                if kind != "image" and self.effective_video_cap_mb > 0
                                 else None
                             ),
                         )
@@ -547,6 +656,9 @@ class DownloadManager:
             image_urls,
             enabled=video_cover_only,
         )
+        size_limited_videos = self._plan_size_limited_videos(
+            metadata, video_urls, image_urls
+        )
         metadata["video_urls"] = video_urls
         metadata["image_urls"] = image_urls
         metadata.setdefault("video_headers", {})
@@ -565,6 +677,8 @@ class DownloadManager:
         image_warnings: List[Optional[str]] = [None] * image_count
         has_access_denied = False
         size_exceeded = False
+        send_limit_exceeded = False
+        send_limit_size_mb: Optional[float] = None
         cover_fallbacks = {
             int(image_index): item
             for image_index, item in zip(
@@ -597,6 +711,20 @@ class DownloadManager:
                 video_plans.append(None)
                 continue
 
+            if idx in size_limited_videos:
+                limit_kind, size_mb, cap_mb = size_limited_videos[idx]
+                video_sizes[idx] = size_mb
+                video_skip_reasons[idx] = self._video_size_limit_reason(
+                    limit_kind, size_mb, cap_mb
+                )
+                if limit_kind == "send":
+                    send_limit_exceeded = True
+                    send_limit_size_mb = size_mb
+                else:
+                    size_exceeded = True
+                video_plans.append(None)
+                continue
+
             if requires_local and not self.cache_dir_available:
                 video_skip_reasons[idx] = (
                     "媒体文件缓存目录不可用，无法处理必须下载到缓存的视频"
@@ -623,7 +751,7 @@ class DownloadManager:
             if plan and plan["needs_precheck"]
         ]
         precheck_results: Dict[
-            int, Tuple[Optional[float], Optional[int], Optional[str], bool]
+            int, Tuple[Optional[float], Optional[int], Optional[str], bool, str]
         ] = {}
         if precheck_indexes:
             gathered = await gather_cancel_on_error(
@@ -648,12 +776,21 @@ class DownloadManager:
                 continue
 
             if idx in precheck_results:
-                size_mb, status_code, reason, denied = precheck_results[idx]
+                (
+                    size_mb,
+                    status_code,
+                    reason,
+                    denied,
+                    limit_kind,
+                ) = precheck_results[idx]
                 video_sizes[idx] = size_mb
                 video_status_codes[idx] = status_code
                 has_access_denied = has_access_denied or denied
                 if reason:
-                    if "超过限制" in reason:
+                    if limit_kind == "send":
+                        send_limit_exceeded = True
+                        send_limit_size_mb = size_mb
+                    elif limit_kind == "max":
                         size_exceeded = True
                     video_skip_reasons[idx] = reason
                     continue
@@ -740,7 +877,17 @@ class DownloadManager:
                     if status_code is not None:
                         video_status_codes[idx] = status_code
                     video_modes[idx] = "skip"
-                    video_skip_reasons[idx] = f"缓存下载失败: {reason}"
+                    if "硬限制" in reason and self._send_cap_is_effective:
+                        # 下载器按生效上限止损，而生效上限来自"能发出去的体积"，
+                        # 直接告诉用户是平台收不下，而不是抛一句内部术语。
+                        video_skip_reasons[idx] = (
+                            "视频体积超过可发送上限"
+                            f"（{self.send_video_max_mb:.1f}MB），"
+                            "聊天平台会拒收，已改为只发信息与封面"
+                        )
+                        send_limit_exceeded = True
+                    else:
+                        video_skip_reasons[idx] = f"缓存下载失败: {reason}"
                 else:
                     idx = position - video_count
                     if status_code is not None:
@@ -760,19 +907,23 @@ class DownloadManager:
                     video_status_codes[idx] = status_code
                 if size_mb is not None:
                     video_sizes[idx] = size_mb
-                if (
-                    size_mb is not None
-                    and self.max_video_size_mb > 0
-                    and size_mb > self.max_video_size_mb
-                ):
+                limit_kind, cap_mb = (
+                    self._video_size_limit(size_mb)
+                    if size_mb is not None
+                    else ("", 0.0)
+                )
+                if limit_kind:
                     cleanup_file(file_path)
                     file_paths[position] = None
                     video_modes[idx] = "skip"
-                    video_skip_reasons[idx] = (
-                        f"下载后视频大小超过限制（{size_mb:.1f}MB > "
-                        f"{self.max_video_size_mb:.1f}MB）"
+                    video_skip_reasons[idx] = self._video_size_limit_reason(
+                        limit_kind, size_mb, cap_mb, downloaded=True
                     )
-                    size_exceeded = True
+                    if limit_kind == "send":
+                        send_limit_exceeded = True
+                        send_limit_size_mb = size_mb
+                    else:
+                        size_exceeded = True
                     continue
             else:
                 idx = position - video_count
@@ -821,6 +972,9 @@ class DownloadManager:
             for idx, mode in enumerate(image_modes)
         )
         metadata["exceeds_max_size"] = bool(size_exceeded and not has_valid_media)
+        metadata["send_limit_exceeded"] = bool(send_limit_exceeded)
+        metadata["send_video_max_mb"] = self.send_video_max_mb
+        metadata["send_limit_video_size_mb"] = send_limit_size_mb
         metadata["has_access_denied"] = bool(
             has_access_denied
             or any(code == 403 for code in video_status_codes)

@@ -452,6 +452,7 @@ class PermissionConfig:
 class DownloadConfig:
     max_video_size_mb: float = DEFAULT_MAX_VIDEO_SIZE_MB
     large_video_threshold_mb: float = Config.DEFAULT_LARGE_VIDEO_THRESHOLD_MB
+    send_video_max_mb: float = Config.DEFAULT_SEND_VIDEO_MAX_MB
     cache_dir: str = ""
     cache_dir_available: bool = False
     max_concurrent_downloads: int = Config.DOWNLOAD_MANAGER_MAX_CONCURRENT
@@ -931,6 +932,13 @@ class ConfigManager:
                 large_video_threshold_mb, Config.MAX_LARGE_VIDEO_THRESHOLD_MB
             )
 
+        send_video_max_mb = self._parse_non_negative_float(
+            download_raw.get(
+                "send_video_max_mb", Config.DEFAULT_SEND_VIDEO_MAX_MB
+            ),
+            Config.DEFAULT_SEND_VIDEO_MAX_MB,
+        )
+
         configured_cache_dir = str(download_raw.get("cache_dir", "") or "").strip()
         if _is_docker_environment():
             cache_dir = configured_cache_dir or Config.DEFAULT_CACHE_DIR
@@ -1054,6 +1062,7 @@ class ConfigManager:
         self.download = DownloadConfig(
             max_video_size_mb=max_video_size_mb,
             large_video_threshold_mb=large_video_threshold_mb,
+            send_video_max_mb=send_video_max_mb,
             cache_dir=cache_dir,
             cache_dir_available=cache_dir_available,
             max_concurrent_downloads=max_concurrent,
@@ -1465,6 +1474,7 @@ class ConfigManager:
                 ytdlp_cookie_dir=self.youtube.ytdlp_runtime_dir,
                 ytdlp_pot_provider=self.youtube.ytdlp_pot_provider,
                 ytdlp_fetch_pot=self.youtube.ytdlp_fetch_pot,
+                send_video_max_mb=self.download.send_video_max_mb,
             )
             parsers.append(self.youtube_parser)
 

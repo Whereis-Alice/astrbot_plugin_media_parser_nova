@@ -432,8 +432,22 @@ def _format_user_agent(fmt: Dict[str, Any]) -> str:
     return ""
 
 
-def _format_size(fmt: Dict[str, Any]) -> int:
-    return _as_int(fmt.get("filesize") or fmt.get("filesize_approx"))
+def _format_size(fmt: Dict[str, Any], duration_seconds: int = 0) -> int:
+    """取该路流的体积（字节）；yt-dlp 没给时用 tbr×时长折算，估不出返回 0。"""
+    declared = _as_int(fmt.get("filesize") or fmt.get("filesize_approx"))
+    if declared > 0:
+        return declared
+    tbr = _as_int(fmt.get("tbr"))
+    duration = _as_int(fmt.get("duration")) or max(0, _as_int(duration_seconds))
+    if tbr <= 0 or duration <= 0:
+        return 0
+    # tbr 单位是 kbit/s。
+    return int(tbr * 1000 * duration / 8)
+
+
+def _fits_budget(size_bytes: int, max_bytes: int) -> bool:
+    """无预算或体积未知时都算放得下。"""
+    return max_bytes <= 0 or size_bytes <= 0 or size_bytes <= max_bytes
 
 
 def _format_label(fmt: Dict[str, Any]) -> str:
@@ -458,9 +472,12 @@ class YtDlpStreamResolver:
         cookie_dir: str = "",
         pot_provider: str = "",
         fetch_pot: str = "auto",
+        max_bytes: int = 0,
     ):
         self.proxy = (proxy or "").strip() or None
         self.max_height = max(0, _as_int(max_height))
+        # 可发送体积预算（字节）：选流时优先挑塞得进去的那一路，0 表示不限。
+        self.max_bytes = max(0, _as_int(max_bytes))
         self.allow_dash = bool(allow_dash)
         self.timeout = max(10.0, float(timeout or 60.0))
         self.js_runtime = (js_runtime or "auto").strip().lower() or "auto"
@@ -688,10 +705,28 @@ class YtDlpStreamResolver:
         height = _as_int(fmt.get("height"))
         return height <= self.max_height if height else True
 
-    def _best_progressive(
-        self, formats: List[Dict[str, Any]]
+    @staticmethod
+    def _resolve(
+        candidates: List[Tuple[Tuple[int, ...], Dict[str, Any], int]],
+        max_bytes: int,
     ) -> Optional[Dict[str, Any]]:
-        best: Optional[Tuple[Tuple[int, int, int], Dict[str, Any]]] = None
+        """预算内挑评分最高的一路；全都超预算时退让为体积最小的那一路。"""
+        if not candidates:
+            return None
+        within = [
+            item for item in candidates if _fits_budget(item[2], max_bytes)
+        ]
+        if within:
+            return max(within, key=lambda item: item[0])[1]
+        return min(candidates, key=lambda item: item[2])[1]
+
+    def _best_progressive(
+        self,
+        formats: List[Dict[str, Any]],
+        max_bytes: int = 0,
+        duration_seconds: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        candidates: List[Tuple[Tuple[int, ...], Dict[str, Any], int]] = []
         for fmt in formats:
             if not (_has_video(fmt) and _has_audio(fmt)):
                 continue
@@ -702,14 +737,18 @@ class YtDlpStreamResolver:
                 _as_int(fmt.get("height")),
                 _as_int(fmt.get("tbr")),
             )
-            if best is None or score > best[0]:
-                best = (score, fmt)
-        return best[1] if best else None
+            candidates.append(
+                (score, fmt, _format_size(fmt, duration_seconds))
+            )
+        return self._resolve(candidates, max_bytes)
 
     def _best_video_only(
-        self, formats: List[Dict[str, Any]]
+        self,
+        formats: List[Dict[str, Any]],
+        max_bytes: int = 0,
+        duration_seconds: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        best: Optional[Tuple[Tuple[int, int, int], Dict[str, Any]]] = None
+        candidates: List[Tuple[Tuple[int, ...], Dict[str, Any], int]] = []
         for fmt in formats:
             if not _has_video(fmt) or _has_audio(fmt):
                 continue
@@ -720,14 +759,18 @@ class YtDlpStreamResolver:
                 _codec_rank(str(fmt.get("vcodec") or ""), _VIDEO_CODEC_RANK),
                 _as_int(fmt.get("tbr")),
             )
-            if best is None or score > best[0]:
-                best = (score, fmt)
-        return best[1] if best else None
+            candidates.append(
+                (score, fmt, _format_size(fmt, duration_seconds))
+            )
+        return self._resolve(candidates, max_bytes)
 
     def _best_audio_only(
-        self, formats: List[Dict[str, Any]]
+        self,
+        formats: List[Dict[str, Any]],
+        max_bytes: int = 0,
+        duration_seconds: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        best: Optional[Tuple[Tuple[int, int], Dict[str, Any]]] = None
+        candidates: List[Tuple[Tuple[int, ...], Dict[str, Any], int]] = []
         for fmt in formats:
             if _has_video(fmt) or not _has_audio(fmt):
                 continue
@@ -735,9 +778,10 @@ class YtDlpStreamResolver:
                 _codec_rank(str(fmt.get("acodec") or ""), _AUDIO_CODEC_RANK),
                 _as_int(fmt.get("tbr")),
             )
-            if best is None or score > best[0]:
-                best = (score, fmt)
-        return best[1] if best else None
+            candidates.append(
+                (score, fmt, _format_size(fmt, duration_seconds))
+            )
+        return self._resolve(candidates, max_bytes)
 
     def select(self, info: Any) -> Optional[YtDlpStream]:
         """从 extract_info 的结果里挑一路最合适的流。
@@ -750,36 +794,44 @@ class YtDlpStreamResolver:
             formats = [fmt for fmt in info["formats"] if _is_direct(fmt)]
         if not formats:
             return None
+        duration = 0
+        if isinstance(info, dict):
+            duration = max(0, _as_int(info.get("duration")))
+        budget = self.max_bytes
         if self.allow_dash:
-            video = self._best_video_only(formats)
-            audio = self._best_audio_only(formats)
+            audio = self._best_audio_only(formats, budget, duration)
+            audio_size = _format_size(audio, duration) if audio else 0
+            # 音轨先占位，余下的预算才留给视频轨。
+            video_budget = max(1, budget - audio_size) if budget > 0 else 0
+            video = self._best_video_only(formats, video_budget, duration)
             if video and audio:
+                video_size = _format_size(video, duration)
                 return YtDlpStream(
                     url=f"dash:{video['url']}||{audio['url']}",
                     kind="dash",
                     height=_as_int(video.get("height")),
                     user_agent=_format_user_agent(video),
-                    filesize=_format_size(video) + _format_size(audio),
+                    filesize=(video_size + audio_size) if video_size else 0,
                     detail=f"{_format_label(video)}+{_format_label(audio)}",
                 )
-        progressive = self._best_progressive(formats)
+        progressive = self._best_progressive(formats, budget, duration)
         if progressive:
             return YtDlpStream(
                 url=str(progressive.get("url") or ""),
                 kind="progressive",
                 height=_as_int(progressive.get("height")),
                 user_agent=_format_user_agent(progressive),
-                filesize=_format_size(progressive),
+                filesize=_format_size(progressive, duration),
                 detail=_format_label(progressive),
             )
-        video = self._best_video_only(formats)
+        video = self._best_video_only(formats, budget, duration)
         if video:
             return YtDlpStream(
                 url=str(video.get("url") or ""),
                 kind="video_only",
                 height=_as_int(video.get("height")),
                 user_agent=_format_user_agent(video),
-                filesize=_format_size(video),
+                filesize=_format_size(video, duration),
                 detail=_format_label(video),
             )
         return None

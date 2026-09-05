@@ -64,6 +64,60 @@ def _append_media_skip_summary(text_parts: List[str], metadata: Dict[str, Any]) 
         text_parts.append(f"图片处理警告[{idx}]：{warning}")
 
 
+def _append_media_notices(
+    text_parts: List[str],
+    metadata: Dict[str, Any],
+    max_video_size_mb: float = 0.0,
+    *,
+    has_text_metadata: bool = True,
+) -> None:
+    """渲染解析失败、体积超限与逐项跳过原因，供文本节点与仅卡片模式共用。"""
+    if metadata.get("error"):
+        text_parts.append(f"解析失败：{metadata['error']}")
+
+    if (
+        metadata.get("has_valid_media") is False
+        and (metadata.get("video_urls") or metadata.get("image_urls"))
+        and has_text_metadata
+        and not metadata.get("exceeds_max_size")
+        and not metadata.get("send_limit_exceeded")
+    ):
+        if metadata.get("has_access_denied"):
+            text_parts.append("解析失败：媒体访问被拒绝(403 Forbidden)")
+        else:
+            text_parts.append("解析失败：直链内未找到有效媒体")
+
+    if metadata.get("exceeds_max_size"):
+        actual_video_size = metadata.get("max_video_size_mb")
+        if actual_video_size is not None:
+            if max_video_size_mb > 0:
+                text_parts.append(
+                    "解析失败：视频大小超过管理员设定的限制"
+                    f"（{actual_video_size:.1f}MB > {max_video_size_mb:.1f}MB）"
+                )
+            else:
+                text_parts.append(
+                    f"解析失败：视频大小超过限制（{actual_video_size:.1f}MB）"
+                )
+
+    _append_media_skip_summary(text_parts, metadata)
+
+
+def build_media_notice_node(
+    metadata: Dict[str, Any], max_video_size_mb: float = 0.0
+) -> Optional[Plain]:
+    """仅构建媒体提示节点。
+
+    仅卡片模式会丢掉完整文本节点，但"视频体积超过可发送上限、只发了封面"这类
+    信息必须让用户看到，否则视频凭空消失、群里没有任何解释。
+    """
+    text_parts: List[str] = []
+    _append_media_notices(text_parts, metadata, max_video_size_mb)
+    if not text_parts:
+        return None
+    return Plain("\n".join(text_parts))
+
+
 def _mark_media_failure(
     metadata: Dict[str, Any], kind: str, index: int, reason: str
 ) -> None:
@@ -134,10 +188,6 @@ def build_text_node(
                     f"(共 {video_count} 个视频, 总计 {total_video_size_mb:.1f} MB)"
                 )
 
-    has_valid_media = metadata.get("has_valid_media")
-    video_urls = metadata.get("video_urls", [])
-    image_urls = metadata.get("image_urls", [])
-
     has_text_metadata = bool(
         (text_metadata_field_enabled(metadata, "title") and metadata.get("title"))
         or (text_metadata_field_enabled(metadata, "author") and metadata.get("author"))
@@ -187,33 +237,12 @@ def build_text_node(
         except (TypeError, ValueError):
             pass
 
-    if metadata.get("error"):
-        text_parts.append(f"解析失败：{metadata['error']}")
-
-    if (
-        has_valid_media is False
-        and (video_urls or image_urls)
-        and has_text_metadata
-        and not metadata.get("exceeds_max_size")
-    ):
-        if metadata.get("has_access_denied"):
-            text_parts.append("解析失败：媒体访问被拒绝(403 Forbidden)")
-        else:
-            text_parts.append("解析失败：直链内未找到有效媒体")
-
-    if metadata.get("exceeds_max_size"):
-        actual_video_size = metadata.get("max_video_size_mb")
-        if actual_video_size is not None:
-            if max_video_size_mb > 0:
-                text_parts.append(
-                    f"解析失败：视频大小超过管理员设定的限制（{actual_video_size:.1f}MB > {max_video_size_mb:.1f}MB）"
-                )
-            else:
-                text_parts.append(
-                    f"解析失败：视频大小超过限制（{actual_video_size:.1f}MB）"
-                )
-
-    _append_media_skip_summary(text_parts, metadata)
+    _append_media_notices(
+        text_parts,
+        metadata,
+        max_video_size_mb,
+        has_text_metadata=has_text_metadata,
+    )
 
     if text_metadata_field_enabled(metadata, "original_link") and metadata.get("url"):
         text_parts.append(f"原始链接：{metadata['url']}")
@@ -500,6 +529,9 @@ def _build_node_parts_for_link(
         nodes.extend(display_text_nodes)
     elif card_mode == "仅卡片":
         display_text_nodes = []
+        if effective_text_metadata:
+            notice_node = build_media_notice_node(metadata, max_video_size_mb)
+            display_text_nodes.extend(_split_plain_node(notice_node))
         if (
             text_metadata_field_enabled(metadata, "original_link")
             and metadata.get("url")
@@ -662,6 +694,9 @@ def build_all_nodes(
                     card_mode=delivery["card_mode"],
                     display_text_nodes=delivery["display_text_nodes"],
                     media_nodes=delivery["media_nodes"],
+                    source_url=str(
+                        metadata.get("url") or metadata.get("source_url") or ""
+                    ),
                 )
             )
         else:

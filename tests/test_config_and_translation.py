@@ -1,4 +1,7 @@
+import json
+import os
 import unittest
+from dataclasses import fields
 from types import SimpleNamespace
 
 from nova_core.config_manager import (
@@ -12,10 +15,13 @@ from nova_core.config_manager import (
     CARD_SKIN_X,
     CARD_SKIN_YOUTUBE,
     CARD_SKINS,
+    DEFAULT_MAX_VIDEO_SIZE_MB,
     TRANSLATION_OUTPUT_CARD_AND_TEXT,
     TRANSLATION_OUTPUT_CARD_ONLY,
     ConfigManager,
+    DownloadConfig,
 )
+from nova_core.constants import Config
 from nova_core.translation import MetadataTranslator, build_card_metadata_list
 
 
@@ -312,6 +318,86 @@ class ConfigAndTranslationTests(unittest.TestCase):
         self.assertEqual(comment["_translated_message"], "你好")
         self.assertEqual(comment["username"], "Alice")
         self.assertEqual(comment["likes"], 9)
+
+
+class DownloadConfigSchemaTests(unittest.TestCase):
+    """确保 download 配置在 dataclass、解析逻辑与 WebUI schema 三处保持一致。"""
+
+    SCHEMA_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "_conf_schema.json",
+    )
+    # schema 键名与 dataclass 字段名不同名时的映射
+    KEY_ALIASES = {"max_concurrent": "max_concurrent_downloads"}
+    # 运行期自行推导、无需暴露给用户的字段
+    RUNTIME_ONLY_FIELDS = {"cache_dir_available"}
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.SCHEMA_PATH, "r", encoding="utf-8") as handle:
+            cls.schema = json.load(handle)
+        cls.download_items = cls.schema["download"]["items"]
+
+    def test_send_video_max_mb_defaults_to_platform_limit(self):
+        self.assertEqual(
+            DownloadConfig().send_video_max_mb,
+            Config.DEFAULT_SEND_VIDEO_MAX_MB,
+        )
+        self.assertEqual(
+            ConfigManager({}).download.send_video_max_mb,
+            Config.DEFAULT_SEND_VIDEO_MAX_MB,
+        )
+
+    def test_send_video_max_mb_accepts_numbers_and_strings(self):
+        cases = {64: 64.0, "80.5": 80.5, 0: 0.0, "0": 0.0}
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                config = ConfigManager({"download": {"send_video_max_mb": raw}})
+                self.assertEqual(config.download.send_video_max_mb, expected)
+
+    def test_send_video_max_mb_normalizes_invalid_values(self):
+        # 非法值回落默认；负数按 0（不限制）处理，与其它体积上限的口径一致
+        cases = {
+            "abc": Config.DEFAULT_SEND_VIDEO_MAX_MB,
+            None: Config.DEFAULT_SEND_VIDEO_MAX_MB,
+            -5: 0.0,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                config = ConfigManager({"download": {"send_video_max_mb": raw}})
+                self.assertEqual(config.download.send_video_max_mb, expected)
+
+    def test_schema_keys_map_to_dataclass_fields(self):
+        field_names = {item.name for item in fields(DownloadConfig)}
+        for key in self.download_items:
+            with self.subTest(key=key):
+                self.assertIn(self.KEY_ALIASES.get(key, key), field_names)
+
+    def test_every_user_facing_field_is_exposed_in_schema(self):
+        exposed = {self.KEY_ALIASES.get(key, key) for key in self.download_items}
+        for item in fields(DownloadConfig):
+            if item.name in self.RUNTIME_ONLY_FIELDS:
+                continue
+            with self.subTest(field=item.name):
+                self.assertIn(item.name, exposed)
+
+    def test_schema_defaults_match_code_defaults(self):
+        expected = {
+            "max_video_size_mb": DEFAULT_MAX_VIDEO_SIZE_MB,
+            "large_video_threshold_mb": Config.MAX_LARGE_VIDEO_THRESHOLD_MB,
+            "send_video_max_mb": Config.DEFAULT_SEND_VIDEO_MAX_MB,
+            "max_concurrent": float(Config.DOWNLOAD_MANAGER_MAX_CONCURRENT),
+        }
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(float(self.download_items[key]["default"]), value)
+
+    def test_send_video_max_mb_schema_entry_explains_platform_limit(self):
+        entry = self.download_items["send_video_max_mb"]
+        self.assertEqual(entry["type"], "float")
+        hint = entry.get("hint", "")
+        self.assertIn("102902", hint)
+        self.assertIn("填 0 不限制", hint)
 
 
 if __name__ == "__main__":

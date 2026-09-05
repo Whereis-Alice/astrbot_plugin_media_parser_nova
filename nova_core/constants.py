@@ -14,6 +14,10 @@ class Config:
     
     DEFAULT_LARGE_VIDEO_THRESHOLD_MB = 100.0
     MAX_LARGE_VIDEO_THRESHOLD_MB = 100.0
+    # 平台单条视频可发送体积上限：QQ 富媒体通道（Highway）对超大视频会在
+    # 上传中途返回 102902 直接拒收，下载再久也白费，因此在取流/下载阶段就
+    # 按这个上限止损，超限只发信息与封面。0 表示不限制。
+    DEFAULT_SEND_VIDEO_MAX_MB = 100.0
     DOWNLOAD_RETRY_ATTEMPTS = 3
     DOWNLOAD_RETRY_BASE_DELAY = 0.5
     

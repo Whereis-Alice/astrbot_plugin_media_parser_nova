@@ -95,6 +95,7 @@ class LinkBuildMeta(TypedDict):
     card_mode: str
     display_text_nodes: List[Any]
     media_nodes: List[Any]
+    source_url: str
 
 
 class BuildAllNodesResult(NamedTuple):

@@ -1,11 +1,18 @@
 import asyncio
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from astrbot.api.message_components import Image, Nodes, Plain, Reply
 
-from nova_core.message_adapter.node_builder import build_all_nodes, build_text_node
+from nova_core.message_adapter import node_builder
+from nova_core.message_adapter.node_builder import (
+    build_all_nodes,
+    build_media_notice_node,
+    build_text_node,
+)
 from nova_core.message_adapter.sender import MessageSender
 
 
@@ -118,8 +125,11 @@ class MessageDeliveryTests(unittest.TestCase):
         forward_content = outer_chain[0].nodes[0].content
         self.assertEqual(forward_content, [self.card, self.summary])
 
-    def test_partial_delivery_failure_is_logged_without_chat_notice(self):
-        event = SimpleNamespace(send=AsyncMock())
+    def test_partial_delivery_failure_notifies_chat(self):
+        event = SimpleNamespace(
+            send=AsyncMock(),
+            plain_result=lambda text: [Plain(text)],
+        )
 
         asyncio.run(
             self.sender._finish_best_effort_delivery(
@@ -127,11 +137,39 @@ class MessageDeliveryTests(unittest.TestCase):
                 label="解析结果",
                 expected=2,
                 succeeded=1,
-                errors=[RuntimeError("video send failed")],
+                errors=[
+                    RuntimeError(
+                        "[Highway] httpUpload Error uploading block at offset 1: "
+                        "HTTP Upload failed with code 102902"
+                    )
+                ],
+                failed_urls=["https://youtu.be/abc"],
             )
         )
 
-        event.send.assert_not_awaited()
+        event.send.assert_awaited_once()
+        notice = event.send.await_args.args[0][0].text
+        self.assertIn("1/2", notice)
+        self.assertIn("聊天平台拒收", notice)
+        self.assertIn("https://youtu.be/abc", notice)
+
+    def test_partial_delivery_failure_notice_failure_is_swallowed(self):
+        event = SimpleNamespace(
+            send=AsyncMock(side_effect=RuntimeError("offline")),
+            plain_result=lambda text: [Plain(text)],
+        )
+
+        asyncio.run(
+            self.sender._finish_best_effort_delivery(
+                event,
+                label="解析结果",
+                expected=2,
+                succeeded=1,
+                errors=[RuntimeError("boom")],
+            )
+        )
+
+        event.send.assert_awaited_once()
 
     def test_hot_comments_can_be_hidden_from_plain_text_only(self):
         result = build_all_nodes(
@@ -164,6 +202,98 @@ class MessageDeliveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CardOnlyNoticeTests(unittest.TestCase):
+    """仅卡片模式：视频被跳过的原因不能被卡片吞掉。"""
+
+    def setUp(self):
+        handle, self.card_path = tempfile.mkstemp(suffix=".png")
+        os.close(handle)
+        self.addCleanup(lambda: os.path.exists(self.card_path)
+                        and os.unlink(self.card_path))
+
+    SEND_LIMIT_REASON = (
+        "视频体积超过可发送上限（129.1MB > 100.0MB），"
+        "聊天平台会拒收，已改为只发信息与封面"
+    )
+
+    def _card_only_texts(self, **extra):
+        metadata = {
+            "url": "https://www.youtube.com/watch?v=TNwnccdoxJQ",
+            "title": "样本标题",
+            "platform": "youtube",
+            "_card_file_path": self.card_path,
+            "_card_mode": "仅卡片",
+        }
+        metadata.update(extra)
+        nodes, _, delivery = node_builder._build_node_parts_for_link(metadata)
+        self.assertEqual(delivery["card_mode"], "仅卡片")
+        return [node.text for node in nodes if isinstance(node, Plain)]
+
+    def test_send_limit_reason_survives_card_only_mode(self):
+        texts = self._card_only_texts(
+            video_count=1,
+            image_count=1,
+            has_valid_media=True,
+            send_limit_exceeded=True,
+            video_skip_reasons=[self.SEND_LIMIT_REASON],
+        )
+        joined = "\n".join(texts)
+        self.assertIn("可发送上限", joined)
+        self.assertIn("聊天平台会拒收", joined)
+        # 提示要排在原始链接前面，读起来才是"发生了什么 + 去哪看"。
+        self.assertTrue(texts[-1].startswith("原始链接："))
+        # 仅卡片模式仍然不该把完整图文正文倒出来。
+        self.assertNotIn("样本标题", joined)
+
+    def test_card_only_mode_without_notice_keeps_only_link(self):
+        texts = self._card_only_texts()
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("原始链接："))
+
+    def test_send_limit_suppresses_generic_no_media_error(self):
+        # 视频因为发不出去被跳过，不能再报一句"直链内未找到有效媒体"。
+        texts = self._card_only_texts(
+            video_count=1,
+            image_count=0,
+            has_valid_media=False,
+            video_urls=[["https://v/1.mp4"]],
+            send_limit_exceeded=True,
+            video_skip_reasons=[self.SEND_LIMIT_REASON],
+        )
+        joined = "\n".join(texts)
+        self.assertNotIn("直链内未找到有效媒体", joined)
+        self.assertIn("可发送上限", joined)
+
+    def test_notice_node_is_none_when_there_is_nothing_to_report(self):
+        self.assertIsNone(build_media_notice_node({}))
+        self.assertIsNone(
+            build_media_notice_node({"title": "只有标题", "video_count": 1})
+        )
+
+    def test_notice_node_reports_error_and_skip_reason(self):
+        node = build_media_notice_node(
+            {
+                "error": "取流失败",
+                "video_count": 1,
+                "video_skip_reasons": [self.SEND_LIMIT_REASON],
+            }
+        )
+        self.assertIsNotNone(node)
+        self.assertIn("解析失败：取流失败", node.text)
+        self.assertIn("媒体跳过：视频 1/1", node.text)
+
+    def test_source_url_is_exposed_for_delivery_fallback(self):
+        metadata = {
+            "url": "https://www.youtube.com/watch?v=TNwnccdoxJQ",
+            "title": "样本标题",
+        }
+        result = build_all_nodes([metadata], 100.0, 1000.0, True, True)
+        self.assertEqual(
+            result.link_metadata[0]["source_url"],
+            "https://www.youtube.com/watch?v=TNwnccdoxJQ",
+        )
 
 
 class TextNodeAccessMessageTests(unittest.TestCase):

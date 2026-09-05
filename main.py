@@ -70,6 +70,7 @@ class MediaParserNovaPlugin(Star):
         self.download_manager = DownloadManager(
             max_video_size_mb=cfg.download.max_video_size_mb,
             large_video_threshold_mb=cfg.download.large_video_threshold_mb,
+            send_video_max_mb=cfg.download.send_video_max_mb,
             cache_dir=cfg.download.cache_dir,
             cache_dir_available=cfg.download.cache_dir_available,
             max_concurrent_downloads=cfg.download.max_concurrent_downloads,

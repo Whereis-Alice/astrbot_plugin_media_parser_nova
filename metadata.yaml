@@ -15,8 +15,9 @@ desc: |
   - 小红书移动端无水印处理
   - B站 Cookie 高画质解析与管理员协助登录
   - YouTube 四层降级解析：Innertube 多客户端取流，SABR 等疑难视频交给 yt-dlp 兜底执行播放器 JS 解出直链，被机器人门禁挡下时仍补齐标题/作者/时长/播放量并出完整信息卡片；Cookie 自动跟进服务端轮换并落盘，导出一次即长期免维护，失效时私聊提醒
+  - 视频按平台可发送体积挑流：预算内取最高画质，超限直接改发信息与封面，发送失败会在会话里说明原因
   - 媒体中转、消息聚合和 ZIP 导出
-version: v1.12.0
+version: v1.13.0
 astrbot_version: ">=4.25.0"
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova

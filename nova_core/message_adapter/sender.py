@@ -7,8 +7,21 @@ from typing import Any, List, Optional
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
 
+from ..constants import Config
 from ..logger import logger
 from .node_builder import is_pure_image_gallery
+
+# 平台富媒体通道拒收超大文件时的特征词。QQ 的 Highway 通道会在上传中途返回
+# 102902，报错文本里没有"太大"两个字，只能靠这些关键字认出来。
+_OVERSIZE_FAILURE_KEYWORDS = (
+    "highway",
+    "httpupload",
+    "102902",
+    "too large",
+    "file size",
+    "rich media",
+    "上传失败",
+)
 
 
 class MessageDeliveryError(RuntimeError):
@@ -68,13 +81,38 @@ class MessageSender:
         return [[node] for node in link_nodes if node is not None]
 
     @staticmethod
+    def _source_urls(metadata_list: Any) -> List[str]:
+        """从元数据里取出原始链接，供发送失败提示回显。"""
+        urls: List[str] = []
+        for metadata in metadata_list or []:
+            if not isinstance(metadata, dict):
+                continue
+            url = str(metadata.get("source_url") or "").strip()
+            if url and url not in urls:
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    def _describe_delivery_failure(error: Any) -> str:
+        """把平台发送异常翻译成用户看得懂的一句话。"""
+        text = str(error or "").strip()
+        lowered = text.lower()
+        if any(keyword in lowered for keyword in _OVERSIZE_FAILURE_KEYWORDS):
+            return "视频上传被聊天平台拒收（体积过大或服务端限制）"
+        if not text:
+            return "未知发送错误"
+        return text if len(text) <= 120 else text[:117] + "..."
+
+    @classmethod
     async def _finish_best_effort_delivery(
+        cls,
         event: AstrMessageEvent,
         *,
         label: str,
         expected: int,
         succeeded: int,
         errors: list[Exception],
+        failed_urls: Optional[List[str]] = None,
     ) -> None:
         if expected <= 0 or not errors:
             return
@@ -87,6 +125,28 @@ class MessageSender:
             f"{label}部分发送失败: {len(errors)}/{expected} 项失败，"
             f"其余内容已发送。错误: {error_preview}"
         )
+        # 部分失败以前只写日志，群里看不到任何异常，用户只会觉得"视频凭空没了"。
+        # 这里补一条简短提示，并尽量附上原链接方便自己点开。
+        reasons: List[str] = []
+        for error in errors:
+            reason = cls._describe_delivery_failure(error)
+            if reason not in reasons:
+                reasons.append(reason)
+        notice = (
+            f"⚠️ 有 {len(errors)}/{expected} 项内容未能发出："
+            + "；".join(reasons[:2])
+        )
+        unique_urls: List[str] = []
+        for raw in failed_urls or []:
+            url = str(raw or "").strip()
+            if url and url not in unique_urls:
+                unique_urls.append(url)
+        if unique_urls:
+            notice += "\n原始链接：" + "\n".join(unique_urls[:3])
+        try:
+            await event.send(event.plain_result(notice))
+        except Exception as exc:
+            logger.warning(f"{label}发送失败提示也未能送出: {exc}")
 
     @staticmethod
     def collect_rendered_card_paths(
@@ -145,6 +205,7 @@ class MessageSender:
         expected = 0
         succeeded = 0
         errors: list[Exception] = []
+        failed_urls: List[str] = []
 
         if normal_metadata:
             flat_nodes = []
@@ -172,6 +233,8 @@ class MessageSender:
                     succeeded += 1
                 except Exception as exc:
                     errors.append(exc)
+                    # 聚合转发是一整条消息，失败即整批链接都没发出去。
+                    failed_urls.extend(self._source_urls(normal_metadata))
                     logger.warning(f"发送聚合消息失败: {exc}")
 
         if large_media_metadata:
@@ -179,6 +242,7 @@ class MessageSender:
                 large_expected,
                 large_succeeded,
                 large_errors,
+                large_failed_urls,
             ) = await self.send_large_media_results(
                 event,
                 large_media_metadata,
@@ -187,6 +251,7 @@ class MessageSender:
             expected += large_expected
             succeeded += large_succeeded
             errors.extend(large_errors)
+            failed_urls.extend(large_failed_urls)
 
         await self._finish_best_effort_delivery(
             event,
@@ -194,6 +259,7 @@ class MessageSender:
             expected=expected,
             succeeded=succeeded,
             errors=errors,
+            failed_urls=failed_urls,
         )
 
     async def send_large_media_results(
@@ -201,7 +267,7 @@ class MessageSender:
         event: AstrMessageEvent,
         link_metadata: list,
         large_video_threshold_mb: float = 0.0,
-    ) -> tuple[int, int, list[Exception]]:
+    ) -> tuple[int, int, list[Exception], List[str]]:
         """发送大媒体结果（单独发送）
 
         Args:
@@ -210,8 +276,10 @@ class MessageSender:
             large_video_threshold_mb: 大视频阈值(MB)
         """
         separator = "-------------------------------------"
-        threshold_mb = (
-            int(large_video_threshold_mb) if large_video_threshold_mb > 0 else 50
+        threshold_mb = int(
+            large_video_threshold_mb
+            if large_video_threshold_mb > 0
+            else Config.DEFAULT_LARGE_VIDEO_THRESHOLD_MB
         )
         notice_text = f"⚠️ 链接中包含超过{threshold_mb}MB的视频时将单独发送所有媒体"
         try:
@@ -221,6 +289,7 @@ class MessageSender:
         expected = 0
         succeeded = 0
         errors: list[Exception] = []
+        failed_urls: List[str] = []
         for link_idx, metadata in enumerate(link_metadata):
             chains = self._delivery_chains(
                 metadata.get("link_nodes") or [],
@@ -235,13 +304,14 @@ class MessageSender:
                     succeeded += 1
                 except Exception as e:
                     errors.append(e)
+                    failed_urls.extend(self._source_urls([metadata]))
                     logger.warning(f"发送大媒体消息链失败: {e}")
             if link_idx < len(link_metadata) - 1:
                 try:
                     await event.send(event.plain_result(separator))
                 except Exception as e:
                     logger.warning(f"发送分隔符失败: {e}")
-        return expected, succeeded, errors
+        return expected, succeeded, errors, failed_urls
 
     async def send_individual_results(
         self,
@@ -266,6 +336,7 @@ class MessageSender:
         expected = 0
         succeeded = 0
         errors: list[Exception] = []
+        failed_urls: List[str] = []
         for link_idx, link_nodes in enumerate(all_link_nodes):
             meta = self._metadata_for_link(link_metadata, link_idx)
             metadata_text_node = meta.get("metadata_text_node")
@@ -287,6 +358,7 @@ class MessageSender:
                     succeeded += 1
                 except Exception as exc:
                     errors.append(exc)
+                    failed_urls.extend(self._source_urls([meta]))
                     logger.warning(f"发送消息链失败: {exc}")
             if link_idx < len(all_link_nodes) - 1:
                 try:
@@ -299,6 +371,7 @@ class MessageSender:
             expected=expected,
             succeeded=succeeded,
             errors=errors,
+            failed_urls=failed_urls,
         )
 
     async def send_zip_result(

@@ -37,6 +37,7 @@ from nova_core.parser.platform.youtube import (
     parse_watch_html,
     parse_youtube_identity,
     select_youtube_media,
+    select_youtube_media_detailed,
     thumbnail_candidates,
 )
 from nova_core.parser.platform.youtube import _Deadline
@@ -402,6 +403,184 @@ class SelectMediaTest(unittest.TestCase):
                 self.assertEqual(
                     select_youtube_media(payload), ("", "none", 0)
                 )
+
+
+class SelectMediaBudgetTest(unittest.TestCase):
+    """可发送体积预算参与选流。"""
+
+    def _player(self, adaptive=None, progressive=None, length=0):
+        streaming = {}
+        if progressive is not None:
+            streaming["formats"] = progressive
+        if adaptive is not None:
+            streaming["adaptiveFormats"] = adaptive
+        player = {"streamingData": streaming}
+        if length:
+            player["videoDetails"] = {"lengthSeconds": str(length)}
+        return player
+
+    def test_picks_highest_quality_that_fits_budget(self):
+        player = self._player(
+            adaptive=[
+                _fmt(
+                    url="https://x/v1080",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=1080,
+                    bitrate=3500,
+                    contentLength=str(130 * 1024 * 1024),
+                ),
+                _fmt(
+                    url="https://x/v720",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=720,
+                    bitrate=1800,
+                    contentLength=str(60 * 1024 * 1024),
+                ),
+                _fmt(
+                    url="https://x/aac",
+                    mimeType='audio/mp4; codecs="mp4a.40.2"',
+                    bitrate=128,
+                    contentLength=str(3 * 1024 * 1024),
+                ),
+            ],
+        )
+        url, kind, height, size = select_youtube_media_detailed(
+            player, max_bytes=100 * 1024 * 1024
+        )
+        self.assertEqual(kind, "dash")
+        self.assertEqual(height, 720)
+        self.assertIn("v720", url)
+        self.assertEqual(size, 63 * 1024 * 1024)
+
+    def test_without_budget_still_picks_best_quality(self):
+        player = self._player(
+            adaptive=[
+                _fmt(
+                    url="https://x/v1080",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=1080,
+                    bitrate=3500,
+                    contentLength=str(130 * 1024 * 1024),
+                ),
+                _fmt(
+                    url="https://x/v720",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=720,
+                    bitrate=1800,
+                    contentLength=str(60 * 1024 * 1024),
+                ),
+                _fmt(
+                    url="https://x/aac",
+                    mimeType='audio/mp4; codecs="mp4a.40.2"',
+                    bitrate=128,
+                    contentLength=str(3 * 1024 * 1024),
+                ),
+            ],
+        )
+        url, kind, height, _size = select_youtube_media_detailed(player)
+        self.assertEqual(kind, "dash")
+        self.assertEqual(height, 1080)
+        self.assertIn("v1080", url)
+
+    def test_all_oversize_falls_back_to_smallest(self):
+        player = self._player(
+            adaptive=[
+                _fmt(
+                    url="https://x/v1080",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=1080,
+                    bitrate=3500,
+                    contentLength=str(400 * 1024 * 1024),
+                ),
+                _fmt(
+                    url="https://x/v480",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=480,
+                    bitrate=900,
+                    contentLength=str(200 * 1024 * 1024),
+                ),
+                _fmt(
+                    url="https://x/aac",
+                    mimeType='audio/mp4; codecs="mp4a.40.2"',
+                    bitrate=128,
+                    contentLength=str(2 * 1024 * 1024),
+                ),
+            ],
+        )
+        url, kind, height, size = select_youtube_media_detailed(
+            player, max_bytes=50 * 1024 * 1024
+        )
+        self.assertEqual(kind, "dash")
+        self.assertEqual(height, 480)
+        self.assertIn("v480", url)
+        self.assertEqual(size, 202 * 1024 * 1024)
+
+    def test_unknown_size_counts_as_fitting(self):
+        player = self._player(
+            adaptive=[
+                _fmt(
+                    url="https://x/v1080",
+                    mimeType='video/mp4; codecs="avc1"',
+                    height=1080,
+                ),
+                _fmt(
+                    url="https://x/aac",
+                    mimeType='audio/mp4; codecs="mp4a.40.2"',
+                ),
+            ],
+        )
+        url, kind, height, size = select_youtube_media_detailed(
+            player, max_bytes=1024
+        )
+        self.assertEqual(kind, "dash")
+        self.assertEqual(height, 1080)
+        self.assertIn("v1080", url)
+        self.assertEqual(size, 0)
+
+    def test_bitrate_and_length_estimate_drives_budget(self):
+        # 没有 contentLength 时用 averageBitrate × 时长折算：
+        # 8000000 bit/s × 120s / 8 ≈ 120MB，超过 100MB 预算。
+        player = self._player(
+            progressive=[
+                _fmt(
+                    url="https://x/big",
+                    mimeType='video/mp4; codecs="avc1, mp4a.40.2"',
+                    height=1080,
+                    averageBitrate=8_000_000,
+                ),
+                _fmt(
+                    url="https://x/small",
+                    mimeType='video/mp4; codecs="avc1, mp4a.40.2"',
+                    height=480,
+                    averageBitrate=1_000_000,
+                ),
+            ],
+            length=120,
+        )
+        url, kind, height, size = select_youtube_media_detailed(
+            player,
+            allow_dash=False,
+            max_bytes=100 * 1024 * 1024,
+        )
+        self.assertEqual(kind, "progressive")
+        self.assertEqual(height, 480)
+        self.assertIn("small", url)
+        self.assertEqual(size, 15_000_000)
+
+    def test_legacy_helper_keeps_three_tuple(self):
+        player = self._player(
+            progressive=[
+                _fmt(
+                    url="https://x/prog",
+                    mimeType='video/mp4; codecs="avc1, mp4a.40.2"',
+                    height=360,
+                ),
+            ],
+        )
+        self.assertEqual(
+            select_youtube_media(player),
+            ("https://x/prog", "progressive", 360),
+        )
 
 
 class NumberFormatTest(unittest.TestCase):
@@ -2171,6 +2350,80 @@ class YtDlpStreamSelectionTest(unittest.TestCase):
         for info in ({}, {"formats": []}, {"formats": "nope"}, None, "x"):
             with self.subTest(info=info):
                 self.assertIsNone(resolver.select(info))
+
+
+class YtDlpBudgetSelectionTest(unittest.TestCase):
+    """选流预算：优先挑塞得下发送上限的清晰度，全都超限时退让为最小的一路。"""
+
+    def test_budget_downgrades_dash_video_track(self):
+        # 30MB 预算：音轨 1.4MB 先占位，1080p(44MB) 放不下，落到 720p(22MB)。
+        resolver = YtDlpStreamResolver(max_height=1080, max_bytes=30_000_000)
+        stream = resolver.select(
+            {"formats": [VIDEO_1080_FMT, VIDEO_720_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.kind, "dash")
+        self.assertEqual(stream.height, 720)
+        self.assertEqual(stream.filesize, 22_000_000 + 1_400_000)
+
+    def test_zero_budget_keeps_best_quality(self):
+        resolver = YtDlpStreamResolver(max_height=1080, max_bytes=0)
+        stream = resolver.select(
+            {"formats": [VIDEO_1080_FMT, VIDEO_720_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.height, 1080)
+
+    def test_negative_budget_normalized_to_unlimited(self):
+        self.assertEqual(YtDlpStreamResolver(max_bytes=-5).max_bytes, 0)
+
+    def test_all_tracks_oversize_falls_back_to_smallest(self):
+        # 1MB 预算谁都塞不下，但不能因此丢流：退让为体积最小的一路。
+        resolver = YtDlpStreamResolver(max_height=1080, max_bytes=1_000_000)
+        stream = resolver.select(
+            {"formats": [VIDEO_1080_FMT, VIDEO_720_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.kind, "dash")
+        self.assertEqual(stream.height, 720)
+
+    def test_unknown_size_counts_as_fitting(self):
+        # 体积既没给也估不出来时不能当成超限，否则会无谓降画质。
+        sizeless = _ytdlp_fmt(
+            format_id="137",
+            url="https://rr1.example.com/video1080-sizeless",
+            vcodec="avc1.640028",
+            height=1080,
+        )
+        resolver = YtDlpStreamResolver(max_height=1080, max_bytes=10_000_000)
+        stream = resolver.select(
+            {"formats": [sizeless, VIDEO_720_FMT, AUDIO_FMT]}
+        )
+        self.assertEqual(stream.height, 1080)
+        # 视频体积未知时合计体积也标记为未知(0)，交给下载阶段的硬上限兜底。
+        self.assertEqual(stream.filesize, 0)
+
+    def test_progressive_budget_uses_bitrate_estimate(self):
+        # 没有 filesize 时用 tbr×时长折算：2000kbps × 600s = 150MB。
+        heavy = _ytdlp_fmt(
+            format_id="22",
+            url="https://rr1.example.com/progressive720",
+            vcodec="avc1.4d401f",
+            acodec="mp4a.40.2",
+            height=720,
+            tbr=2000,
+        )
+        info = {"formats": [heavy, PROGRESSIVE_FMT], "duration": 600}
+        unlimited = YtDlpStreamResolver(allow_dash=False).select(info)
+        self.assertEqual(unlimited.height, 720)
+        self.assertEqual(unlimited.filesize, 150_000_000)
+        capped = YtDlpStreamResolver(
+            allow_dash=False, max_bytes=20_000_000
+        ).select(info)
+        self.assertEqual(capped.height, 360)
+
+    def test_video_only_fallback_respects_budget(self):
+        resolver = YtDlpStreamResolver(max_height=1080, max_bytes=30_000_000)
+        stream = resolver.select({"formats": [VIDEO_1080_FMT, VIDEO_720_FMT]})
+        self.assertEqual(stream.kind, "video_only")
+        self.assertEqual(stream.height, 720)
 
 
 class YtDlpCookieJarTest(unittest.TestCase):

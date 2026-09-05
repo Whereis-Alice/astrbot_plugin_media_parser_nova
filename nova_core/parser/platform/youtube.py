@@ -65,6 +65,7 @@ __all__ = [
     "parse_watch_html",
     "parse_youtube_identity",
     "select_youtube_media",
+    "select_youtube_media_detailed",
     "thumbnail_candidates",
     "upscale_avatar_url",
 ]
@@ -748,14 +749,67 @@ def _has_audio(fmt: Dict[str, Any]) -> bool:
     return bool(fmt.get("audioQuality") or fmt.get("audioChannels"))
 
 
+def _estimate_format_bytes(fmt: Any, duration_seconds: int = 0) -> int:
+    """估算一路流的体积（字节）；估不出来时返回 0 表示"未知"。
+
+    优先信服务端声明的 contentLength，缺失时用码率×时长折算。未知体积一律
+    按"放得下"处理——宁可事后被下载器拦一次，也不要凭猜测把可用流全筛掉。
+    """
+    if not isinstance(fmt, dict):
+        return 0
+    declared = _as_int(fmt.get("contentLength"))
+    if declared > 0:
+        return declared
+    bitrate = _as_int(fmt.get("averageBitrate")) or _as_int(fmt.get("bitrate"))
+    if bitrate <= 0:
+        return 0
+    seconds = _as_int(fmt.get("approxDurationMs")) // 1000
+    if seconds <= 0:
+        seconds = max(0, _as_int(duration_seconds))
+    if seconds <= 0:
+        return 0
+    return int(bitrate * seconds / 8)
+
+
+def _fits_budget(size_bytes: int, max_bytes: int) -> bool:
+    """无预算或体积未知时都算放得下。"""
+    return max_bytes <= 0 or size_bytes <= 0 or size_bytes <= max_bytes
+
+
+# (评分, 下载地址, 视频高度, 估算体积)
+_StreamCandidate = Tuple[Tuple[int, ...], str, int, int]
+
+
+def _resolve_candidate(
+    candidates: Sequence[_StreamCandidate],
+    max_bytes: int,
+) -> Optional[_StreamCandidate]:
+    """在预算内挑评分最高的一路；全都超预算时退让为体积最小的那一路。
+
+    "全都超预算"时不能直接放弃：一路 720p 也比只发封面强。
+    """
+    if not candidates:
+        return None
+    within = [item for item in candidates if _fits_budget(item[3], max_bytes)]
+    if within:
+        return max(within, key=lambda item: item[0])
+    return min(candidates, key=lambda item: item[3])
+
+
 def _pick_progressive(
     formats: Any,
     max_height: int,
-) -> Tuple[str, int]:
-    """从 progressive 单文件流里挑一路带音轨的最佳画质。"""
-    best: Optional[Tuple[Tuple[int, int, int], str, int]] = None
+    max_bytes: int = 0,
+    duration_seconds: int = 0,
+) -> Tuple[str, int, int]:
+    """从 progressive 单文件流里挑一路带音轨的最佳画质。
+
+    Returns:
+        (下载地址, 视频高度, 估算体积)；无可用流时返回 ("", 0, 0)。
+    """
     if not isinstance(formats, list):
-        return "", 0
+        return "", 0, 0
+    candidates: List[_StreamCandidate] = []
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
@@ -770,22 +824,33 @@ def _pick_progressive(
             height,
             _as_int(fmt.get("bitrate")),
         )
-        if best is None or score > best[0]:
-            best = (score, url, height)
+        candidates.append(
+            (score, url, height, _estimate_format_bytes(fmt, duration_seconds))
+        )
+    best = _resolve_candidate(candidates, max_bytes)
     if best is None:
-        return "", 0
-    return best[1], best[2]
+        return "", 0, 0
+    return best[1], best[2], best[3]
 
 
 def _pick_adaptive_pair(
     formats: Any,
     max_height: int,
-) -> Tuple[str, str, int]:
-    """从 adaptive 分离流里各挑一路最佳视频与音频。"""
+    max_bytes: int = 0,
+    duration_seconds: int = 0,
+) -> Tuple[str, str, int, int]:
+    """从 adaptive 分离流里各挑一路最佳视频与音频。
+
+    音轨先定，剩下的预算才留给视频轨：音频通常只占几 MB，砍画质远比砍音质
+    划算。
+
+    Returns:
+        (视频地址, 音频地址, 视频高度, 估算总体积)。
+    """
     if not isinstance(formats, list):
-        return "", "", 0
-    best_video: Optional[Tuple[Tuple[int, int, int], str, int]] = None
-    best_audio: Optional[Tuple[Tuple[int, int], str]] = None
+        return "", "", 0, 0
+    video_candidates: List[_StreamCandidate] = []
+    audio_candidates: List[_StreamCandidate] = []
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
@@ -793,6 +858,7 @@ def _pick_adaptive_pair(
         if not url:
             continue
         mime = (fmt.get("mimeType") or "").lower()
+        size = _estimate_format_bytes(fmt, duration_seconds)
         if mime.startswith("video/"):
             if _has_audio(fmt):
                 continue
@@ -804,25 +870,35 @@ def _pick_adaptive_pair(
                 height,
                 _as_int(fmt.get("bitrate")),
             )
-            if best_video is None or score > best_video[0]:
-                best_video = (score, url, height)
+            video_candidates.append((score, url, height, size))
         elif mime.startswith("audio/"):
             score = (
                 _codec_rank(mime, _AUDIO_CODEC_RANK),
                 _as_int(fmt.get("bitrate")),
             )
-            if best_audio is None or score > best_audio[0]:
-                best_audio = (score, url)
-    if best_video is None or best_audio is None:
-        return "", "", 0
-    return best_video[1], best_audio[1], best_video[2]
+            audio_candidates.append((score, url, 0, size))
+    audio = _resolve_candidate(audio_candidates, max_bytes)
+    if audio is None:
+        return "", "", 0, 0
+    video_budget = max(1, max_bytes - audio[3]) if max_bytes > 0 else 0
+    video = _resolve_candidate(video_candidates, video_budget)
+    if video is None:
+        return "", "", 0, 0
+    # 视频体积未知时整体也算未知：只按音频报一个几 MB 的总量会误导预拦截。
+    total = video[3] + max(0, audio[3]) if video[3] > 0 else 0
+    return video[1], audio[1], video[2], total
 
 
-def _pick_video_only(formats: Any, max_height: int) -> Tuple[str, int]:
+def _pick_video_only(
+    formats: Any,
+    max_height: int,
+    max_bytes: int = 0,
+    duration_seconds: int = 0,
+) -> Tuple[str, int, int]:
     """兜底：只挑一路视频流（无声）。"""
     if not isinstance(formats, list):
-        return "", 0
-    best: Optional[Tuple[Tuple[int, int, int], str, int]] = None
+        return "", 0, 0
+    candidates: List[_StreamCandidate] = []
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
@@ -840,11 +916,73 @@ def _pick_video_only(formats: Any, max_height: int) -> Tuple[str, int]:
             height,
             _as_int(fmt.get("bitrate")),
         )
-        if best is None or score > best[0]:
-            best = (score, url, height)
+        candidates.append(
+            (score, url, height, _estimate_format_bytes(fmt, duration_seconds))
+        )
+    best = _resolve_candidate(candidates, max_bytes)
     if best is None:
-        return "", 0
-    return best[1], best[2]
+        return "", 0, 0
+    return best[1], best[2], best[3]
+
+
+def select_youtube_media_detailed(
+    player: Any,
+    max_height: int = 1080,
+    allow_dash: bool = True,
+    allow_hls: bool = True,
+    max_bytes: int = 0,
+    duration_seconds: int = 0,
+) -> Tuple[str, str, int, int]:
+    """挑选最合适的一路可下载媒体，并附带估算体积。
+
+    ``max_bytes`` 是"发得出去"的预算（通常来自聊天平台的富媒体上限）。带上
+    它以后选流不再是一味挑最高画质：先在预算内挑最好的，实在没有才退让。
+
+    Returns:
+        (下载地址, 类型标识, 视频高度, 估算体积)；无可用流时返回
+        ("", "none", 0, 0)。类型标识取值：dash / progressive / hls /
+        video_only / none。估算体积为 0 表示未知。
+    """
+    if not isinstance(player, dict):
+        return "", "none", 0, 0
+    streaming = player.get("streamingData")
+    if not isinstance(streaming, dict):
+        streaming = {}
+    progressive = streaming.get("formats")
+    adaptive = streaming.get("adaptiveFormats")
+    height_cap = max(0, _as_int(max_height))
+    budget = max(0, _as_int(max_bytes))
+    seconds = max(0, _as_int(duration_seconds))
+    if seconds <= 0:
+        details = player.get("videoDetails")
+        if isinstance(details, dict):
+            seconds = max(0, _as_int(details.get("lengthSeconds")))
+
+    if allow_dash:
+        video_url, audio_url, height, size = _pick_adaptive_pair(
+            adaptive, height_cap, budget, seconds
+        )
+        if video_url and audio_url:
+            return f"dash:{video_url}||{audio_url}", "dash", height, size
+
+    url, height, size = _pick_progressive(
+        progressive, height_cap, budget, seconds
+    )
+    if url:
+        return url, "progressive", height, size
+
+    if allow_hls:
+        manifest = streaming.get("hlsManifestUrl")
+        if isinstance(manifest, str) and manifest.startswith("http"):
+            return f"m3u8:{manifest}", "hls", 0, 0
+
+    url, height, size = _pick_video_only(
+        adaptive, height_cap, budget, seconds
+    )
+    if url:
+        return url, "video_only", height, size
+
+    return "", "none", 0, 0
 
 
 def select_youtube_media(
@@ -852,43 +990,19 @@ def select_youtube_media(
     max_height: int = 1080,
     allow_dash: bool = True,
     allow_hls: bool = True,
+    max_bytes: int = 0,
+    duration_seconds: int = 0,
 ) -> Tuple[str, str, int]:
-    """挑选最合适的一路可下载媒体。
-
-    Returns:
-        (下载地址, 类型标识, 视频高度)；无可用流时返回 ("", "none", 0)。
-        类型标识取值：dash / progressive / hls / video_only / none。
-    """
-    if not isinstance(player, dict):
-        return "", "none", 0
-    streaming = player.get("streamingData")
-    if not isinstance(streaming, dict):
-        streaming = {}
-    progressive = streaming.get("formats")
-    adaptive = streaming.get("adaptiveFormats")
-    height_cap = max(0, _as_int(max_height))
-
-    if allow_dash:
-        video_url, audio_url, height = _pick_adaptive_pair(
-            adaptive, height_cap
-        )
-        if video_url and audio_url:
-            return f"dash:{video_url}||{audio_url}", "dash", height
-
-    url, height = _pick_progressive(progressive, height_cap)
-    if url:
-        return url, "progressive", height
-
-    if allow_hls:
-        manifest = streaming.get("hlsManifestUrl")
-        if isinstance(manifest, str) and manifest.startswith("http"):
-            return f"m3u8:{manifest}", "hls", 0
-
-    url, height = _pick_video_only(adaptive, height_cap)
-    if url:
-        return url, "video_only", height
-
-    return "", "none", 0
+    """``select_youtube_media_detailed`` 的三元组版本（不带体积）。"""
+    url, kind, height, _size = select_youtube_media_detailed(
+        player,
+        max_height=max_height,
+        allow_dash=allow_dash,
+        allow_hls=allow_hls,
+        max_bytes=max_bytes,
+        duration_seconds=duration_seconds,
+    )
+    return url, kind, height
 
 
 # ── next 端点数据提取 ─────────────────────────────────────
@@ -1332,6 +1446,7 @@ class YouTubeParser(BaseVideoParser):
         ytdlp_cookie_dir: str = "",
         ytdlp_pot_provider: str = "",
         ytdlp_fetch_pot: str = "auto",
+        send_video_max_mb: float = 0.0,
     ):
         super().__init__("youtube")
         self.cookie = (cookie or "").strip()
@@ -1346,6 +1461,13 @@ class YouTubeParser(BaseVideoParser):
         self.cookie_authenticated = self.cookie_runtime.authenticated
         self.proxy = proxy
         self.max_height = max(0, _as_int(max_height))
+        # 聊天平台发得出去的体积上限：选流时当预算用，免得下完 129MB 才发现
+        # QQ 富媒体通道根本不收。0 表示不设预算，一律挑最高画质。
+        self.stream_max_bytes = (
+            int(float(send_video_max_mb) * 1024 * 1024)
+            if float(send_video_max_mb or 0) > 0
+            else 0
+        )
         self.player_clients = self._resolve_clients(player_clients)
         self.hot_comment_count = max(0, _as_int(hot_comment_count))
         self.total_budget_seconds = max(8.0, float(total_budget_seconds or 45))
@@ -1434,6 +1556,7 @@ class YouTubeParser(BaseVideoParser):
                 cookie_dir=self.ytdlp_cookie_dir,
                 pot_provider=self.ytdlp_pot_provider,
                 fetch_pot=self.ytdlp_fetch_pot,
+                max_bytes=self.stream_max_bytes,
             )
         return self._ytdlp
 
@@ -1667,6 +1790,7 @@ class YouTubeParser(BaseVideoParser):
                 player,
                 max_height=self.max_height,
                 allow_dash=self.allow_dash,
+                max_bytes=self.stream_max_bytes,
             )
             if media_url:
                 return player, client_key
@@ -1896,10 +2020,16 @@ class YouTubeParser(BaseVideoParser):
             )
 
         # 第 2 层：挑选媒体流。
-        media_url, media_kind, media_height = select_youtube_media(
+        (
+            media_url,
+            media_kind,
+            media_height,
+            media_size_bytes,
+        ) = select_youtube_media_detailed(
             player,
             max_height=self.max_height,
             allow_dash=self.allow_dash,
+            max_bytes=self.stream_max_bytes,
         )
 
         covers = thumbnail_candidates(video_id)
@@ -2009,6 +2139,7 @@ class YouTubeParser(BaseVideoParser):
                 media_url = stream.url
                 media_kind = stream.kind
                 media_height = stream.height
+                media_size_bytes = max(0, _as_int(stream.filesize))
                 ytdlp_detail = stream.detail
                 used_ytdlp = True
                 if stream.user_agent:
@@ -2069,6 +2200,13 @@ class YouTubeParser(BaseVideoParser):
             "has_valid_media": bool(media_url or covers),
         }
 
+        # 把估算体积交给下载器：超过可发送上限的直接跳过下载，省掉那趟白跑
+        # 的一两分钟，并让卡片如实写出"为什么没有视频"。
+        if media_url and media_size_bytes > 0:
+            metadata["video_size_estimates"] = [
+                media_size_bytes / 1024 / 1024
+            ]
+
         if limit_warnings:
             metadata["limit_warnings"] = limit_warnings
             metadata["access_message"] = limit_warnings[0]
@@ -2126,10 +2264,15 @@ class YouTubeParser(BaseVideoParser):
                 logger.debug(
                     f"[youtube] 降级链: video_id={video_id}; {chain}"
                 )
+        size_label = (
+            f"/{media_size_bytes / 1024 / 1024:.1f}MB"
+            if media_size_bytes > 0
+            else ""
+        )
         logger.info(
             f"[youtube] 解析完成 video_id={video_id} "
             f"标题={title[:40]} 作者={author} "
-            f"流={media_kind}@{media_height}p "
+            f"流={media_kind}@{media_height}p{size_label} "
             f"取流={'yt-dlp ' + ytdlp_detail if used_ytdlp else 'innertube'} "
             f"client={player_client or self._NA} "
             f"热评={len(hot_comments)} 耗时={time.time() - started:.2f}s"
