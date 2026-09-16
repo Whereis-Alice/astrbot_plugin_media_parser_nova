@@ -21,7 +21,6 @@
 - 小黑盒：支持 视频 / 图片 / 文本；覆盖游戏详情页和 BBS/link 帖子。
 - Twitter/X：支持 视频 / 图片 / 文本；优先 FxTwitter/FxEmbed，服务不可用时回退 Guest GraphQL。
 - Pixiv：支持 图片 / 文本；覆盖插画和漫画作品页、多页原图候选、Cookie 访问限制与解析/图片代理。
-- YouTube：支持 视频 / 图片 / 文本 / 热评；官方 Innertube（player / next）多客户端降级与 yt-dlp 两条取流腿，配比由「视频流取用来源」决定，共享单次解析时间预算；Cookie 后台续期保活并在判死后退回匿名，两条腿都取不到流时退化为封面卡片。
 
 ### 1.2 核心模块结构
 
@@ -34,7 +33,6 @@ astrbot_plugin_media_parser_nova/
 │   ├── PARSER_METHOD_MEMO.md        # 平台解析方法说明
 │   ├── configuration.md             # 配置说明
 │   ├── cards.md                     # 卡片渲染（皮肤 / 布局 / 家具）
-│   ├── youtube.md                   # YouTube 解析链路与 Cookie
 │   ├── platforms.md                 # 平台专项说明
 │   └── troubleshooting.md           # 排查与反馈
 └── nova_core/
@@ -47,13 +45,9 @@ astrbot_plugin_media_parser_nova/
     │   ├── router.py                # LinkRouter，链接提取、去重、直播过滤
     │   ├── utils.py                 # 通用工具、卡片 URL 提取、直播判断、请求头构建
     │   ├── runtime_manager/
-    │   │   ├── bilibili/auth.py     # BilibiliAuthRuntime，Cookie 校验与扫码登录
-    │   │   └── youtube/
-    │   │       ├── cookie.py        # YouTubeCookieRuntime，鉴权头、轮换吸收、续期与健康态
-    │   │       └── ytdlp.py         # yt-dlp 取流与元数据摘要、PO Token provider 探测
+    │   │   └── bilibili/auth.py     # BilibiliAuthRuntime，Cookie 校验与扫码登录
     │   └── platform/                # 各平台解析器
     │       ├── pixiv.py             # Pixiv 插画/漫画解析器
-    │       ├── youtube.py           # YouTube 解析器（Innertube 降级 + yt-dlp）
     │       ├── xianyu.py            # 闲鱼商品页解析器
     │       └── toutiao.py           # 今日头条文章/微头条/视频解析器
     ├── downloader/
@@ -160,8 +154,7 @@ cache/runtime_manager/bilibili/cookie.json
 - 监听所有消息事件。
 - 执行权限检查、触发判断、卡片 URL 和回复 URL 提取。
 - 协调解析限流、解析、下载、文件 Token 注册、节点构建、发送与清理。
-- 维护 YouTube Cookie 后台任务：每 20 分钟跑一次续期，按「Cookie 体检间隔」补跑登录态体检，判死时触发管理员私聊提醒。
-- 在 `terminate()` 中关闭周期清理、延迟清理、管理员交互、YouTube Cookie 维护和下载任务；仍处于 Token TTL 内的已标记文件由下次加载后的过期扫描回收。
+- 在 `terminate()` 中关闭周期清理、延迟清理、管理员交互和下载任务；仍处于 Token TTL 内的已标记文件由下次加载后的过期扫描回收。
 
 管理员私聊发送 `admin.clean_cache_keyword`，且发送者为 `permissions.admin_id` 时，会触发 `cleanup_marked_in(cache_dir)` 主动清理媒体缓存。
 
@@ -175,10 +168,9 @@ cache/runtime_manager/bilibili/cookie.json
 - `PermissionConfig`：管理员、白名单、黑名单，提供 `check()`。
 - `DownloadConfig`：大小限制、缓存目录、缓存可用性、下载并发。
 - `ParseRateLimitConfig`：同链接/同用户解析频率限制、时间窗和持久化记录文件。
-- `ProxyConfig`：全局代理、TikTok、小黑盒、Twitter/X、Pixiv、YouTube 代理开关。
+- `ProxyConfig`：全局代理、TikTok、小黑盒、Twitter/X、Pixiv 代理开关。
 - `BilibiliEnhancedConfig`：Cookie、最高画质、运行时文件、管理员协助登录与主动更新指令。
 - `PixivConfig`：Pixiv Web Ajax API 使用的可选 Cookie。
-- `YouTubeConfig`：画质上限、是否允许 dash 分离流、视频流取用来源、Innertube 客户端顺序、单次解析总时间预算、可选 Cookie 与其维护参数、yt-dlp 与 PO Token provider 参数。
 - `MediaRelayConfig`：文件 Token 中转开关、回调地址、TTL。
 - `TranslationConfig`：翻译开关、翻译范围、目标语言、AstrBot 内置或自定义大模型配置。输入/输出上限固定为 4000，超时固定为 60 秒，随机性固定为 0。
 - `AdminConfig`：清理关键词和 debug 模式。
@@ -204,14 +196,6 @@ cache/runtime_manager/bilibili/cookie.json
 - 归一 `platform`、`parser_name`、`source_url`、`video_urls`、`image_urls`、headers。
 
 `BaseVideoParser` 定义 `can_parse()`、`extract_links()`、`parse()` 接口，并提供 `_add_range_prefix_to_video_urls()`，可给普通视频候选 URL 或 DASH 子流增加 `range:` 前缀。
-
-`YouTubeCookieRuntime`（`runtime_manager/youtube/cookie.py`）管理 YouTube 登录态：
-
-- 解析配置里的 Netscape / `k=v` 两种 Cookie 格式，生成 SAPISIDHASH 鉴权头，并把服务端下发的轮换凭据按白名单吸收后原子落盘。
-- 维护健康态：向 `accounts.google.com/RotateCookies` 续期拿到新凭据即判活，会话被吊销或体检判定未登录即判死。判死后 `active_header()` 返回空，Innertube 不再挂鉴权客户端，yt-dlp 也拿不到 cookie jar，取流整体退回匿名链。
-- `status_line()` 输出可读状态摘要，不含任何 Cookie 取值。
-
-`runtime_manager/youtube/ytdlp.py` 封装 yt-dlp：探测可执行文件与 PO Token provider、按体积预算挑流、把 `info_dict` 摘要成插件用的元数据字段。它既可作为官方接口的兜底，也可由「视频流取用来源」配置成主取流器。
 
 ### 2.4 B站运行时与管理员交互
 
@@ -552,8 +536,6 @@ error
 
 Pixiv 解析器还会附加 `pixiv_illust_id`、`pixiv_user_id`、`pixiv_x_restrict`、`pixiv_ai_type`、`pixiv_sanity_level` 和 `pixiv_page_count`，用于保留作品访问限制与分页信息。
 
-YouTube 解析器附加 `youtube_video_id`、`youtube_channel_id`、`youtube_stream_kind`（dash / progressive / hls / video_only / none）和 `youtube_player_client`，用于排查取流走到了哪一层降级。
-
 下载层回填：
 
 ```text
@@ -622,7 +604,6 @@ proxy.address
 proxy.tiktok
 proxy.xiaoheihe_video
 proxy.pixiv
-proxy.youtube
 proxy.twitter.parse
 proxy.twitter.image
 proxy.twitter.video
@@ -634,7 +615,6 @@ proxy.twitter.video
 - `XiaoheiheParser`：视频代理。
 - `TwitterParser`：Twitter/X 解析、图片、视频代理。
 - `PixivParser`：Pixiv Web Ajax API 解析和图片下载共用同一代理开关。
-- `YouTubeParser`：Innertube 解析与 googlevideo 直链下载共用同一代理开关（直链与出口 IP 绑定，拆开必然 403）。
 
 解析结果写入：
 

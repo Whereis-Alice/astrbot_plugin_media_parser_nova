@@ -17,7 +17,7 @@ class Config:
     # 平台单条视频可发送体积上限：QQ 富媒体通道（Highway）对超大视频会在
     # 上传中途返回 102902 直接拒收，下载再久也白费，因此在取流/下载阶段就
     # 按这个上限止损，超限只发信息与封面。0 表示不限制。
-    DEFAULT_SEND_VIDEO_MAX_MB = 100.0
+    DEFAULT_SEND_VIDEO_MAX_MB = 48.0
     # 超过可发送上限时先用 ffmpeg 重编码到上限以内再发送，压不下来才只发封面。
     DEFAULT_TRANSCODE_OVERSIZE_VIDEO = True
     DEFAULT_TRANSCODE_TIMEOUT_SECONDS = 600

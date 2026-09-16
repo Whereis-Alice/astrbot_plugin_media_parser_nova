@@ -151,24 +151,6 @@ SAMPLES: dict[str, dict[str, Any]] = {
             ("第三位读者", "uid:10003", 77, "希望浅色模式也能这么好看。"),
         ],
     },
-    "youtube": {
-        "platform": "youtube",
-        "display_name": "YouTube",
-        "author": "コズまげch",
-        "handle": "@kozumage",
-        "title": "如果 Ex-Aid 的主题曲被用在名侦探光之美少女中",
-        "body": "把主题曲剪进开场，画面与鼓点几乎逐帧咬合；副歌进来的那一拍连字幕节奏都对上了。",
-        "time": "2026-08-22",
-        "duration": 226,
-        "online": "",
-        "stats_line": "👀 128万 👍 4.2万 💬 863",
-        "url": "https://www.youtube.com/watch?v=2smExample01",
-        "has_video": True,
-        "comments": [
-            ("Kamen Fan", "uid:20001", 1240, "副歌进来的那一秒鸡皮疙瘩起来了。"),
-            ("光之美少女应援团", "uid:20002", 306, "第二段的转场剪得太干净了。"),
-        ],
-    },
     "twitter": {
         "platform": "twitter",
         "display_name": "推特",
@@ -193,7 +175,7 @@ SAMPLES: dict[str, dict[str, Any]] = {
 }
 
 #: 单皮肤图用哪个样例：仿站皮肤配对应平台的内容，通用皮肤统一用 B 站样例
-SKIN_SAMPLE = {"x": "twitter", "youtube": "youtube"}
+SKIN_SAMPLE = {"x": "twitter"}
 
 
 def make_result(key: str, assets: dict[str, Any]) -> ParseResult:
@@ -310,7 +292,8 @@ async def build(names: set[str] | None) -> list[str]:
         def wanted(name: str) -> bool:
             return names is None or name in names
 
-        for skin in THEME_KEYS:
+        public_theme_keys = tuple(skin for skin in THEME_KEYS if skin != "youtube")
+        for skin in public_theme_keys:
             if not wanted(skin):
                 continue
             key = SKIN_SAMPLE.get(skin, "bilibili")
@@ -330,7 +313,7 @@ async def build(names: set[str] | None) -> list[str]:
             compose(cards, PAIR_GAP).save(out)
             written.append(out.name)
 
-        trio = ("bilibili", "youtube", "twitter")
+        platforms = ("bilibili", "twitter")
         if wanted("platform-skin"):
             cards = [
                 await render_card(
@@ -342,7 +325,7 @@ async def build(names: set[str] | None) -> list[str]:
                     layout="standard",
                     width=TRIO_WIDTH,
                 )
-                for key in trio
+                for key in platforms
             ]
             out = OUT_DIR / "platform-skin.png"
             compose(cards, TRIO_GAP).save(out)
@@ -359,7 +342,7 @@ async def build(names: set[str] | None) -> list[str]:
                     layout="feed",
                     width=TRIO_WIDTH,
                 )
-                for key in trio
+                for key in platforms
             ]
             out = OUT_DIR / "platform-chrome.png"
             compose(cards, TRIO_GAP).save(out)
@@ -371,7 +354,7 @@ def main(argv: Sequence[str]) -> int:
     names = {arg.removesuffix(".png") for arg in argv} or None
     written = asyncio.run(build(names))
     if not written:
-        print("没有匹配到任何截图名，可用名称：8 套皮肤 + platform-skin + platform-chrome")
+        print("没有匹配到任何截图名，可用名称：7 套皮肤 + platform-skin + platform-chrome")
         return 1
     for name in written:
         print(f"已重出 docs/card-skins/{name}")

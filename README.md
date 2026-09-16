@@ -13,11 +13,10 @@
 - 自动提取消息、回复消息和部分 QQ/平台卡片中的链接
 - 支持视频、图片、纯文本和部分平台热评
 - 每个平台独立设置为：关闭、全部发送、仅文本、仅富媒体
-- 卡片渲染：8 套皮肤 × 深浅配色 × 4 种布局，皮肤与界面家具可跟随链接所属平台
+- 卡片渲染：7 套可选皮肤 × 深浅配色 × 4 种布局，皮肤与界面家具可跟随链接所属平台
 - 标题、正文和热评可翻译；译文可以只用于卡片，也可以同时用于普通文本
 - 热评可直接合并到同一张卡片中
 - B 站支持 Cookie 解析、高画质与管理员协助扫码更新
-- YouTube 双腿取流：官方 Innertube 多客户端降级 + yt-dlp，Cookie 后台自动续期，被机器人门禁挡下也能出完整信息卡片
 - 视频按聊天平台能收下的体积挑流，放不下先自动压缩，压不进去才改发封面，发送失败会在会话里说明原因
 - 媒体缓存、媒体中转、ZIP 归档，以及对下载体积、解析频率、缓存清理和公网 URL 的兜底
 
@@ -36,7 +35,6 @@
 | 小黑盒 | 视频、图片、文本；BBS 帖子热评 | `xiaoheihe.cn/app/topic`、`xiaoheihe.cn/app/bbs/link` |
 | Twitter/X | 视频、图片、文本；热评与互动统计需配置 Nitter | `twitter.com/.../status/...`、`x.com/.../status/...` |
 | Pixiv | 插画、漫画多页图片、文本 | `pixiv.net/artworks/...`、`pixiv.net/i/...` |
-| YouTube | 视频、封面、文本、热评与统计 | `youtu.be/...`、`youtube.com/watch`、`youtube.com/shorts/...` |
 
 平台页面结构、登录状态、地区限制和风控策略会变化，「支持平台」不代表每条链接在任何网络环境下都一定可访问。
 
@@ -58,13 +56,15 @@ astrbot_plugin_media_parser_nova
 
 三种触发方式：自动解析链接、引用消息后发关键词、手动关键词（默认含 `媒体解析`）。全部配置项见 [配置说明](docs/configuration.md)。
 
+## YouTube 已独立
+
+YouTube 解析、yt-dlp、PO Token、Cookie 轮换和 YouTube 仿站卡片已经迁移到独立插件 [YouTube Nova](https://github.com/Whereis-Alice/astrbot_plugin_youtube_nova)。本插件不再识别 YouTube 链接，两个插件可以同时安装且不会重复响应。
+
 ## 卡片渲染
 
-开启卡片渲染后，解析结果会画成一张 PNG。五套通用皮肤（极光 / 报章 / 测控 / 展陈 / 夜曲）走自己的设计语言，三套仿站皮肤（哔哩哔哩 / X / YouTube）复刻对应平台手机端的详情页；配色分深浅，布局有标准 / 杂志 / 沉浸式 / 信息流四种。
+开启卡片渲染后，解析结果会画成一张 PNG。五套通用皮肤（极光 / 报章 / 测控 / 展陈 / 夜曲）走自己的设计语言，两套仿站皮肤（哔哩哔哩 / X）复刻对应平台手机端的详情页；配色分深浅，布局有标准 / 杂志 / 沉浸式 / 信息流四种。
 
-皮肤选「跟随平台」时，B 站链接用哔哩哔哩皮肤、X 用 X 皮肤、YouTube 用 YouTube 皮肤；页签条、操作栏、评论输入框这些界面家具也按链接来源换件。
-
-![皮肤跟随平台](docs/card-skins/platform-skin.png)
+皮肤选「跟随平台」时，B 站链接用哔哩哔哩皮肤、X 用 X 皮肤；页签条、操作栏、评论输入框这些界面家具也按链接来源换件。
 
 全部皮肤与布局的截图、家具对照表和排版规则见 [卡片渲染](docs/cards.md)。
 
@@ -73,8 +73,7 @@ astrbot_plugin_media_parser_nova
 | 文档 | 内容 |
 | --- | --- |
 | [配置说明](docs/configuration.md) | 输出模式、触发方式、聚合、视频体积与超限压缩、翻译、缓存、代理、ffmpeg、ZIP 归档 |
-| [卡片渲染](docs/cards.md) | 八套皮肤、四种布局、家具跟随平台、热评合并，含全部截图 |
-| [YouTube 说明](docs/youtube.md) | 取流策略与客户端链、Cookie 自动续期、yt-dlp、PO Token provider、代理 |
+| [卡片渲染](docs/cards.md) | 七套可选皮肤、四种布局、家具跟随平台、热评合并，含截图 |
 | [平台专项说明](docs/platforms.md) | B 站 Cookie、Twitter/X 的 Nitter、小黑盒热评 |
 | [排查与反馈](docs/troubleshooting.md) | 常见现象对照表、日志分级、反馈须知 |
 | [模块结构](docs/ARCHITECTURE.md) | 目录结构与执行链 |

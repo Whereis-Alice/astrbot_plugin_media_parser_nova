@@ -21,9 +21,7 @@ from .parser.platform import (
     XianyuParser,
     XiaoheiheParser,
     XiaohongshuParser,
-    YouTubeParser,
 )
-from .parser.runtime_manager.youtube import normalize_cookie_input
 from .translation.provider_defs import (
     LLM_PROVIDER_DEFAULTS,
     LLM_PROVIDER_OPTIONS,
@@ -54,7 +52,6 @@ PARSER_OUTPUT_KEYS = (
     "xiaoheihe",
     "twitter",
     "pixiv",
-    "youtube",
 )
 
 OUTPUT_MODE_DISABLED = "关闭"
@@ -359,7 +356,6 @@ class HotCommentConfig:
     xiaohongshu: bool = True
     twitter: bool = True
     xiaoheihe: bool = True
-    youtube: bool = True
     #: Twitter/X 热评的 Nitter 实例地址（逗号分隔可配多个），留空表示不使用。
     twitter_nitter_base_url: str = ""
 
@@ -503,9 +499,6 @@ class ProxyConfig:
     twitter_use_video_proxy: bool = True
     tiktok_use_proxy: bool = False
     pixiv_use_proxy: bool = False
-    #: YouTube 解析与下载共用同一开关：googlevideo 直链与出口 IP 绑定，
-    #: 解析出口与下载出口不一致会直接 403。
-    youtube_use_proxy: bool = False
 
 
 @dataclass
@@ -525,27 +518,6 @@ class BilibiliEnhancedConfig:
 @dataclass
 class PixivConfig:
     cookie: str = ""
-
-
-@dataclass
-class YouTubeConfig:
-    cookie: str = ""
-    max_height: int = 1080
-    player_clients: str = "ios,android_vr"
-    total_budget_seconds: int = 45
-    allow_dash: bool = True
-    notify_admin_on_cookie_expired: bool = True
-    cookie_alert_cooldown_minutes: int = 120
-    cookie_auto_refresh: bool = True
-    cookie_keepalive_hours: int = 6
-    cookie_runtime_file: str = ""
-    ytdlp_fallback: bool = True
-    ytdlp_js_runtime: str = "auto"
-    ytdlp_timeout: int = 60
-    ytdlp_runtime_dir: str = ""
-    ytdlp_pot_provider: str = ""
-    ytdlp_fetch_pot: str = "auto"
-    stream_source: str = "auto"
 
 
 @dataclass
@@ -592,7 +564,6 @@ class ConfigManager:
 
     def __init__(self, config: dict):
         self.bilibili_parser = None
-        self.youtube_parser = None
         if not isinstance(config, dict):
             logger.warning("插件根配置不是对象，已安全关闭解析并拒绝所有消息")
             config = {
@@ -669,7 +640,6 @@ class ConfigManager:
         self._enable_xiaoheihe = self._parser_enabled("xiaoheihe")
         self._enable_twitter = self._parser_enabled("twitter")
         self._enable_pixiv = self._parser_enabled("pixiv")
-        self._enable_youtube = self._parser_enabled("youtube")
 
         # --- message ---
         message_raw = self._as_dict(config.get("message"))
@@ -799,11 +769,6 @@ class ConfigManager:
                     hot_comments.get("xiaoheihe", True),
                     True,
                     "message.hot_comments.xiaoheihe",
-                ),
-                youtube=self._parse_bool(
-                    hot_comments.get("youtube", True),
-                    True,
-                    "message.hot_comments.youtube",
                 ),
                 twitter_nitter_base_url=str(
                     hot_comments.get("twitter_nitter_base_url", "") or ""
@@ -1202,98 +1167,6 @@ class ConfigManager:
             cookie=str(pixiv_raw.get("cookie", "") or "").strip(),
         )
 
-        # --- youtube ---
-        youtube_raw = self._as_dict(config.get("youtube"))
-        youtube_cookie_auto_refresh = self._parse_bool(
-            youtube_raw.get("cookie_auto_refresh", True),
-            True,
-            "youtube.cookie_auto_refresh",
-        )
-        # 用户可能直接粘 cookies.txt 或扩展导出的 JSON，统一成 Cookie 请求头。
-        youtube_cookie = normalize_cookie_input(
-            str(youtube_raw.get("cookie", "") or "")
-        )
-        self.youtube = YouTubeConfig(
-            cookie=youtube_cookie,
-            max_height=self._parse_youtube_max_height(
-                youtube_raw.get("max_height", "1080")
-            ),
-            player_clients=str(
-                youtube_raw.get("player_clients", "")
-                or "ios,android_vr"
-            ).strip(),
-            total_budget_seconds=max(
-                8,
-                self._parse_non_negative_int(
-                    youtube_raw.get("total_budget_seconds", 45), 45
-                ),
-            ),
-            allow_dash=self._parse_bool(
-                youtube_raw.get("allow_dash", True),
-                True,
-                "youtube.allow_dash",
-            ),
-            notify_admin_on_cookie_expired=self._parse_bool(
-                youtube_raw.get("notify_admin_on_cookie_expired", True),
-                True,
-                "youtube.notify_admin_on_cookie_expired",
-            ),
-            cookie_alert_cooldown_minutes=max(
-                1,
-                self._parse_non_negative_int(
-                    youtube_raw.get("cookie_alert_cooldown_minutes", 120), 120
-                ),
-            ),
-            cookie_auto_refresh=youtube_cookie_auto_refresh,
-            cookie_keepalive_hours=min(
-                168,
-                self._parse_non_negative_int(
-                    youtube_raw.get("cookie_keepalive_hours", 6), 6
-                ),
-            ),
-            cookie_runtime_file=self._build_youtube_cookie_runtime_file(
-                cache_dir,
-                enabled=bool(
-                    youtube_cookie
-                    and cache_dir_available
-                    and youtube_cookie_auto_refresh
-                ),
-            ),
-            ytdlp_fallback=self._parse_bool(
-                youtube_raw.get("ytdlp_fallback", True),
-                True,
-                "youtube.ytdlp_fallback",
-            ),
-            ytdlp_js_runtime=(
-                str(youtube_raw.get("ytdlp_js_runtime", "") or "auto")
-                .strip()
-                .lower()
-                or "auto"
-            ),
-            ytdlp_timeout=min(
-                300,
-                max(
-                    10,
-                    self._parse_non_negative_int(
-                        youtube_raw.get("ytdlp_timeout", 60), 60
-                    ),
-                ),
-            ),
-            ytdlp_runtime_dir=self._build_youtube_runtime_dir(
-                cache_dir,
-                enabled=cache_dir_available,
-            ),
-            ytdlp_pot_provider=str(
-                youtube_raw.get("ytdlp_pot_provider", "") or ""
-            ).strip(),
-            ytdlp_fetch_pot=self._parse_fetch_pot(
-                youtube_raw.get("ytdlp_fetch_pot", "")
-            ),
-            stream_source=self._parse_stream_source(
-                youtube_raw.get("stream_source", "")
-            ),
-        )
-
         # --- proxy ---
         proxy_raw = self._as_dict(config.get("proxy"))
         twitter_proxy = self._as_dict(proxy_raw.get("twitter"))
@@ -1328,11 +1201,6 @@ class ConfigManager:
                 proxy_raw.get("pixiv", False),
                 False,
                 "proxy.pixiv",
-            ),
-            youtube_use_proxy=self._parse_bool(
-                proxy_raw.get("youtube", False),
-                False,
-                "proxy.youtube",
             ),
         )
 
@@ -1414,10 +1282,6 @@ class ConfigManager:
             self.message.hot_comments.xiaoheihe,
             "xiaoheihe",
         )
-        youtube_hc = self._effective_hot_comment_count(
-            self.message.hot_comments.youtube,
-            "youtube",
-        )
         proxy_addr = self.proxy.address or None
 
         if self._enable_bilibili:
@@ -1483,72 +1347,9 @@ class ConfigManager:
                     proxy=proxy_addr if self.proxy.pixiv_use_proxy else None,
                 )
             )
-        if self._enable_youtube:
-            self.youtube_parser = YouTubeParser(
-                cookie=self.youtube.cookie,
-                proxy=proxy_addr if self.proxy.youtube_use_proxy else None,
-                max_height=self.youtube.max_height,
-                player_clients=self.youtube.player_clients,
-                hot_comment_count=youtube_hc,
-                total_budget_seconds=self.youtube.total_budget_seconds,
-                allow_dash=self.youtube.allow_dash,
-                cookie_alert_enabled=(
-                    self.youtube.notify_admin_on_cookie_expired
-                ),
-                cookie_state_file=self.youtube.cookie_runtime_file,
-                cookie_auto_refresh=self.youtube.cookie_auto_refresh,
-                ytdlp_fallback=self.youtube.ytdlp_fallback,
-                ytdlp_js_runtime=self.youtube.ytdlp_js_runtime,
-                ytdlp_timeout=self.youtube.ytdlp_timeout,
-                ytdlp_cookie_dir=self.youtube.ytdlp_runtime_dir,
-                ytdlp_pot_provider=self.youtube.ytdlp_pot_provider,
-                ytdlp_fetch_pot=self.youtube.ytdlp_fetch_pot,
-                stream_source=self.youtube.stream_source,
-                send_video_max_mb=self.download.send_video_max_mb,
-            )
-            parsers.append(self.youtube_parser)
-
         return parsers
 
     # ── 静态辅助 ────────────────────────────────────────
-
-    @staticmethod
-    def _build_youtube_cookie_runtime_file(
-        cache_dir: str,
-        enabled: bool,
-    ) -> str:
-        """给 YouTube Cookie 运行时挑一个可写文件路径，不可用时返回空串。
-
-        YouTube 会不断轮换 Cookie，运行时把最新值写在这里，插件重载后接着
-        用；目录不可写时只是退化成「仅内存跟进轮换」，不影响解析。
-        """
-        if not enabled or not cache_dir:
-            return ""
-        cookie_dir = Config.build_runtime_dir(cache_dir, "youtube")
-        try:
-            os.makedirs(cookie_dir, exist_ok=True)
-        except Exception as exc:
-            logger.warning(
-                f"YouTube Cookie 运行时目录不可用，轮换结果只保留在内存: {exc}"
-            )
-            return ""
-        return os.path.join(cookie_dir, "cookie.json")
-
-    @staticmethod
-    def _build_youtube_runtime_dir(cache_dir: str, enabled: bool) -> str:
-        """给 YouTube 兜底链路（yt-dlp 的 Cookie jar）挑一个可写目录。
-
-        目录不可用时返回空串，届时 jar 落到系统临时目录，功能不受影响。
-        """
-        if not enabled or not cache_dir:
-            return ""
-        runtime_dir = Config.build_runtime_dir(cache_dir, "youtube")
-        try:
-            os.makedirs(runtime_dir, exist_ok=True)
-        except Exception as exc:
-            logger.debug(f"YouTube 运行时目录不可用，改用系统临时目录: {exc}")
-            return ""
-        return runtime_dir
 
     @staticmethod
     def _parse_parser_outputs(values) -> Dict[str, str]:
@@ -1723,59 +1524,6 @@ class ConfigManager:
             return max(0, int(value))
         except (OverflowError, TypeError, ValueError):
             return max(0, int(default))
-
-    @staticmethod
-    def _parse_stream_source(value) -> str:
-        """把取流来源配置归一成解析器认得的英文枚举值。
-
-        WebUI 里给的是中文选项，非法值一律回落 auto——这一项只影响取流路径
-        的选择顺序，不该因为拼错就让整份配置解析失败。
-        """
-        text = str(value or "").strip().lower()
-        mapping = {
-            "自动": "auto",
-            "auto": "auto",
-            "优先官方接口": "innertube",
-            "innertube": "innertube",
-            "仅 yt-dlp": "ytdlp_only",
-            "仅yt-dlp": "ytdlp_only",
-            "ytdlp_only": "ytdlp_only",
-            "ytdlp-only": "ytdlp_only",
-        }
-        return mapping.get(text, "auto")
-
-    @staticmethod
-    def _parse_fetch_pot(value) -> str:
-        """把 PO Token 取用策略配置归一成 yt-dlp 认得的英文枚举值。
-
-        WebUI 里给的是中文选项，非法值一律回落 auto——这一项只影响性能与
-        成功率，不该因为拼错就让整份配置解析失败。
-        """
-        text = str(value or "").strip().lower()
-        mapping = {
-            "自动": "auto",
-            "总是": "always",
-            "从不": "never",
-            "auto": "auto",
-            "always": "always",
-            "never": "never",
-        }
-        return mapping.get(text, "auto")
-
-    @staticmethod
-    def _parse_youtube_max_height(value) -> int:
-        """把 YouTube 画质上限配置转成像素高度，0 表示不限制。"""
-        if isinstance(value, str):
-            text = value.strip()
-            if not text or text in {"不限制", "0", "auto", "原画"}:
-                return 0
-            digits = "".join(ch for ch in text if ch.isdigit())
-            value = digits or 1080
-        try:
-            height = int(value)
-        except (OverflowError, TypeError, ValueError):
-            return 1080
-        return height if height > 0 else 0
 
     @staticmethod
     def _coerce_bool(value: Any) -> Optional[bool]:

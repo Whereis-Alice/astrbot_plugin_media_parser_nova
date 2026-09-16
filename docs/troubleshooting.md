@@ -4,16 +4,11 @@
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
+| YouTube 链接没有响应 | YouTube 已从本插件拆出 | 安装独立插件 [YouTube Nova](https://github.com/Whereis-Alice/astrbot_plugin_youtube_nova) |
 | Twitter/X 卡片没有热评和互动数字 | X 已不对未登录访问输出带回复数据的页面，属平台行为 | 配置一个 Nitter 实例，见 [Twitter/X → 热评与互动统计需要 Nitter](platforms.md#热评与互动统计需要-nitter) |
-| YouTube 只出封面卡片，日志写 `playability=LOGIN_REQUIRED` | 出口 IP 被要求人机验证，或 Cookie 已失效 | 重新导出 Cookie、或换住宅/家宽出口；见 [YouTube → 机器人验证](youtube.md#sign-in-to-confirm-youre-not-a-bot) |
-| YouTube 有完整元数据但「未取到可下载视频流」，`playability=OK` | 该视频只发 SABR 分段流，官方接口拿不到直连地址 | 让 yt-dlp 参与取流，见 [YouTube → yt-dlp 这条腿](youtube.md#yt-dlp-这条腿) |
-| YouTube Cookie 隔几天就失效 | 导出时会话没有冻结，浏览器继续用同一会话，服务端会轮换掉旧凭据 | 后台已在每 20 分钟自动续期；只需按 [让 Cookie 长期不用再管](youtube.md#让-cookie-长期不用再管) 用冻结会话的方式重新导出一次 |
-| 日志写 `登录态=cookie(已判定失效，按匿名请求)` | Cookie 被判死，取流已自动退回匿名 + PO Token 链 | 属正常自适应；续期或体检确认在线后会自动复活，见 [判死之后自动退回匿名](youtube.md#判死之后自动退回匿名) |
-| 「视频流取用来源」选的是「自动」，日志却写 `取流策略=ytdlp_only` | 官方接口连续两次撞上机器人门禁，进入 30 分钟冷却期 | 属正常自适应，冷却结束自动恢复，见 [谁来出流](youtube.md#谁来出流) |
-| 日志每隔一段时间出现 `Cookie 维护: 续期: … 验证: …` | 后台续期与登录态体检的例行报告 | 属正常行为；只有结尾写「请重新导出 YouTube Cookie」才需要动手，见 [第二层：让插件自动续期并跟进轮换](youtube.md#第二层让插件自动续期并跟进轮换默认开启) |
 | 只发了信息与封面，没有视频文件 | 体积超过发送上限且压不下来（未装 ffmpeg、视频太长或压缩超时） | 装好 ffmpeg 并开启 `transcode_oversize_video`，见 [视频体积与发送上限](configuration.md#视频体积与发送上限) |
 | 视频画质比原片明显下降，消息里写「视频已压缩」 | 原片超过可发送上限，已自动降码率/降分辨率换取能发出去 | 属正常行为；想要原画质就调高 `send_video_max_mb`，或关掉 `transcode_oversize_video` 改发封面 |
-| 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端富媒体通道拒收大文件，常在传到一半才拒 | 把 `send_video_max_mb` 调到自己部署的实测值以下 |
+| 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端富媒体通道拒收大文件；LLOneBot 8.1.9 实测要求视频严格小于 53 MiB | 保持默认 48 MiB，或把 `send_video_max_mb` 调到自己部署的实测值以下 |
 | 高画质视频没有声音，或合并失败 | DASH 音视频轨需要 `ffmpeg` 合并 | 安装 ffmpeg，见 [ffmpeg](configuration.md#ffmpeg) |
 | 图片发不出、B 站高画质拿不到 | 缺少可写缓存目录，无法带 Referer 下载 | 配置缓存目录，见 [缓存目录](configuration.md#缓存目录) |
 | B 站画质一直上不去 | 未配置 Cookie 或 Cookie 已失效 | 见 [平台专项 → B 站](platforms.md#b-站) |
@@ -27,8 +22,6 @@
 - **一行摘要（INFO）**：每次解析结束都会打一条，包含平台、ID、标题、作者、取流方式、清晰度、热评条数和耗时。
 - **降级说明（WARNING）**：取不到视频流、热评为空、Cookie 失效等情况会打一条，一行写清尝试过的链路、登录态、代理状态与处理建议。取不到流不算异常，不会抛错。
 - **详细降级链（DEBUG）**：逐个客户端 / 数据源的失败原因需要开启「管理与调试 → debug 模式」才会输出。
-
-YouTube 取不到流时的日志字段含义见 [取不到视频流时](youtube.md#取不到视频流时)。
 
 ## 反馈问题
 

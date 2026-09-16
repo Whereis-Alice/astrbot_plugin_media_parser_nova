@@ -10,7 +10,6 @@ from .toutiao import ToutiaoParser
 from .xiaoheihe import XiaoheiheParser
 from .twitter import TwitterParser
 from .pixiv import PixivParser
-from .youtube import YouTubeParser
 from .base import BaseVideoParser
 
 __all__ = [
@@ -25,7 +24,5 @@ __all__ = [
     'XiaoheiheParser',
     'TwitterParser',
     'PixivParser',
-    'YouTubeParser',
     'BaseVideoParser'
 ]
-

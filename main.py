@@ -15,7 +15,6 @@ from .nova_core.config_manager import (
 from .nova_core.constants import Config
 from .nova_core.downloader import DownloadManager, create_public_only_connector
 from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistManager
-from .nova_core.interaction.platform.youtube import YouTubeCookieNoticeManager
 from .nova_core.logger import logger
 from .nova_core.message_adapter.archive_builder import (
     ArchiveSizeLimitError,
@@ -45,14 +44,9 @@ from .nova_core.translation import MetadataTranslator, build_card_metadata_list
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.7.1",
+    "1.16.0",
 )
 class MediaParserNovaPlugin(Star):
-    # Google 侧的登录凭据大约每 10 分钟就会换一茬。轮换请求本身极轻（一个
-    # 空 POST），跑得比 Cookie 老化更快才追得上；重的登录态体检仍按配置的
-    # 体检间隔来，两者共用同一个后台任务。
-    _YOUTUBE_ROTATE_INTERVAL = 20 * 60
-
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.logger = logger
@@ -63,7 +57,6 @@ class MediaParserNovaPlugin(Star):
         parsers = cfg.create_parsers()
         self.parser_manager = ParserManager(parsers)
         self.bilibili_parser = cfg.bilibili_parser
-        self.youtube_parser = cfg.youtube_parser
         self.metadata_translator = MetadataTranslator(
             cfg.translation,
             self.context,
@@ -87,7 +80,6 @@ class MediaParserNovaPlugin(Star):
         self.message_sender = MessageSender()
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._expired_cleanup_task: Optional[asyncio.Task] = None
-        self._youtube_keepalive_task: Optional[asyncio.Task] = None
         self._active_media_flows = 0
         self._cache_cleanup_lock = asyncio.Lock()
         rate_limit = cfg.parse_rate_limit
@@ -108,29 +100,14 @@ class MediaParserNovaPlugin(Star):
             request_cooldown_minutes=cfg.bilibili.admin_request_cooldown_minutes,
             command=cfg.bilibili.admin_cookie_update_command,
         )
-        self.youtube_cookie_notice = YouTubeCookieNoticeManager(
-            context=self.context,
-            admin_id=cfg.permission.admin_id,
-            enabled=(
-                self.youtube_parser is not None
-                and cfg.youtube.notify_admin_on_cookie_expired
-            ),
-            request_cooldown_minutes=(
-                cfg.youtube.cookie_alert_cooldown_minutes
-            ),
-        )
-
     async def initialize(self):
         """事件循环就绪后再启动后台任务（__init__ 阶段无运行中的事件循环）。"""
         self._start_expired_cache_cleanup()
-        self._start_youtube_cookie_keepalive()
 
     async def terminate(self):
         await self._shutdown_expired_cache_cleanup()
-        await self._shutdown_youtube_cookie_keepalive()
         await self._shutdown_delayed_cleanups()
         await self.admin_cookie_assist.shutdown()
-        await self.youtube_cookie_notice.shutdown()
         await self.download_manager.shutdown()
         # 翻译客户端持有复用的 ClientSession，插件卸载/重载时必须显式关闭。
         try:
@@ -139,19 +116,6 @@ class MediaParserNovaPlugin(Star):
             self.logger.warning(f"关闭翻译 HTTP 会话失败: {exc!r}")
 
     # ── 内部辅助 ────────────────────────────────────────
-
-    def _trigger_youtube_cookie_notice_if_needed(self):
-        if not self.youtube_parser:
-            return
-        reason = self.youtube_parser.consume_cookie_alert()
-        if not reason:
-            return
-        self.logger.warning(
-            "[youtube] Cookie 失效: "
-            + YouTubeCookieNoticeManager.describe_reason(reason)
-            + "，请重新导出 YouTube Cookie"
-        )
-        self.youtube_cookie_notice.trigger_assist_request(reason)
 
     def _trigger_bilibili_cookie_assist_if_needed(self):
         if not self.bilibili_parser:
@@ -271,113 +235,6 @@ class MediaParserNovaPlugin(Star):
     async def _shutdown_expired_cache_cleanup(self):
         task = self._expired_cleanup_task
         self._expired_cleanup_task = None
-        if task and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    # ── YouTube Cookie 维护 ─────────────────────────────
-
-    def _youtube_keepalive_enabled(self) -> bool:
-        """只有配置了 Cookie 且体检间隔为正数时才需要后台维护任务。"""
-        if self.youtube_parser is None:
-            return False
-        cfg = self.config_manager
-        if not cfg.youtube.cookie:
-            return False
-        try:
-            return int(cfg.youtube.cookie_keepalive_hours) > 0
-        except (TypeError, ValueError):
-            return False
-
-    def _youtube_keepalive_interval(self) -> int:
-        hours = self.config_manager.youtube.cookie_keepalive_hours
-        try:
-            hours = int(hours)
-        except (TypeError, ValueError):
-            hours = 6
-        return max(1, min(hours, 168)) * 3600
-
-    async def _youtube_cookie_keepalive_once(
-        self,
-        verify: bool = True,
-    ) -> None:
-        """跑一次 Cookie 维护。
-
-        verify=False 时只做轻量轮换（吸收服务端下发的新凭据），不额外发起
-        登录态体检；verify=True 时补上体检，用来确认凭据是否还被认账。
-        """
-        parser = self.youtube_parser
-        if parser is None:
-            return
-        cfg = self.config_manager
-        trusted_proxies = [cfg.proxy.address] if cfg.proxy.address else []
-        connector = create_public_only_connector(
-            trusted_proxy_urls=trusted_proxies,
-        )
-        try:
-            session = aiohttp.ClientSession(connector=connector)
-        except BaseException:
-            # 会话构造失败时不会接管 connector，需手动关闭避免连接器泄漏。
-            await connector.close()
-            raise
-        async with session:
-            logged_in, detail = await parser.maintain_cookie(
-                session, verify=verify
-            )
-        summary = f"[youtube] Cookie 维护: {detail}；{parser.cookie_status_line()}"
-        if logged_in is False:
-            self.logger.warning(summary + "；请重新导出 YouTube Cookie")
-            self.youtube_cookie_notice.trigger_assist_request(
-                "keepalive_logged_out"
-            )
-        elif verify or logged_in is True:
-            self.logger.info(summary)
-        else:
-            # 纯轮换轮次没有新结论时不占用日志。
-            self.logger.debug(summary)
-
-    async def _youtube_cookie_keepalive_loop(self) -> None:
-        try:
-            verify_interval = self._youtube_keepalive_interval()
-            # 首轮就带体检：既校验 Cookie 健康度，也把长时间沉默期间积累的
-            # 轮换一并补上。
-            elapsed = verify_interval
-            while True:
-                verify = elapsed >= verify_interval
-                try:
-                    await self._youtube_cookie_keepalive_once(verify=verify)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"[youtube] Cookie 维护失败: {e!r}")
-                if verify:
-                    elapsed = 0
-                    # 间隔可能被热改，每轮体检后重新读一次。
-                    verify_interval = self._youtube_keepalive_interval()
-                await asyncio.sleep(self._YOUTUBE_ROTATE_INTERVAL)
-                elapsed += self._YOUTUBE_ROTATE_INTERVAL
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"[youtube] Cookie 维护任务异常退出: {e!r}")
-
-    def _start_youtube_cookie_keepalive(self) -> None:
-        task = self._youtube_keepalive_task
-        if task and not task.done():
-            return
-        if not self._youtube_keepalive_enabled():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._youtube_keepalive_task = loop.create_task(
-            self._youtube_cookie_keepalive_loop()
-        )
-
-    async def _shutdown_youtube_cookie_keepalive(self) -> None:
-        task = self._youtube_keepalive_task
-        self._youtube_keepalive_task = None
         if task and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -962,10 +819,8 @@ class MediaParserNovaPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def auto_parse(self, event: AstrMessageEvent):
         self._start_expired_cache_cleanup()
-        self._start_youtube_cookie_keepalive()
         cfg = self.config_manager
         self.admin_cookie_assist.try_update_admin_origin(event)
-        self.youtube_cookie_notice.try_update_admin_origin(event)
 
         is_private = event.is_private_chat()
         sender_id = event.get_sender_id()
@@ -1118,7 +973,6 @@ class MediaParserNovaPlugin(Star):
                     metadata_list,
                 )
             self._trigger_bilibili_cookie_assist_if_needed()
-            self._trigger_youtube_cookie_notice_if_needed()
             if not metadata_list:
                 if cfg.admin.debug_mode:
                     self.logger.debug("解析后未获得任何元数据")

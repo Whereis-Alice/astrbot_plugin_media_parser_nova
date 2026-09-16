@@ -2,6 +2,16 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.16.0 (2026-09-17)
+
+### 调整
+
+- YouTube 解析已完整拆分到独立插件 [YouTube Nova](https://github.com/Whereis-Alice/astrbot_plugin_youtube_nova)。本插件不再识别 YouTube 链接，也不再加载 Innertube、yt-dlp、PO Token 或 Cookie 维护任务。
+- 删除 YouTube 配置、代理开关、专项解析器、运行时模块、提醒交互、文档和测试，避免同时安装两个插件时重复响应。
+- 旧配置中的 YouTube 卡片皮肤标识仍可被读取，但不再在配置面板中展示，仅用于平滑迁移历史配置。
+- 默认可发送视频体积预算调整为 48 MiB，适配 LLOneBot/QQ Highway 的常见上传边界。
+- 收窄运行数据忽略规则，避免误忽略 `nova_core/parser/runtime_manager/` 下的源码。
+
 ## v1.15.0 (2026-09-06)
 
 手工导出的 YouTube Cookie 常常撑不过几个小时，日志反复写「服务端判定未登录」。更麻烦的是这份死 Cookie 还会被原样塞给 yt-dlp——yt-dlp 一旦认定处于登录态就会摘掉所有不支持 Cookie 的客户端，本来靠匿名 + PO Token 能出流的视频也跟着一起失败。这一版把 Cookie 交给 Google 自己的续期机制养着，并把 yt-dlp 从「最后兜底」提升为一等取流器。

@@ -1,6 +1,6 @@
 # 平台专项说明
 
-各平台通用的输出模式、聚合、体积上限等设置见 [配置说明](configuration.md)。本文只收录需要额外配置或有平台特殊行为的部分。YouTube 单独成篇，见 [YouTube 说明](youtube.md)。
+各平台通用的输出模式、聚合、体积上限等设置见 [配置说明](configuration.md)。本文只收录需要额外配置或有平台特殊行为的部分。YouTube 已迁移到独立插件 [YouTube Nova](https://github.com/Whereis-Alice/astrbot_plugin_youtube_nova)。
 
 ## B 站
 

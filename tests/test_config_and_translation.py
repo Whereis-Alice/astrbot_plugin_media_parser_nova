@@ -57,7 +57,7 @@ class ConfigAndTranslationTests(unittest.TestCase):
         self.assertEqual(ConfigManager._parse_card_skin("未知皮肤"), CARD_SKIN_NOVA)
 
     def test_site_skins_and_auto_sentinel_are_parsed(self):
-        """X / YouTube 仿站皮肤与「跟随平台」哨兵都要能从配置里认出来。"""
+        """X、旧版 YouTube 皮肤和「跟随平台」哨兵保持可解析。"""
         self.assertEqual(ConfigManager._parse_card_skin("推特卡片"), CARD_SKIN_X)
         self.assertEqual(ConfigManager._parse_card_skin("X（推特）"), CARD_SKIN_X)
         self.assertEqual(ConfigManager._parse_card_skin("油管卡片"), CARD_SKIN_YOUTUBE)
@@ -67,109 +67,6 @@ class ConfigAndTranslationTests(unittest.TestCase):
                 self.assertEqual(ConfigManager._parse_card_skin(raw), CARD_SKIN_AUTO)
         for key in (CARD_SKIN_X, CARD_SKIN_YOUTUBE, CARD_SKIN_AUTO):
             self.assertIn(key, CARD_SKINS)
-
-    def test_youtube_stream_source_is_parsed(self):
-        config = ConfigManager({"youtube": {"stream_source": "仅 yt-dlp"}})
-        self.assertEqual(config.youtube.stream_source, "ytdlp_only")
-        self.assertEqual(ConfigManager({}).youtube.stream_source, "auto")
-
-    def test_stream_source_accepts_chinese_and_english_and_falls_back(self):
-        cases = {
-            "自动": "auto",
-            "auto": "auto",
-            "优先官方接口": "innertube",
-            " INNERTUBE ": "innertube",
-            "仅 yt-dlp": "ytdlp_only",
-            "仅yt-dlp": "ytdlp_only",
-            "ytdlp-only": "ytdlp_only",
-            "": "auto",
-            None: "auto",
-            "随便": "auto",
-        }
-        for raw, expected in cases.items():
-            with self.subTest(raw=raw):
-                self.assertEqual(
-                    ConfigManager._parse_stream_source(raw), expected
-                )
-    def test_youtube_pot_options_are_parsed(self):
-        config = ConfigManager(
-            {
-                "youtube": {
-                    "ytdlp_pot_provider": "  http://127.0.0.1:4416  ",
-                    "ytdlp_fetch_pot": "总是",
-                }
-            }
-        )
-        self.assertEqual(
-            config.youtube.ytdlp_pot_provider, "http://127.0.0.1:4416"
-        )
-        self.assertEqual(config.youtube.ytdlp_fetch_pot, "always")
-
-        default = ConfigManager({})
-        self.assertEqual(default.youtube.ytdlp_pot_provider, "")
-        self.assertEqual(default.youtube.ytdlp_fetch_pot, "auto")
-
-    def test_fetch_pot_accepts_chinese_and_english_and_falls_back(self):
-        cases = {
-            "自动": "auto",
-            "总是": "always",
-            "从不": "never",
-            " ALWAYS ": "always",
-            "never": "never",
-            "": "auto",
-            None: "auto",
-            "有时": "auto",
-        }
-        for raw, expected in cases.items():
-            with self.subTest(raw=raw):
-                self.assertEqual(
-                    ConfigManager._parse_fetch_pot(raw), expected
-                )
-
-    def test_youtube_cookie_alert_options_are_parsed(self):
-        config = ConfigManager(
-            {
-                "youtube": {
-                    "notify_admin_on_cookie_expired": False,
-                    "cookie_alert_cooldown_minutes": 30,
-                }
-            }
-        )
-        self.assertFalse(config.youtube.notify_admin_on_cookie_expired)
-        self.assertEqual(config.youtube.cookie_alert_cooldown_minutes, 30)
-
-        default = ConfigManager({})
-        self.assertTrue(default.youtube.notify_admin_on_cookie_expired)
-        self.assertEqual(default.youtube.cookie_alert_cooldown_minutes, 120)
-
-    def test_youtube_cookie_keepalive_options_are_parsed(self):
-        default = ConfigManager({})
-        self.assertTrue(default.youtube.cookie_auto_refresh)
-        self.assertEqual(default.youtube.cookie_keepalive_hours, 6)
-        # 没填 Cookie 时不需要运行时文件。
-        self.assertEqual(default.youtube.cookie_runtime_file, "")
-
-        disabled = ConfigManager(
-            {
-                "youtube": {
-                    "cookie_auto_refresh": False,
-                    "cookie_keepalive_hours": 0,
-                }
-            }
-        )
-        self.assertFalse(disabled.youtube.cookie_auto_refresh)
-        self.assertEqual(disabled.youtube.cookie_keepalive_hours, 0)
-        self.assertEqual(disabled.youtube.cookie_runtime_file, "")
-
-        clamped = ConfigManager(
-            {"youtube": {"cookie_keepalive_hours": 9999}}
-        )
-        self.assertEqual(clamped.youtube.cookie_keepalive_hours, 168)
-
-        invalid = ConfigManager(
-            {"youtube": {"cookie_keepalive_hours": "不是数字"}}
-        )
-        self.assertEqual(invalid.youtube.cookie_keepalive_hours, 6)
 
     def test_card_and_platform_hot_comment_options_are_parsed(self):
         config = ConfigManager(
