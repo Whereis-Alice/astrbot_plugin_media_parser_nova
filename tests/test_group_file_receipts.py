@@ -22,10 +22,12 @@ from nova_core.message_adapter.group_file import (
 from nova_core.message_adapter.sender import MessageSender
 
 
-def make_event(bot):
+def make_event(bot, *, private=False):
     return SimpleNamespace(
         bot=bot,
-        get_group_id=lambda: "123456",
+        get_group_id=lambda: "" if private else "123456",
+        is_private_chat=lambda: private,
+        get_sender_id=lambda: "456789",
         get_self_id=lambda: "987654",
         get_platform_name=lambda: "aiocqhttp",
         send=AsyncMock(),
@@ -40,7 +42,10 @@ def make_bot(api):
     return bot
 
 
-def test_late_websocket_receipt_obeys_upload_timeout_not_shared_timeout(tmp_path):
+@pytest.mark.parametrize("private", [False, True])
+def test_late_websocket_receipt_obeys_upload_timeout_not_shared_timeout(
+    tmp_path, private
+):
     async def run():
         sent = []
         loop = asyncio.get_running_loop()
@@ -62,7 +67,7 @@ def test_late_websocket_receipt_obeys_upload_timeout_not_shared_timeout(tmp_path
         ws = SimpleNamespace(send=send)
         original = WebSocketReverseApi({"987654": ws}, set(), 0.005)
         bot = make_bot(UnifiedApi(wsr_api=original))
-        event = make_event(bot)
+        event = make_event(bot, private=private)
         path = tmp_path / "video.mp4"
         path.write_bytes(b"video")
         uploader = GroupFileUploader(600)
@@ -76,7 +81,10 @@ def test_late_websocket_receipt_obeys_upload_timeout_not_shared_timeout(tmp_path
         result = await upload_task
         assert result["file_id"] == "uploaded"
         uploads = [
-            request for request in sent if request["action"] == "upload_group_file"
+            request
+            for request in sent
+            if request["action"]
+            == ("upload_private_file" if private else "upload_group_file")
         ]
         assert len(uploads) == 1
         assert uploads[0]["params"]["self_id"] == "987654"

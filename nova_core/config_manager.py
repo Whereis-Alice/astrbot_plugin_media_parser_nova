@@ -63,7 +63,7 @@ OVERSIZE_DELIVERY_COVER = "cover"
 OVERSIZE_DELIVERY_GROUP_FILE = "group_file"
 OVERSIZE_DELIVERY_LABELS = {
     OVERSIZE_DELIVERY_COVER: "仅发送信息与封面",
-    OVERSIZE_DELIVERY_GROUP_FILE: "上传为群文件",
+    OVERSIZE_DELIVERY_GROUP_FILE: "上传为文件（群聊/私聊）",
 }
 
 TRANSCODE_MODE_DISABLED = "disabled"
@@ -1584,6 +1584,8 @@ class ConfigManager:
     @staticmethod
     def _parse_oversize_delivery(value: Any) -> str:
         text = str(value or "").strip()
+        if text == "上传为群文件":  # 旧面板配置继续启用文件投递
+            return OVERSIZE_DELIVERY_GROUP_FILE
         lowered = text.lower()
         for key, label in OVERSIZE_DELIVERY_LABELS.items():
             if text == label or lowered == key:

@@ -6,11 +6,11 @@
 | --- | --- | --- |
 | YouTube 链接没有响应 | YouTube 已从本插件拆出 | 安装独立插件 [YouTube Nova](https://github.com/Whereis-Alice/astrbot_plugin_youtube_nova) |
 | Twitter/X 卡片没有热评和互动数字 | X 已不对未登录访问输出带回复数据的页面，属平台行为 | 配置一个 Nitter 实例，见 [Twitter/X → 热评与互动统计需要 Nitter](platforms.md#热评与互动统计需要-nitter) |
-| 只发了信息与封面，没有视频文件 | 视频超过普通发送上限，且当前策略选择封面回退或当前会话不支持群文件 | 检查 `oversize_delivery`、缓存目录和会话类型，见 [视频体积、压缩与群文件](configuration.md#视频体积压缩与群文件) |
+| 只发了信息与封面，没有视频文件 | 视频超过普通发送上限，且当前策略选择封面回退或当前会话不支持文件上传 | 检查 `oversize_delivery`、缓存目录和会话类型，见 [视频体积、压缩与群文件](configuration.md#视频体积压缩与群文件) |
 | 视频画质比原片明显下降，消息里写「视频已压缩」 | 独立压缩策略命中阈值，已按配置重编码 | 调高压缩阈值或目标体积，或把 `transcode_mode` 设为关闭 |
-| 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端普通富媒体通道拒收大文件 | 保持默认 48 MiB、调低 `send_video_max_mb`，或对 QQ 群启用群文件投递 |
-| 群文件上传失败 | 当前不是 aiocqhttp QQ 群聊、协议端未实现 `upload_group_file`或文件不可见 | 查看同条失败提示和后台 WARNING，确认缓存目录在协议端可访问并适当提高群文件上传超时 |
-| 群文件回执未确认，但稍后出现文件 | 等待上传响应超时或连接中断，协议端可能仍在上传 | 先查看群文件，避免重复解析；较慢出口可调高群文件上传超时，详细原因见后台日志 |
+| 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端普通富媒体通道拒收大文件 | 保持默认 48 MiB、调低 `send_video_max_mb`，或启用 QQ 群聊/私聊文件投递 |
+| 文件上传失败 | 当前不是 aiocqhttp QQ 会话、协议端未实现对应的 `upload_group_file` / `upload_private_file`、权限不足或文件不可见 | 查看同条失败提示和后台 WARNING，确认缓存目录在协议端可访问并适当提高文件上传超时 |
+| 文件回执未确认，但稍后出现文件 | 等待上传响应超时或连接中断，协议端可能仍在上传 | 先查看当前会话，避免重复解析；较慢出口可调高文件上传超时，详细原因见后台日志 |
 | 高画质视频没有声音，或合并失败 | DASH 音视频轨需要 `ffmpeg` 合并 | 安装 ffmpeg，见 [ffmpeg](configuration.md#ffmpeg) |
 | 图片发不出、B 站高画质拿不到 | 缺少可写缓存目录，无法带 Referer 下载 | 配置缓存目录，见 [缓存目录](configuration.md#缓存目录) |
 | B 站画质一直上不去 | 未配置 Cookie 或 Cookie 已失效 | 见 [平台专项 → B 站](platforms.md#b-站) |

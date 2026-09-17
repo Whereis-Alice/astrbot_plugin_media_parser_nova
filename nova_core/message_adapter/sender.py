@@ -144,7 +144,7 @@ class MessageSender:
         all_failed = succeeded <= 0 and not unconfirmed
         error_preview = "; ".join(str(error) for error in errors[:3])
         if not failures:
-            logger.info(f"{label}: {len(unconfirmed)} 项群文件回执未确认；{error_preview}")
+            logger.info(f"{label}: {len(unconfirmed)} 项文件回执未确认；{error_preview}")
         elif all_failed:
             logger.warning(
                 f"{label}全部发送失败: {len(failures)}/{expected} 项失败。"
@@ -172,7 +172,7 @@ class MessageSender:
         if unconfirmed:
             if notice:
                 notice += "\n"
-            notice += "群文件上传结果尚未确认，可能仍在上传或已发送，请稍后查看群文件，暂勿重复解析。"
+            notice += "文件上传结果尚未确认，可能仍在上传或已发送，请稍后查看当前会话，暂勿重复解析。"
         unique_urls: List[str] = []
         for raw in failed_urls or []:
             url = str(raw or "").strip()
@@ -254,7 +254,7 @@ class MessageSender:
                         if isinstance(size_mb, (int, float))
                         else ""
                     )
-                    logger.info(f"群文件上传完成: {file_name}{size_text}")
+                    logger.info(f"文件上传完成: {file_name}{size_text}")
                 except asyncio.CancelledError:
                     raise
                 except GroupFileUploadUnconfirmed as exc:
@@ -262,7 +262,7 @@ class MessageSender:
                     if source_url:
                         failed_urls.append(source_url)
                     logger.info(
-                        f"群文件上传回执未确认: {file_name}，不重试上传；"
+                        f"文件上传回执未确认: {file_name}，不重试上传；"
                         f"详情: {exc.__cause__ or exc}"
                     )
                 except Exception as exc:
@@ -270,7 +270,7 @@ class MessageSender:
                     errors.append(exc)
                     if source_url:
                         failed_urls.append(source_url)
-                    logger.warning(f"群文件上传失败: {file_name}, 错误: {exc}")
+                    logger.warning(f"文件上传失败: {file_name}, 错误: {exc}")
         return expected, succeeded, errors, failed_urls
 
     async def send_aggregated_results(

@@ -1,4 +1,4 @@
-"""OneBot QQ 群文件投递；与普通消息链发送保持隔离。"""
+"""OneBot QQ 文件投递：群文件与私聊文件共用回执等待和错误处理。"""
 
 import asyncio
 import os
@@ -14,7 +14,7 @@ _INVALID_FILE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
 class GroupFileUploadError(RuntimeError):
-    """群文件投递不可用或执行失败。"""
+    """文件投递不可用或执行失败（保留历史类名）。"""
 
 
 class GroupFileUploadUnconfirmed(GroupFileUploadError):
@@ -108,18 +108,33 @@ def build_group_file_name(
 
 
 class GroupFileUploader:
-    """通过 AstrBot 的 aiocqhttp 事件调用标准 OneBot v11 action。"""
+    """根据当前 QQ 会话选择文件上传 action；保留历史内部名称。"""
 
     def __init__(self, timeout_seconds: int = 600):
         self.timeout_seconds = max(30, min(3600, int(timeout_seconds or 600)))
 
     @staticmethod
-    def can_upload(event: AstrMessageEvent) -> bool:
+    def _target(event: AstrMessageEvent) -> tuple[str, dict, str] | None:
+        """只从当前事件取收件人，群消息不会因用户 ID 存在而转入私聊。"""
         try:
             group_id = str(event.get_group_id() or "").strip()
+            if group_id:
+                if not group_id.isdigit():
+                    return None
+                return "upload_group_file", {"group_id": int(group_id)}, "群文件"
+            if not event.is_private_chat():
+                return None
+            user_id = str(event.get_sender_id() or "").strip()
+            if user_id.isdigit():
+                return "upload_private_file", {"user_id": user_id}, "私聊文件"
         except Exception:
-            return False
-        if not group_id:
+            pass
+        return None
+
+    @classmethod
+    def can_upload(cls, event: AstrMessageEvent) -> bool:
+        target = cls._target(event)
+        if target is None:
             return False
 
         get_platform_name = getattr(event, "get_platform_name", None)
@@ -138,10 +153,12 @@ class GroupFileUploader:
         return bool(
             callable(getattr(bot, "call_action", None))
             or callable(getattr(api, "call_action", None))
-            or callable(getattr(bot, "upload_group_file", None))
+            or callable(getattr(bot, target[0], None))
         )
 
-    async def _call_action(self, event: AstrMessageEvent, payload: dict) -> Any:
+    async def _call_action(
+        self, event: AstrMessageEvent, action: str, payload: dict
+    ) -> Any:
         bot = getattr(event, "bot", None)
         api = _scoped_upload_api(bot, self.timeout_seconds)
         if api is not None:
@@ -149,20 +166,20 @@ class GroupFileUploader:
             self_id = str(get_self_id() or "") if callable(get_self_id) else ""
             if self_id:
                 payload = {**payload, "self_id": self_id}
-            return await api.call_action("upload_group_file", **payload)
+            return await api.call_action(action, **payload)
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
-            return await call_action("upload_group_file", **payload)
+            return await call_action(action, **payload)
 
         api = getattr(bot, "api", None)
         api_call_action = getattr(api, "call_action", None)
         if callable(api_call_action):
-            return await api_call_action("upload_group_file", **payload)
+            return await api_call_action(action, **payload)
 
-        upload = getattr(bot, "upload_group_file", None)
+        upload = getattr(bot, action, None)
         if callable(upload):
             return await upload(**payload)
-        raise GroupFileUploadError("当前 OneBot 客户端未暴露 upload_group_file")
+        raise GroupFileUploadError(f"当前 OneBot 客户端未暴露 {action}")
 
     async def upload(
         self,
@@ -171,24 +188,26 @@ class GroupFileUploader:
         file_name: str,
     ) -> Any:
         if not self.can_upload(event):
-            raise GroupFileUploadError("当前会话不是支持群文件上传的 QQ 群聊")
+            raise GroupFileUploadError("当前会话不支持 QQ 文件上传")
         path = os.path.abspath(str(file_path or ""))
         if not os.path.isfile(path):
             raise GroupFileUploadError("待上传的视频文件不存在")
 
-        raw_group_id = str(event.get_group_id() or "").strip()
-        group_id: Any = int(raw_group_id) if raw_group_id.isdigit() else raw_group_id
+        target = self._target(event)
+        if target is None:
+            raise GroupFileUploadError("无法确定文件接收会话")
+        action, recipient, label = target
         payload = {
-            "group_id": group_id,
+            **recipient,
             "file": path,
             "name": str(file_name or Path(path).name),
         }
         logger.info(
-            f"开始上传群文件: {payload['name']}，回执等待上限 {self.timeout_seconds} 秒"
+            f"开始上传{label}: {payload['name']}，回执等待上限 {self.timeout_seconds} 秒"
         )
         try:
             result = await asyncio.wait_for(
-                self._call_action(event, payload),
+                self._call_action(event, action, payload),
                 timeout=self.timeout_seconds,
             )
             # 某些适配器直接返回 OneBot 响应包装，不会抛 ActionFailed。
@@ -197,10 +216,10 @@ class GroupFileUploader:
                     detail = (
                         result.get("wording") or result.get("message") or "接口拒绝"
                     )
-                    raise GroupFileUploadError(f"群文件上传失败：{detail}")
+                    raise GroupFileUploadError(f"{label}上传失败：{detail}")
                 if result.get("status") == "async" or result.get("retcode") == 1:
                     raise GroupFileUploadUnconfirmed(
-                        "协议端已受理，尚未确认群文件上传完成"
+                        f"协议端已受理，尚未确认{label}上传完成"
                     )
             return result
         except asyncio.CancelledError:
@@ -210,6 +229,6 @@ class GroupFileUploader:
         except Exception as exc:
             if _receipt_is_uncertain(exc):
                 raise GroupFileUploadUnconfirmed(
-                    "群文件上传回执未确认，文件可能仍在上传或已发送，请稍后查看群文件"
+                    f"{label}上传回执未确认，文件可能仍在上传或已发送，请稍后查看当前会话"
                 ) from exc
-            raise GroupFileUploadError(f"群文件上传失败：{exc}") from exc
+            raise GroupFileUploadError(f"{label}上传失败：{exc}") from exc

@@ -728,18 +728,15 @@
         "type": "string",
         "options": [
           "仅发送信息与封面",
-          "上传为群文件"
+          "上传为文件（群聊/私聊）"
         ],
-        "hint": "视频在压缩策略执行后仍超过普通发送上限时如何处理。上传为群文件仅支持 QQ 群聊的 aiocqhttp / OneBot v11 适配器（NapCat、LLOneBot / LLBot、SnowLuma 等）；私聊和其他平台仍退回信息与封面。",
+        "hint": "视频在压缩策略执行后仍超限时，可改为文件发送：QQ 群聊上传群文件，QQ 私聊发送给当前用户。需要 aiocqhttp / OneBot v11 协议端支持对应文件接口；不支持或明确拒绝时提示原因并保留原链接。",
         "default": "仅发送信息与封面"
       },
       "group_file_timeout_seconds": {
-        "description": "群文件上传超时（秒）",
+        "description": "文件上传超时（秒）",
         "type": "int",
-        "hint": "单个群文件等待上传回执的最长时间，有效范围 30–3600；aiocqhttp 内层等待同步使用此值。超时只表示结果未确认，协议端可能仍在上传，请先查看群文件。",
-        "condition": {
-          "oversize_delivery": "上传为群文件"
-        },
+        "hint": "单个群聊或私聊文件等待上传回执的最长时间，有效范围 30–3600；aiocqhttp 内层等待同步使用此值。超时只表示结果未确认，协议端可能仍在上传，请先查看当前会话。",
         "default": 600
       },
       "transcode_oversize_video": {
