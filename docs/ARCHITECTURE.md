@@ -53,7 +53,7 @@ astrbot_plugin_media_parser_nova/
     ├── downloader/
     │   ├── manager.py               # DownloadManager，媒体模式决策与下载调度
     │   ├── router.py                # 下载路由：dash/m3u8/image/video/range
-    │   ├── transcode.py             # 超过可发送上限的视频 ffmpeg 重编码压缩
+    │   ├── transcode.py             # 独立可配置的 ffmpeg 视频重编码策略
     │   ├── utils.py                 # 缓存路径、扩展名、URL 前缀、Content-Type 工具
     │   ├── validator.py             # 媒体预检、大小探测、响应校验
     │   └── handler/
@@ -65,6 +65,7 @@ astrbot_plugin_media_parser_nova/
     │       ├── image.py             # 图片下载与可选 ffmpeg 转 PNG
     │       └── video_cover.py       # 视频仅封面模式的首帧截取
     ├── message_adapter/
+    │   ├── group_file.py            # OneBot v11 QQ 群文件上传
     │   ├── node_builder.py          # Plain/Image/Video 节点构建
     │   ├── sender.py                # 聚合/独立/文件发送
     │   └── archive_builder.py       # 解析结果 ZIP 归档
@@ -242,7 +243,7 @@ video_count .. video_count + image_count   图片
 - 缓存不可用的普通视频：通过大小与可访问性预检后 `direct`。
 - 必须 `local` 但缓存不可用：`skip`。
 - 普通视频会先走 `get_video_size()`，必要时再 `validate_media_url()`；超过 `download.max_video_size_mb` 或 403 会记录跳过原因。
-- 体积超过 `download.send_video_max_mb` 时的处理取决于 `download.transcode_oversize_video`：关闭时按超限直接 `skip`；开启时下载阶段只用硬上限 `max_video_size_mb` 判定（`video_download_cap_mb`），下载完成后交给压缩流程。
+- 压缩或群文件策略可处理发送超限时，下载阶段只按硬上限 `download.max_video_size_mb` 止损；最终体积超过 `download.send_video_max_mb` 时，根据当前会话能力进入 `group_file` 或 `skip`。
 
 每个图片独立决策：
 
@@ -260,13 +261,13 @@ video_count .. video_count + image_count   图片
 - `image`：进入图片处理器；非 jpg/jpeg/png 会尝试 ffmpeg 转 PNG。
 - 其他：普通视频流式下载。
 
-超限压缩由 `transcode.py` 承担，在 `process_metadata()` 回填下载结果时按视频顺序串行触发（`_fit_video_to_send_limit()`）：
+独立压缩策略由 `transcode.py` 承担，在 `process_metadata()` 回填下载结果时按视频顺序串行触发（`_fit_video_to_send_limit()`）：
 
 1. `probe_video()` 用 `ffprobe` 读时长/分辨率/帧率/音轨，JSON 失败时回退 `ffmpeg -i` 的正则兜底。
-2. `plan_transcode()` 由目标字节数与时长反推总码率（留 6% 封装余量），先按阶梯定音频码率（128/96/64 kbps，无音轨为 0），再由剩余视频码率查分辨率阶梯；判档用**短边**，竖屏不会被误判成更高清晰度。视频码率低于 120 kbps 时拒绝压缩并返回「视频太长」原因。
-3. `transcode_video_to_size()` 最多两轮 libx264 + AAC 重编码，先写 `.part.mp4` 再原子替换到源文件同目录的 `{原名}_fit.mp4`；第一轮实际体积超出目标时按比例收紧预算再压一轮。缺少 ffmpeg、超时或两轮都压不进上限时返回错误原因，不抛异常。
+2. `plan_transcode()` 接收目标字节数与 `TranscodeOptions`。自动码率模式按时长反推预算并保留 6% 封装余量，也可使用固定码率或 CRF；编码器、preset、最大短边、最大帧率和音频码率均可配置。
+3. `transcode_video_to_size()` 在自动码率模式下最多尝试三轮，固定码率或 CRF 只执行一轮。产物先写 `.part.mp4` 再原子替换到 `{原名}_fit.mp4`；缺少 ffmpeg、超时或压不进目标体积时返回错误原因，不抛异常。
 
-压缩成功后 `file_paths`/`video_sizes` 换成压缩产物并清掉原文件，压缩说明写入 `metadata["video_transcode_notes"]`，由 `node_builder.py` 追加到文本节点；失败或压缩后仍超限则清空该条说明并按原有逻辑降级为「信息 + 封面」。
+压缩成功后 `file_paths`/`video_sizes` 换成压缩产物并清掉原文件，压缩说明写入 `metadata["video_transcode_notes"]`。压缩失败时保留原文件；若当前 aiocqhttp QQ 群支持 `upload_group_file` 且配置允许，视频模式改为 `group_file`，否则清理文件并降级为「信息 + 封面」。`node_builder.py` 只记录群文件描述，不构造 `Video` 节点；`sender.py` 在普通消息链完成后单独等待上传 action。
 
 `validator.py` 负责 HEAD/Range GET 预检、大小提取、Content-Type 检查、HTML/JSON/文本错误响应识别和 403 状态传递。`security.py` 统一负责公网地址限制、逐跳重定向、DNS/peer 校验和跨源凭据剥离；`budget.py` 为普通视频、图片、DASH、HLS 和封面截取提供流式硬字节预算。所有文件先写 `.part` 再原子替换，取消或失败不会留下伪成功文件。HLS 会选择最高分辨率/带宽变体并限制清单、初始化片和分片总量；`EXT-X-BYTERANGE` 当前明确拒绝。
 
@@ -652,6 +653,6 @@ metadata.proxy_url > ConfigManager.proxy.address
 - 解析阶段：`SkipParse` 跳过；普通异常生成 error metadata；`CancelledError` 继续抛出。
 - Pixiv Ajax 返回 HTML 时会在 HTTP 状态抛错前识别 Cloudflare 防护页，避免把拦截页当作 JSON 处理。
 - 下载阶段：单个候选失败会尝试下一个候选；媒体项全部失败写入 skip reason；本条 metadata 全部媒体失败时清理对应缓存子目录。
-- 大小限制：普通视频下载前预检，DASH/M3U8/强制缓存视频下载后再兜底检查，超限会删除文件并置为 `skip`。
-- 发送阶段：独立节点采用 best-effort；部分失败只记录后台日志，不再向 QQ 会话追加提示。预期节点全部发送失败时抛出聚合错误，不再记录虚假的“发送完成”。主发送异常始终进入 finally 清理。
+- 大小限制：普通视频下载前预检，DASH/M3U8/强制缓存视频下载后再兜底检查；硬上限始终删除，普通发送超限则按配置进入群文件或封面回退。
+- 发送阶段：独立节点与群文件均采用 best-effort；部分或全部上传失败时会向会话补充简短原因与原始链接。群文件 action 完整返回后主流程才进入 finally 清理。
 - 外部子进程：DASH/M3U8/图片转换涉及 ffmpeg，TikTok 涉及系统 curl；超时或取消路径会终止并回收子进程。

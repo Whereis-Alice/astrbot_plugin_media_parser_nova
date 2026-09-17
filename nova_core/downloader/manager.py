@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import re
+import shlex
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -15,12 +16,11 @@ from ..constants import Config
 from ..logger import logger
 from ..storage import cleanup_directory, cleanup_file
 from .fileio import gather_cancel_on_error, run_blocking
+from .handler.video_cover import extract_video_cover_to_cache
 from .router import download_media
-from .transcode import transcode_video_to_size
+from .transcode import TranscodeOptions, transcode_video_to_size
 from .utils import check_cache_dir_available, strip_media_prefixes
 from .validator import get_video_size, validate_media_url
-from .handler.video_cover import extract_video_cover_to_cache
-
 
 # 仅在出现 status/http/code 等上下文关键字时才认定为 HTTP 状态码，避免把
 # "120.5MB" 之类的数字误判成状态码。
@@ -44,7 +44,20 @@ class DownloadManager:
         cache_dir_available: Optional[bool] = None,
         max_concurrent_downloads: int = None,
         video_cover_only: bool = False,
+        oversize_delivery: str = "cover",
         transcode_oversize_video: bool = False,
+        transcode_mode: str = "above_size",
+        transcode_trigger_mb: float = 0.0,
+        transcode_target_size_mb: float = 0.0,
+        transcode_video_codec: str = "libx264",
+        transcode_preset: str = "veryfast",
+        transcode_max_height: int = 0,
+        transcode_max_fps: float = 0.0,
+        transcode_video_bitrate_kbps: int = 0,
+        transcode_audio_bitrate_kbps: int = 0,
+        transcode_crf: int = 0,
+        transcode_max_attempts: int = 2,
+        transcode_extra_args: str = "",
         transcode_timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
     ):
         self.max_video_size_mb = self._normalize_size_cap(max_video_size_mb)
@@ -69,7 +82,35 @@ class DownloadManager:
             concurrency = Config.DOWNLOAD_MANAGER_MAX_CONCURRENT
         self._download_semaphore = asyncio.Semaphore(concurrency)
         self.video_cover_only = bool(video_cover_only)
+        self.oversize_delivery = (
+            "group_file" if str(oversize_delivery) == "group_file" else "cover"
+        )
         self.transcode_oversize_video = bool(transcode_oversize_video)
+        self.transcode_mode = (
+            str(transcode_mode)
+            if str(transcode_mode) in {"disabled", "above_size", "always"}
+            else "above_size"
+        )
+        self.transcode_trigger_mb = self._normalize_size_cap(transcode_trigger_mb)
+        self.transcode_target_size_mb = self._normalize_size_cap(
+            transcode_target_size_mb
+        )
+        try:
+            extra_args = tuple(shlex.split(str(transcode_extra_args or "")))
+        except ValueError as exc:
+            logger.warning(f"自定义 ffmpeg 参数无法解析，已忽略: {exc}")
+            extra_args = ()
+        self.transcode_options = TranscodeOptions(
+            video_codec=str(transcode_video_codec or "libx264"),
+            preset=str(transcode_preset or "veryfast"),
+            max_height=max(0, int(transcode_max_height or 0)),
+            max_fps=max(0.0, float(transcode_max_fps or 0.0)),
+            video_bitrate_kbps=max(0, int(transcode_video_bitrate_kbps or 0)),
+            audio_bitrate_kbps=max(0, int(transcode_audio_bitrate_kbps or 0)),
+            crf=max(0, min(51, int(transcode_crf or 0))),
+            max_attempts=max(1, min(3, int(transcode_max_attempts or 2))),
+            extra_args=extra_args,
+        )
         self.transcode_timeout_seconds = self._normalize_transcode_timeout(
             transcode_timeout_seconds
         )
@@ -139,28 +180,77 @@ class DownloadManager:
 
     @property
     def transcode_enabled(self) -> bool:
-        """是否可以把超过可发送上限的视频压缩后再发送。"""
-        return (
-            self.transcode_oversize_video
-            and self.send_video_max_mb > 0
+        """视频压缩策略是否具备执行条件。"""
+        if (
+            not self.transcode_oversize_video
+            or not self.cache_dir_available
+            or self.transcode_mode == "disabled"
+        ):
+            return False
+        if self.transcode_mode == "always":
+            return True
+        return self.effective_transcode_trigger_mb > 0
+
+    @property
+    def group_file_enabled(self) -> bool:
+        return self.oversize_delivery == "group_file"
+
+    @property
+    def effective_transcode_trigger_mb(self) -> float:
+        return self.transcode_trigger_mb or self.send_video_max_mb
+
+    def _should_transcode(self, size_mb: Optional[float]) -> bool:
+        if not self.transcode_enabled or size_mb is None:
+            return False
+        if self.transcode_mode == "always":
+            return True
+        threshold = self.effective_transcode_trigger_mb
+        return threshold > 0 and size_mb > threshold
+
+    def _transcode_target_mb(self, source_size_mb: float) -> float:
+        configured = self.transcode_target_size_mb or self.send_video_max_mb
+        # “始终压缩”遇到小于目标值的源文件时，也必须得到真正更小的预算。
+        shrink_target = max(0.1, source_size_mb * 0.90)
+        return min(configured, shrink_target) if configured > 0 else shrink_target
+
+    def _send_limit_can_recover(
+        self,
+        limit_kind: str,
+        size_mb: Optional[float],
+        *,
+        allow_group_file: bool = False,
+    ) -> bool:
+        if limit_kind != "send":
+            return False
+        return self._should_transcode(size_mb) or (
+            self.group_file_enabled
+            and allow_group_file
             and self.cache_dir_available
         )
 
     @property
     def video_download_cap_mb(self) -> float:
-        """下载阶段的体积上限。开启压缩后只受管理员上限约束。"""
-        if self.transcode_enabled:
+        """兼容属性：启用任一种后处理时，下载只受管理员硬上限约束。"""
+        if self.transcode_enabled or self.group_file_enabled:
             return self.max_video_size_mb
         return self.effective_video_cap_mb
 
-    def _send_limit_can_transcode(self, limit_kind: str) -> bool:
-        """命中可发送上限且能压缩时，先放行下载，压完再判断能不能发。"""
-        return limit_kind == "send" and self.transcode_enabled
+    def _send_limit_can_transcode(
+        self, limit_kind: str, size_mb: Optional[float] = None
+    ) -> bool:
+        """旧内部入口：仅判断压缩是否能处理本次发送超限。"""
+        if limit_kind != "send" or not self.transcode_enabled:
+            return False
+        return size_mb is None or self._should_transcode(size_mb)
 
     @property
     def _send_cap_is_effective(self) -> bool:
         """生效上限是否来自可发送上限（用于改写下载器抛出的硬限制文案）。"""
-        if self.send_video_max_mb <= 0 or self.transcode_enabled:
+        if (
+            self.send_video_max_mb <= 0
+            or self.transcode_enabled
+            or self.group_file_enabled
+        ):
             return False
         return (
             self.max_video_size_mb <= 0
@@ -275,6 +365,8 @@ class DownloadManager:
         metadata: Dict[str, Any],
         video_urls: List[List[str]],
         image_urls: List[List[str]],
+        *,
+        allow_group_file: bool = False,
     ) -> Dict[int, Tuple[str, float, float]]:
         """按解析器给出的体积预估提前拦下必然超限的视频。
 
@@ -301,7 +393,11 @@ class DownloadManager:
             if not math.isfinite(size_mb) or size_mb <= 0:
                 continue
             limit_kind, cap_mb = self._video_size_limit(size_mb)
-            if limit_kind and not self._send_limit_can_transcode(limit_kind):
+            if limit_kind and not self._send_limit_can_recover(
+                limit_kind,
+                size_mb,
+                allow_group_file=allow_group_file,
+            ):
                 limited[idx] = (limit_kind, size_mb, cap_mb)
 
         if not limited:
@@ -436,6 +532,7 @@ class DownloadManager:
         metadata: Dict[str, Any],
         proxy_addr: str = None,
         require_accessible_for_direct: bool = False,
+        allow_group_file: bool = False,
     ) -> Tuple[Optional[float], Optional[int], Optional[str], bool, str]:
         """预检普通视频大小与可访问性。
 
@@ -470,7 +567,11 @@ class DownloadManager:
                 continue
             if size_mb is not None:
                 limit_kind, cap_mb = self._video_size_limit(size_mb)
-                if limit_kind and not self._send_limit_can_transcode(limit_kind):
+                if limit_kind and not self._send_limit_can_recover(
+                    limit_kind,
+                    size_mb,
+                    allow_group_file=allow_group_file,
+                ):
                     size_limit_value = size_mb
                     size_limit_kind = limit_kind
                     size_limit_reason = self._video_size_limit_reason(
@@ -594,8 +695,8 @@ class DownloadManager:
                             headers=headers,
                             proxy=proxy,
                             max_bytes=(
-                                int(self.video_download_cap_mb * 1024 * 1024)
-                                if kind != "image" and self.video_download_cap_mb > 0
+                                item.get("max_bytes")
+                                if kind != "image"
                                 else None
                             ),
                         )
@@ -688,6 +789,7 @@ class DownloadManager:
                 file_path,
                 target_bytes,
                 timeout_seconds=self.transcode_timeout_seconds,
+                options=self.transcode_options,
             )
         except asyncio.CancelledError:
             raise
@@ -698,7 +800,7 @@ class DownloadManager:
         if not result.file_path or result.size_mb is None:
             error = result.error or "压缩失败"
             logger.warning(
-                f"视频压缩未成功（{size_mb:.1f}MB > {cap_mb:.1f}MB）: {error}"
+                f"视频压缩未成功（源 {size_mb:.1f}MB，目标 {cap_mb:.1f}MB）: {error}"
             )
             return {"error": error}
 
@@ -719,6 +821,7 @@ class DownloadManager:
         on_sendable_media: Optional[Callable[[], Awaitable[None]]] = None,
         *,
         video_cover_only: Optional[bool] = None,
+        group_file_available: bool = False,
     ) -> Dict[str, Any]:
         """处理元数据，回填媒体模式、本地文件、大小和跳过原因。"""
         if self._shutting_down or not metadata:
@@ -734,7 +837,10 @@ class DownloadManager:
             enabled=video_cover_only,
         )
         size_limited_videos = self._plan_size_limited_videos(
-            metadata, video_urls, image_urls
+            metadata,
+            video_urls,
+            image_urls,
+            allow_group_file=group_file_available,
         )
         metadata["video_urls"] = video_urls
         metadata["image_urls"] = image_urls
@@ -751,6 +857,7 @@ class DownloadManager:
         image_modes: List[str] = ["skip"] * image_count
         video_skip_reasons: List[Optional[str]] = [None] * video_count
         video_transcode_notes: List[Optional[str]] = [None] * video_count
+        video_transcode_warnings: List[Optional[str]] = [None] * video_count
         image_skip_reasons: List[Optional[str]] = [None] * image_count
         image_warnings: List[Optional[str]] = [None] * image_count
         has_access_denied = False
@@ -842,6 +949,7 @@ class DownloadManager:
                         require_accessible_for_direct=(
                             video_plans[idx]["mode"] == "direct"
                         ),
+                        allow_group_file=group_file_available,
                     )
                     for idx in precheck_indexes
                 )
@@ -886,6 +994,24 @@ class DownloadManager:
                         "media_id": media_id,
                         "headers": metadata.get("video_headers", {}),
                         "proxy": self._proxy_for(metadata, "video", proxy_addr),
+                        "max_bytes": (
+                            int(self.max_video_size_mb * 1024 * 1024)
+                            if (
+                                self.max_video_size_mb > 0
+                                and (
+                                    self.transcode_enabled
+                                    or (
+                                        self.group_file_enabled
+                                        and group_file_available
+                                    )
+                                )
+                            )
+                            else (
+                                int(self.effective_video_cap_mb * 1024 * 1024)
+                                if self.effective_video_cap_mb > 0
+                                else None
+                            )
+                        ),
                     }
                 )
 
@@ -985,16 +1111,31 @@ class DownloadManager:
                     video_status_codes[idx] = status_code
                 if size_mb is not None:
                     video_sizes[idx] = size_mb
+                transcode_error: Optional[str] = None
                 limit_kind, cap_mb = (
                     self._video_size_limit(size_mb)
                     if size_mb is not None
                     else ("", 0.0)
                 )
-                transcode_error: Optional[str] = None
-                if self._send_limit_can_transcode(limit_kind):
-                    # 体积超出平台能收下的范围，但可以先压缩再发。
+                if limit_kind == "max":
+                    cleanup_file(file_path)
+                    file_paths[position] = None
+                    video_modes[idx] = "skip"
+                    video_skip_reasons[idx] = self._video_size_limit_reason(
+                        limit_kind,
+                        size_mb,
+                        cap_mb,
+                        downloaded=True,
+                    )
+                    size_exceeded = True
+                    continue
+
+                if self._should_transcode(size_mb):
+                    target_mb = self._transcode_target_mb(size_mb)
                     fitted = await self._fit_video_to_send_limit(
-                        file_path, size_mb, cap_mb
+                        file_path,
+                        size_mb,
+                        target_mb,
                     )
                     if fitted.get("file_path"):
                         cleanup_file(file_path)
@@ -1005,25 +1146,49 @@ class DownloadManager:
                         limit_kind, cap_mb = self._video_size_limit(size_mb)
                     else:
                         transcode_error = fitted.get("error")
+                        video_transcode_warnings[idx] = (
+                            f"压缩未完成，已保留原视频：{transcode_error or '未知错误'}"
+                        )
                 if limit_kind:
-                    cleanup_file(file_path)
-                    file_paths[position] = None
-                    video_modes[idx] = "skip"
-                    # 视频最终没发出去，"已压缩"的提示只会让人困惑。
-                    video_transcode_notes[idx] = None
-                    video_skip_reasons[idx] = self._video_size_limit_reason(
-                        limit_kind,
-                        size_mb,
-                        cap_mb,
-                        downloaded=True,
-                        transcode_error=transcode_error,
-                    )
                     if limit_kind == "send":
                         send_limit_exceeded = True
                         send_limit_size_mb = size_mb
+                        if (
+                            self.group_file_enabled
+                            and group_file_available
+                            and self.cache_dir_available
+                        ):
+                            video_modes[idx] = "group_file"
+                        else:
+                            cleanup_file(file_path)
+                            file_paths[position] = None
+                            video_modes[idx] = "skip"
+                            # 视频最终没发出去，"已压缩"的提示只会让人困惑。
+                            video_transcode_notes[idx] = None
+                            video_transcode_warnings[idx] = None
+                            video_skip_reasons[idx] = self._video_size_limit_reason(
+                                limit_kind,
+                                size_mb,
+                                cap_mb,
+                                downloaded=True,
+                                transcode_error=transcode_error,
+                            )
+                            continue
                     else:
+                        cleanup_file(file_path)
+                        file_paths[position] = None
+                        video_modes[idx] = "skip"
+                        video_transcode_notes[idx] = None
+                        video_transcode_warnings[idx] = None
+                        video_skip_reasons[idx] = self._video_size_limit_reason(
+                            limit_kind,
+                            size_mb,
+                            cap_mb,
+                            downloaded=True,
+                            transcode_error=transcode_error,
+                        )
                         size_exceeded = True
-                    continue
+                        continue
             else:
                 idx = position - video_count
                 if status_code is not None:
@@ -1033,7 +1198,7 @@ class DownloadManager:
             file_paths[position] = file_path
 
         valid_video_count = sum(
-            1 for mode in video_modes if mode in ("local", "direct")
+            1 for mode in video_modes if mode in ("local", "direct", "group_file")
         )
         valid_image_count = sum(
             1 for mode in image_modes if mode in ("local", "direct")
@@ -1054,6 +1219,7 @@ class DownloadManager:
         metadata["image_modes"] = image_modes
         metadata["video_skip_reasons"] = video_skip_reasons
         metadata["video_transcode_notes"] = video_transcode_notes
+        metadata["video_transcode_warnings"] = video_transcode_warnings
         metadata["image_skip_reasons"] = image_skip_reasons
         metadata["image_warnings"] = image_warnings
         metadata["media_cache_dir_available"] = self.cache_dir_available
@@ -1063,7 +1229,9 @@ class DownloadManager:
         metadata["image_count"] = image_count
         metadata["has_valid_media"] = has_valid_media
         metadata["use_local_files"] = any(
-            mode == "local" and idx < len(file_paths) and file_paths[idx]
+            mode in ("local", "group_file")
+            and idx < len(file_paths)
+            and file_paths[idx]
             for idx, mode in enumerate(video_modes)
         ) or any(
             mode == "local"

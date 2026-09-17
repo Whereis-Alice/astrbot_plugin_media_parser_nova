@@ -8,6 +8,7 @@ from nova_core.constants import Config
 from nova_core.downloader import transcode as transcode_mod
 from nova_core.downloader.manager import DownloadManager
 from nova_core.downloader.transcode import (
+    TranscodeOptions,
     TranscodePlan,
     TranscodeResult,
     VideoProbe,
@@ -263,6 +264,54 @@ class FfmpegArgumentTests(unittest.TestCase):
         self.assertIn("+faststart", args)
         self.assertIn("libx264", args)
 
+    def test_custom_codec_limits_and_extra_args_reach_ffmpeg(self):
+        plan, reject = plan_transcode(
+            VideoProbe(
+                duration=60.0,
+                width=1920,
+                height=1080,
+                fps=60.0,
+                has_audio=True,
+            ),
+            100 * MB,
+            options=TranscodeOptions(
+                video_codec="libx265",
+                preset="medium",
+                max_height=720,
+                max_fps=24,
+                video_bitrate_kbps=1800,
+                audio_bitrate_kbps=96,
+                extra_args=("-threads", "2"),
+            ),
+        )
+        self.assertEqual(reject, "")
+        self.assertEqual(plan.height, 720)
+        self.assertEqual(plan.fps_cap, 24)
+        self.assertEqual(plan.video_kbps, 1800)
+        self.assertEqual(plan.audio_kbps, 96)
+        args = self._args(plan, VideoProbe(duration=60.0, fps=60.0))
+        self.assertIn("libx265", args)
+        self.assertIn("medium", args)
+        self.assertEqual(args[-3:-1], ["-threads", "2"])
+
+    def test_crf_replaces_bitrate_control(self):
+        plan, reject = plan_transcode(
+            VideoProbe(
+                duration=60.0,
+                width=1280,
+                height=720,
+                fps=30.0,
+                has_audio=True,
+            ),
+            100 * MB,
+            options=TranscodeOptions(crf=23),
+        )
+        self.assertEqual(reject, "")
+        args = self._args(plan, VideoProbe(duration=60.0, fps=30.0))
+        self.assertIn("-crf", args)
+        self.assertIn("23", args)
+        self.assertNotIn("-b:v", args)
+
 
 class DescribeNoteTests(unittest.TestCase):
     """给用户看的一行压缩说明。"""
@@ -422,10 +471,17 @@ class ProcessMetadataTranscodeTests(unittest.TestCase):
                     )
                 return results
 
-            async def fake_transcode(path, target_bytes, *, timeout_seconds):
+            async def fake_transcode(
+                path,
+                target_bytes,
+                *,
+                timeout_seconds,
+                options=None,
+            ):
                 seen["path"] = path
                 seen["target_bytes"] = target_bytes
                 seen["timeout_seconds"] = timeout_seconds
+                seen["options"] = options
                 return transcode_result
 
             manager._download_local_items = fake_download
@@ -499,11 +555,95 @@ class ProcessMetadataTranscodeTests(unittest.TestCase):
         self.assertTrue(result["send_limit_exceeded"])
         self.assertEqual(result["video_transcode_notes"], [None])
 
+    def test_failed_compression_keeps_original_for_group_file(self):
+        result, seen = self._run(
+            TranscodeResult(error="编码器不可用"),
+            oversize_delivery="group_file",
+        )
+
+        self.assertTrue(seen)
+        self.assertEqual(result["video_modes"], ["skip"])
+
+        # 未声明当前会话支持群文件时仍维持封面回退；显式支持后才保留原文件。
+        with tempfile.TemporaryDirectory() as cache_dir:
+            manager = DownloadManager(
+                max_video_size_mb=1000,
+                send_video_max_mb=100,
+                cache_dir=cache_dir,
+                cache_dir_available=True,
+                oversize_delivery="group_file",
+                transcode_oversize_video=True,
+            )
+            original = os.path.join(cache_dir, "original.mp4")
+            with open(original, "wb") as handle:
+                handle.write(b"video")
+
+            async def fake_download(**kwargs):
+                return [
+                    {
+                        "kind": "video",
+                        "position": 0,
+                        "success": True,
+                        "file_path": original,
+                        "size_mb": 129.0,
+                    }
+                ]
+
+            manager._download_local_items = fake_download
+            with mock.patch(
+                "nova_core.downloader.manager.transcode_video_to_size",
+                return_value=TranscodeResult(error="编码器不可用"),
+            ):
+                group_result = asyncio.run(
+                    manager.process_metadata(
+                        session=None,
+                        metadata={
+                            "url": "https://youtu.be/example",
+                            "platform": "youtube",
+                            "video_urls": [["dash:https://v||https://a"]],
+                            "image_urls": [],
+                        },
+                        group_file_available=True,
+                    )
+                )
+
+            self.assertEqual(group_result["video_modes"], ["group_file"])
+            self.assertEqual(group_result["file_paths"], [original])
+            self.assertTrue(os.path.isfile(original))
+            self.assertIn("编码器不可用", group_result["video_transcode_warnings"][0])
+
     def test_video_within_cap_is_never_transcoded(self):
         result, seen = self._run(TranscodeResult(error="不该被调用"), downloaded_mb=42.0)
         self.assertEqual(result["video_modes"], ["local"])
         self.assertEqual(seen, {})
         self.assertEqual(result["video_transcode_notes"], [None])
+
+    def test_always_mode_transcodes_even_within_send_cap(self):
+        result, seen = self._run(
+            TranscodeResult(
+                file_path="C:/tmp/clip_fit.mp4",
+                size_mb=30.0,
+                note="42.0MB → 30.0MB（保持 720p）",
+            ),
+            downloaded_mb=42.0,
+            transcode_mode="always",
+        )
+        self.assertEqual(result["video_modes"], ["local"])
+        self.assertEqual(seen["target_bytes"], int(37.8 * MB))
+
+    def test_custom_trigger_is_independent_from_send_cap(self):
+        result, seen = self._run(
+            TranscodeResult(
+                file_path="C:/tmp/clip_fit.mp4",
+                size_mb=60.0,
+                note="80.0MB → 60.0MB（保持 720p）",
+            ),
+            downloaded_mb=80.0,
+            transcode_trigger_mb=60,
+            transcode_target_size_mb=70,
+        )
+        self.assertEqual(result["video_modes"], ["local"])
+        self.assertEqual(seen["target_bytes"], int(70 * MB))
 
     def test_switch_off_keeps_the_old_skip_behaviour(self):
         result, seen = self._run(

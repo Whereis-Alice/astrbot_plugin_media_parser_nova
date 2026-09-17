@@ -720,14 +720,153 @@
       "send_video_max_mb": {
         "description": "可发送视频体积上限（MB）",
         "type": "float",
-        "hint": "发送前的视频体积预算，单位 MiB。默认 48 为 LLOneBot/QQ Highway 的保守安全值；返回 102902 时通常表示超过当前上传边界。填 0 不限制，超限时按下面开关压缩。",
+        "hint": "普通视频消息的体积边界，单位 MiB。默认 48 为 LLOneBot/QQ Highway 的保守安全值；返回 102902 时通常表示超过当前上传边界。填 0 不限制。压缩策略与超限投递方式分别由下面的配置控制。",
         "default": 48
       },
+      "oversize_delivery": {
+        "description": "超限视频投递方式",
+        "type": "string",
+        "options": [
+          "仅发送信息与封面",
+          "上传为群文件"
+        ],
+        "hint": "视频在压缩策略执行后仍超过普通发送上限时如何处理。上传为群文件仅支持 QQ 群聊的 aiocqhttp / OneBot v11 适配器（NapCat、LLOneBot / LLBot、SnowLuma 等）；私聊和其他平台仍退回信息与封面。",
+        "default": "仅发送信息与封面"
+      },
+      "group_file_timeout_seconds": {
+        "description": "群文件上传超时（秒）",
+        "type": "int",
+        "hint": "单个群文件等待 OneBot 协议端完成上传的最长时间，有效范围 30–3600。",
+        "condition": {
+          "oversize_delivery": "上传为群文件"
+        },
+        "default": 600
+      },
       "transcode_oversize_video": {
-        "description": "超限视频自动压缩",
+        "description": "启用视频压缩",
         "type": "bool",
-        "hint": "视频超过可发送上限时，先用 ffmpeg 按目标体积重新编码（必要时降分辨率和帧率）再发送。需要宿主装有 ffmpeg，压缩期间占用 CPU；压缩失败或视频太长压不出可看画质时，自动退回只发信息与封面。",
+        "hint": "独立的视频重编码策略。需要宿主安装 ffmpeg，压缩期间会占用 CPU；关闭后不会因为普通发送上限而隐式压缩。",
         "default": true
+      },
+      "transcode_mode": {
+        "description": "压缩触发方式",
+        "type": "string",
+        "options": [
+          "关闭",
+          "超过指定体积",
+          "始终压缩"
+        ],
+        "hint": "超过指定体积只处理命中压缩阈值的视频；始终压缩会重编码每个下载到本地的视频。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": "超过指定体积"
+      },
+      "transcode_trigger_mb": {
+        "description": "压缩触发阈值（MB）",
+        "type": "float",
+        "hint": "仅“超过指定体积”模式使用。填 0 时跟随“可发送视频体积上限”；两者都为 0 时该模式不触发。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_target_size_mb": {
+        "description": "压缩目标体积（MB）",
+        "type": "float",
+        "hint": "压缩产物的最大目标体积。填 0 时优先跟随普通发送上限；普通发送也不限制时，按源文件的 90% 作为目标。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_video_codec": {
+        "description": "视频编码器",
+        "type": "string",
+        "options": [
+          "libx264",
+          "libx265",
+          "libsvtav1",
+          "h264_nvenc",
+          "hevc_nvenc"
+        ],
+        "hint": "兼容性优先选 libx264；硬件编码器要求 ffmpeg 和宿主显卡环境支持。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": "libx264"
+      },
+      "transcode_preset": {
+        "description": "编码预设",
+        "type": "string",
+        "hint": "直接传给 ffmpeg 编码器的 preset。libx264 默认 veryfast；不同编码器支持的值不同。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": "veryfast"
+      },
+      "transcode_max_height": {
+        "description": "最大短边分辨率",
+        "type": "int",
+        "hint": "0 为按目标体积自动判断；例如 720 会把横屏限制到 720p、竖屏限制到 720 像素宽。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_max_fps": {
+        "description": "最大帧率",
+        "type": "float",
+        "hint": "0 为自动；设置后仅限制高于该值的源视频。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_video_bitrate_kbps": {
+        "description": "固定视频码率（kbps）",
+        "type": "int",
+        "hint": "0 为按目标体积自动计算。填写固定码率后只编码一轮，产物仍必须满足目标体积。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_audio_bitrate_kbps": {
+        "description": "音频码率（kbps）",
+        "type": "int",
+        "hint": "0 为按目标体积自动选择 64/96/128 kbps；无音轨的视频不会创建音轨。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_crf": {
+        "description": "CRF 恒定质量值",
+        "type": "int",
+        "hint": "0 为关闭并使用目标体积码率；1–51 会改用 CRF 且只编码一轮，数值越小画质越高、体积越大。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_max_attempts": {
+        "description": "目标体积尝试次数",
+        "type": "int",
+        "hint": "自动码率模式下产物超限时最多重新收紧几轮，有效范围 1–3。固定码率或 CRF 模式始终只编码一轮。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 2
+      },
+      "transcode_extra_args": {
+        "description": "附加 ffmpeg 参数",
+        "type": "string",
+        "hint": "高级选项，按命令行规则拆分并追加在输出文件前，不经过 shell。可留空；错误参数会导致本次压缩失败并按投递策略回退。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": ""
       },
       "transcode_timeout_seconds": {
         "description": "压缩超时（秒）",

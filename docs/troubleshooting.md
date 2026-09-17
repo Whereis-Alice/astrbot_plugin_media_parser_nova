@@ -6,9 +6,10 @@
 | --- | --- | --- |
 | YouTube 链接没有响应 | YouTube 已从本插件拆出 | 安装独立插件 [YouTube Nova](https://github.com/Whereis-Alice/astrbot_plugin_youtube_nova) |
 | Twitter/X 卡片没有热评和互动数字 | X 已不对未登录访问输出带回复数据的页面，属平台行为 | 配置一个 Nitter 实例，见 [Twitter/X → 热评与互动统计需要 Nitter](platforms.md#热评与互动统计需要-nitter) |
-| 只发了信息与封面，没有视频文件 | 体积超过发送上限且压不下来（未装 ffmpeg、视频太长或压缩超时） | 装好 ffmpeg 并开启 `transcode_oversize_video`，见 [视频体积与发送上限](configuration.md#视频体积与发送上限) |
-| 视频画质比原片明显下降，消息里写「视频已压缩」 | 原片超过可发送上限，已自动降码率/降分辨率换取能发出去 | 属正常行为；想要原画质就调高 `send_video_max_mb`，或关掉 `transcode_oversize_video` 改发封面 |
-| 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端富媒体通道拒收大文件；LLOneBot 8.1.9 实测要求视频严格小于 53 MiB | 保持默认 48 MiB，或把 `send_video_max_mb` 调到自己部署的实测值以下 |
+| 只发了信息与封面，没有视频文件 | 视频超过普通发送上限，且当前策略选择封面回退或当前会话不支持群文件 | 检查 `oversize_delivery`、缓存目录和会话类型，见 [视频体积、压缩与群文件](configuration.md#视频体积压缩与群文件) |
+| 视频画质比原片明显下降，消息里写「视频已压缩」 | 独立压缩策略命中阈值，已按配置重编码 | 调高压缩阈值或目标体积，或把 `transcode_mode` 设为关闭 |
+| 发送时报 `[Highway] httpUpload Error ... code 102902` | 协议端普通富媒体通道拒收大文件 | 保持默认 48 MiB、调低 `send_video_max_mb`，或对 QQ 群启用群文件投递 |
+| 群文件上传失败 | 当前不是 aiocqhttp QQ 群聊、协议端未实现 `upload_group_file`、文件不可见或上传超时 | 查看同条失败提示和后台 WARNING，确认缓存目录在协议端可访问并适当提高群文件上传超时 |
 | 高画质视频没有声音，或合并失败 | DASH 音视频轨需要 `ffmpeg` 合并 | 安装 ffmpeg，见 [ffmpeg](configuration.md#ffmpeg) |
 | 图片发不出、B 站高画质拿不到 | 缺少可写缓存目录，无法带 Referer 下载 | 配置缓存目录，见 [缓存目录](configuration.md#缓存目录) |
 | B 站画质一直上不去 | 未配置 Cookie 或 Cookie 已失效 | 见 [平台专项 → B 站](platforms.md#b-站) |

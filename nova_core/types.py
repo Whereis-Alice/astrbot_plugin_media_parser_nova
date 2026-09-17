@@ -64,6 +64,7 @@ class MediaMetadata(TypedDict, total=False):
     image_modes: List[str]
     video_skip_reasons: List[Optional[str]]
     video_transcode_notes: List[Optional[str]]
+    video_transcode_warnings: List[Optional[str]]
     image_skip_reasons: List[Optional[str]]
     media_cache_dir_available: bool
     max_video_size_mb: float
@@ -96,6 +97,7 @@ class LinkBuildMeta(TypedDict):
     card_mode: str
     display_text_nodes: List[Any]
     media_nodes: List[Any]
+    group_files: List[Dict[str, Any]]
     source_url: str
 
 

@@ -18,11 +18,14 @@ class Config:
     # 上传中途返回 102902 直接拒收，下载再久也白费，因此在取流/下载阶段就
     # 按这个上限止损，超限只发信息与封面。0 表示不限制。
     DEFAULT_SEND_VIDEO_MAX_MB = 48.0
-    # 超过可发送上限时先用 ffmpeg 重编码到上限以内再发送，压不下来才只发封面。
+    # 旧配置键仍作为压缩总开关使用；压缩触发条件与参数由独立策略控制。
     DEFAULT_TRANSCODE_OVERSIZE_VIDEO = True
     DEFAULT_TRANSCODE_TIMEOUT_SECONDS = 600
     MIN_TRANSCODE_TIMEOUT_SECONDS = 30
     MAX_TRANSCODE_TIMEOUT_SECONDS = 3600
+    DEFAULT_GROUP_FILE_TIMEOUT_SECONDS = 600
+    MIN_GROUP_FILE_TIMEOUT_SECONDS = 30
+    MAX_GROUP_FILE_TIMEOUT_SECONDS = 3600
     DOWNLOAD_RETRY_ATTEMPTS = 3
     DOWNLOAD_RETRY_BASE_DELAY = 0.5
     

@@ -6,11 +6,12 @@ from typing import Any, Dict, List, Optional, Union
 from astrbot.api.message_components import Image, Plain, Video
 
 from ..downloader.utils import strip_media_prefixes
-from ..parser.utils import format_duration_ms
 from ..logger import logger
 from ..message_text import split_message_text
 from ..metadata_visibility import text_metadata_field_enabled
+from ..parser.utils import format_duration_ms
 from ..types import BuildAllNodesResult, LinkBuildMeta
+from .group_file import build_group_file_name
 
 TEXT_SECTION_SEPARATOR = "-------------------------------------"
 
@@ -78,6 +79,18 @@ def _append_transcode_notes(text_parts: List[str], metadata: Dict[str, Any]) -> 
         text_parts.append(f"{prefix}：{note}")
 
 
+def _append_transcode_warnings(text_parts: List[str], metadata: Dict[str, Any]) -> None:
+    warnings = metadata.get("video_transcode_warnings", []) or []
+    visible = [(idx + 1, warning) for idx, warning in enumerate(warnings) if warning]
+    if not visible:
+        return
+    video_count = metadata.get("video_count", len(metadata.get("video_urls", []))) or 0
+    single = video_count <= 1 and len(visible) <= 1
+    for idx, warning in visible[:5]:
+        prefix = "视频压缩提示" if single else f"视频[{idx}]压缩提示"
+        text_parts.append(f"{prefix}：{warning}")
+
+
 def _append_media_notices(
     text_parts: List[str],
     metadata: Dict[str, Any],
@@ -115,6 +128,7 @@ def _append_media_notices(
                 )
 
     _append_transcode_notes(text_parts, metadata)
+    _append_transcode_warnings(text_parts, metadata)
     _append_media_skip_summary(text_parts, metadata)
 
 
@@ -371,7 +385,7 @@ def build_media_nodes(
             if idx < len(video_modes)
             else ("local" if use_local_files else "direct")
         )
-        if mode == "skip":
+        if mode in ("skip", "group_file"):
             file_idx += 1
             continue
         if not url_list or not isinstance(url_list, list):
@@ -673,6 +687,7 @@ def build_all_nodes(
         link_file_paths = metadata.get("file_paths", [])
         link_video_files = []
         link_temp_files = []
+        group_files = []
 
         video_urls = metadata.get("video_urls", [])
         video_count = len(video_urls)
@@ -684,9 +699,27 @@ def build_all_nodes(
                 continue
             if fp_idx < video_count:
                 mode = video_modes[fp_idx] if fp_idx < len(video_modes) else ""
-                if mode == "local":
+                if mode in ("local", "group_file"):
                     link_video_files.append(file_path)
                     video_files.append(file_path)
+                if mode == "group_file":
+                    size_mb = None
+                    video_sizes = metadata.get("video_sizes") or []
+                    if fp_idx < len(video_sizes):
+                        size_mb = video_sizes[fp_idx]
+                    group_files.append(
+                        {
+                            "path": file_path,
+                            "name": build_group_file_name(
+                                metadata,
+                                file_path,
+                                video_index=fp_idx,
+                                video_count=video_count,
+                            ),
+                            "size_mb": size_mb,
+                            "video_index": fp_idx,
+                        }
+                    )
             else:
                 img_idx = fp_idx - video_count
                 mode = image_modes[img_idx] if img_idx < len(image_modes) else ""
@@ -694,7 +727,7 @@ def build_all_nodes(
                     link_temp_files.append(file_path)
                     temp_files.append(file_path)
 
-        if link_nodes:
+        if link_nodes or group_files:
             all_link_nodes.append(link_nodes)
             link_metadata.append(
                 LinkBuildMeta(
@@ -709,6 +742,7 @@ def build_all_nodes(
                     card_mode=delivery["card_mode"],
                     display_text_nodes=delivery["display_text_nodes"],
                     media_nodes=delivery["media_nodes"],
+                    group_files=group_files,
                     source_url=str(
                         metadata.get("url") or metadata.get("source_url") or ""
                     ),

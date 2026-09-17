@@ -72,6 +72,25 @@ class TranscodePlan:
     audio_kbps: int
     height: int = 0
     fps_cap: float = 0.0
+    video_codec: str = "libx264"
+    preset: str = "veryfast"
+    crf: int = 0
+    extra_args: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TranscodeOptions:
+    """管理员可调的编码参数；0 表示沿用按目标体积自动规划。"""
+
+    video_codec: str = "libx264"
+    preset: str = "veryfast"
+    max_height: int = 0
+    max_fps: float = 0.0
+    video_bitrate_kbps: int = 0
+    audio_bitrate_kbps: int = 0
+    crf: int = 0
+    max_attempts: int = _MAX_ATTEMPTS
+    extra_args: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -261,7 +280,10 @@ def _format_duration(seconds: float) -> str:
 
 
 def plan_transcode(
-    probe: Optional[VideoProbe], target_bytes: int
+    probe: Optional[VideoProbe],
+    target_bytes: int,
+    *,
+    options: Optional[TranscodeOptions] = None,
 ) -> Tuple[Optional[TranscodePlan], str]:
     """按目标体积推算码率与分辨率，压不出可看画质时返回放弃原因。"""
     if probe is None or probe.duration <= 0:
@@ -269,16 +291,24 @@ def plan_transcode(
     if target_bytes <= 0:
         return None, "目标体积无效"
 
+    options = options or TranscodeOptions()
     total_kbps = target_bytes * _SIZE_SAFETY_RATIO * 8 / probe.duration / 1000
     audio_kbps = 0
     if probe.has_audio:
-        audio_kbps = _AUDIO_KBPS_LADDER[-1]
-        for candidate in _AUDIO_KBPS_LADDER:
-            if candidate <= total_kbps * 0.25:
-                audio_kbps = candidate
-                break
+        if options.audio_bitrate_kbps > 0:
+            audio_kbps = options.audio_bitrate_kbps
+        else:
+            audio_kbps = _AUDIO_KBPS_LADDER[-1]
+            for candidate in _AUDIO_KBPS_LADDER:
+                if candidate <= total_kbps * 0.25:
+                    audio_kbps = candidate
+                    break
 
-    video_kbps = int(total_kbps - audio_kbps)
+    video_kbps = (
+        options.video_bitrate_kbps
+        if options.video_bitrate_kbps > 0
+        else int(total_kbps - audio_kbps)
+    )
     if video_kbps < _MIN_VIDEO_KBPS:
         # 说清"至少要多大"，比只说压不动更容易判断该调哪个上限。
         floor_bytes = (
@@ -301,13 +331,24 @@ def plan_transcode(
             break
     if 0 < probe.short_edge <= height:
         height = 0
+    if options.max_height > 0 and probe.short_edge > options.max_height:
+        if height <= 0 or height > options.max_height:
+            height = options.max_height
+
+    fps_cap = _FPS_CAP if video_kbps < 3000 else 0.0
+    if options.max_fps > 0:
+        fps_cap = min(fps_cap, options.max_fps) if fps_cap > 0 else options.max_fps
 
     return (
         TranscodePlan(
             video_kbps=video_kbps,
             audio_kbps=audio_kbps,
             height=height,
-            fps_cap=_FPS_CAP if video_kbps < 3000 else 0.0,
+            fps_cap=fps_cap,
+            video_codec=options.video_codec or "libx264",
+            preset=options.preset or "veryfast",
+            crf=options.crf if 0 < options.crf <= 51 else 0,
+            extra_args=tuple(options.extra_args or ()),
         ),
         "",
     )
@@ -356,22 +397,23 @@ def _build_ffmpeg_args(
         args += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
     if plan.fps_cap > 0 and probe.fps > plan.fps_cap:
         args += ["-r", f"{plan.fps_cap:g}"]
-    args += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-profile:v",
-        "high",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        f"{plan.video_kbps}k",
-        "-maxrate",
-        f"{int(plan.video_kbps * 1.45)}k",
-        "-bufsize",
-        f"{int(plan.video_kbps * 2.5)}k",
-    ]
+    args += ["-c:v", plan.video_codec]
+    if plan.preset:
+        args += ["-preset", plan.preset]
+    if plan.video_codec == "libx264":
+        args += ["-profile:v", "high"]
+    args += ["-pix_fmt", "yuv420p"]
+    if plan.crf > 0:
+        args += ["-crf", str(plan.crf)]
+    else:
+        args += [
+            "-b:v",
+            f"{plan.video_kbps}k",
+            "-maxrate",
+            f"{int(plan.video_kbps * 1.45)}k",
+            "-bufsize",
+            f"{int(plan.video_kbps * 2.5)}k",
+        ]
     if plan.audio_kbps > 0:
         args += ["-c:a", "aac", "-b:a", f"{plan.audio_kbps}k", "-ac", "2"]
     else:
@@ -381,8 +423,9 @@ def _build_ffmpeg_args(
         "1024",
         "-movflags",
         "+faststart",
-        output_path,
     ]
+    args.extend(plan.extra_args)
+    args.append(output_path)
     return args
 
 
@@ -390,8 +433,9 @@ def _describe_attempt(attempt: int, plan: TranscodePlan, actual_bytes: int) -> s
     """把一轮压缩的参数与结果压成一句日志。"""
     scale_text = f"{plan.height}p" if plan.height else "原尺寸"
     audio_text = f"{plan.audio_kbps}kbps音频" if plan.audio_kbps else "无音轨"
+    rate_text = f"CRF {plan.crf}" if plan.crf > 0 else f"{plan.video_kbps}kbps"
     return (
-        f"第{attempt}轮 {plan.video_kbps}kbps/{scale_text}/{audio_text}"
+        f"第{attempt}轮 {rate_text}/{scale_text}/{audio_text}"
         f" -> {actual_bytes / 1024 / 1024:.1f}MB"
     )
 
@@ -416,6 +460,7 @@ async def transcode_video_to_size(
     target_bytes: int,
     *,
     timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
+    options: Optional[TranscodeOptions] = None,
 ) -> TranscodeResult:
     """把视频重编码到 target_bytes 以内，成功时返回新文件路径与体积。"""
     if target_bytes <= 0:
@@ -440,9 +485,17 @@ async def transcode_video_to_size(
     attempts: List[str] = []
     last_error = "压缩后体积仍然超限"
 
+    options = options or TranscodeOptions()
+    custom_rate_control = options.crf > 0 or options.video_bitrate_kbps > 0
+    attempt_limit = 1 if custom_rate_control else max(1, min(3, options.max_attempts))
+
     try:
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            plan, reject = plan_transcode(probe, budget_bytes)
+        for attempt in range(1, attempt_limit + 1):
+            plan, reject = plan_transcode(
+                probe,
+                budget_bytes,
+                options=options,
+            )
             if plan is None:
                 return TranscodeResult(error=reject or "无法规划压缩参数")
 

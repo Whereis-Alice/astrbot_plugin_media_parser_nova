@@ -1,5 +1,6 @@
 """消息发送封装，统一不同会话场景下的发送行为。"""
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any, List, Optional
@@ -9,6 +10,7 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
 
 from ..constants import Config
 from ..logger import logger
+from .group_file import GroupFileUploader
 from .node_builder import is_pure_image_gallery
 
 # 平台富媒体通道拒收超大文件时的特征词。QQ 的 Highway 通道会在上传中途返回
@@ -30,6 +32,19 @@ class MessageDeliveryError(RuntimeError):
 
 class MessageSender:
     """消息发送器，封装统一的私聊/群聊发送接口。"""
+
+    def __init__(
+        self,
+        *,
+        group_file_timeout_seconds: int = Config.DEFAULT_GROUP_FILE_TIMEOUT_SECONDS,
+        group_file_uploader: Optional[GroupFileUploader] = None,
+    ):
+        self.group_file_uploader = group_file_uploader or GroupFileUploader(
+            group_file_timeout_seconds
+        )
+
+    def can_upload_group_file(self, event: AstrMessageEvent) -> bool:
+        return self.group_file_uploader.can_upload(event)
 
     @staticmethod
     def _metadata_for_link(link_metadata: Optional[List[dict]], link_idx: int) -> dict:
@@ -116,17 +131,21 @@ class MessageSender:
     ) -> None:
         if expected <= 0 or not errors:
             return
-        if succeeded <= 0:
-            raise MessageDeliveryError(
-                f"{label}全部发送失败（{len(errors)}项）"
-            ) from errors[0]
+        all_failed = succeeded <= 0
         error_preview = "; ".join(str(error) for error in errors[:3])
-        logger.warning(
-            f"{label}部分发送失败: {len(errors)}/{expected} 项失败，"
-            f"其余内容已发送。错误: {error_preview}"
-        )
-        # 部分失败以前只写日志，群里看不到任何异常，用户只会觉得"视频凭空没了"。
-        # 这里补一条简短提示，并尽量附上原链接方便自己点开。
+        if all_failed:
+            logger.warning(
+                f"{label}全部发送失败: {len(errors)}/{expected} 项失败。"
+                f"错误: {error_preview}"
+            )
+        else:
+            logger.warning(
+                f"{label}部分发送失败: {len(errors)}/{expected} 项失败，"
+                f"其余内容已发送。错误: {error_preview}"
+            )
+
+        # 即使唯一的群文件上传失败，也要把原因留在会话里；若连短文本都发不出，
+        # 再抛异常交给上层按整次发送失败处理。
         reasons: List[str] = []
         for error in errors:
             reason = cls._describe_delivery_failure(error)
@@ -147,6 +166,10 @@ class MessageSender:
             await event.send(event.plain_result(notice))
         except Exception as exc:
             logger.warning(f"{label}发送失败提示也未能送出: {exc}")
+            if all_failed:
+                raise MessageDeliveryError(
+                    f"{label}全部发送失败（{len(errors)}项）"
+                ) from errors[0]
 
     @staticmethod
     def collect_rendered_card_paths(
@@ -176,6 +199,50 @@ class MessageSender:
         sender_name = "Nova解析"
         sender_id = str(event.get_self_id() or "").strip() or "10000"
         return sender_name, sender_id
+
+    async def _upload_group_files(
+        self,
+        event: AstrMessageEvent,
+        metadata_list: Optional[List[dict]],
+    ) -> tuple[int, int, list[Exception], List[str]]:
+        expected = 0
+        succeeded = 0
+        errors: list[Exception] = []
+        failed_urls: List[str] = []
+        for metadata in metadata_list or []:
+            if not isinstance(metadata, dict):
+                continue
+            source_url = str(metadata.get("source_url") or "").strip()
+            for item in metadata.get("group_files") or []:
+                if not isinstance(item, dict):
+                    continue
+                file_path = str(item.get("path") or "").strip()
+                file_name = str(item.get("name") or Path(file_path).name).strip()
+                if not file_path:
+                    continue
+                expected += 1
+                try:
+                    await self.group_file_uploader.upload(
+                        event,
+                        file_path,
+                        file_name,
+                    )
+                    succeeded += 1
+                    size_mb = item.get("size_mb")
+                    size_text = (
+                        f"/{float(size_mb):.1f}MB"
+                        if isinstance(size_mb, (int, float))
+                        else ""
+                    )
+                    logger.info(f"群文件上传完成: {file_name}{size_text}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    errors.append(exc)
+                    if source_url:
+                        failed_urls.append(source_url)
+                    logger.warning(f"群文件上传失败: {file_name}, 错误: {exc}")
+        return expected, succeeded, errors, failed_urls
 
     async def send_aggregated_results(
         self,
@@ -209,16 +276,24 @@ class MessageSender:
 
         if normal_metadata:
             flat_nodes = []
-            for link_idx, metadata in enumerate(normal_metadata):
-                for content in self._delivery_chains(
-                    metadata.get("link_nodes") or [],
-                    metadata,
-                ):
-                    if content:
-                        flat_nodes.append(
-                            Node(name=sender_name, uin=node_uin, content=content)
-                        )
-                if link_idx < len(normal_metadata) - 1:
+            link_chains = [
+                [
+                    content
+                    for content in self._delivery_chains(
+                        metadata.get("link_nodes") or [],
+                        metadata,
+                    )
+                    if content
+                ]
+                for metadata in normal_metadata
+            ]
+            link_chains = [chains for chains in link_chains if chains]
+            for link_idx, chains in enumerate(link_chains):
+                for content in chains:
+                    flat_nodes.append(
+                        Node(name=sender_name, uin=node_uin, content=content)
+                    )
+                if link_idx < len(link_chains) - 1:
                     flat_nodes.append(
                         Node(
                             name=sender_name,
@@ -252,6 +327,17 @@ class MessageSender:
             succeeded += large_succeeded
             errors.extend(large_errors)
             failed_urls.extend(large_failed_urls)
+
+        (
+            group_expected,
+            group_succeeded,
+            group_errors,
+            group_failed_urls,
+        ) = await self._upload_group_files(event, link_metadata)
+        expected += group_expected
+        succeeded += group_succeeded
+        errors.extend(group_errors)
+        failed_urls.extend(group_failed_urls)
 
         await self._finish_best_effort_delivery(
             event,
@@ -337,12 +423,20 @@ class MessageSender:
         succeeded = 0
         errors: list[Exception] = []
         failed_urls: List[str] = []
+        delivery_items = []
         for link_idx, link_nodes in enumerate(all_link_nodes):
             meta = self._metadata_for_link(link_metadata, link_idx)
+            chains = [
+                content
+                for content in self._delivery_chains(link_nodes, meta)
+                if content
+            ]
+            if chains:
+                delivery_items.append((meta, chains))
+
+        for delivery_idx, (meta, chains) in enumerate(delivery_items):
             metadata_text_node = meta.get("metadata_text_node")
-            for content in self._delivery_chains(link_nodes, meta):
-                if not content:
-                    continue
+            for content in chains:
                 expected += 1
                 chain = []
                 if (
@@ -360,11 +454,21 @@ class MessageSender:
                     errors.append(exc)
                     failed_urls.extend(self._source_urls([meta]))
                     logger.warning(f"发送消息链失败: {exc}")
-            if link_idx < len(all_link_nodes) - 1:
+            if delivery_idx < len(delivery_items) - 1:
                 try:
                     await event.send(event.plain_result(separator))
                 except Exception as exc:
                     logger.warning(f"发送分隔符失败: {exc}")
+        (
+            group_expected,
+            group_succeeded,
+            group_errors,
+            group_failed_urls,
+        ) = await self._upload_group_files(event, link_metadata)
+        expected += group_expected
+        succeeded += group_succeeded
+        errors.extend(group_errors)
+        failed_urls.extend(group_failed_urls)
         await self._finish_best_effort_delivery(
             event,
             label="解析结果",

@@ -59,6 +59,30 @@ OUTPUT_MODE_ALL = "全部发送"
 OUTPUT_MODE_TEXT_ONLY = "仅文本"
 OUTPUT_MODE_RICH_ONLY = "仅富媒体"
 
+OVERSIZE_DELIVERY_COVER = "cover"
+OVERSIZE_DELIVERY_GROUP_FILE = "group_file"
+OVERSIZE_DELIVERY_LABELS = {
+    OVERSIZE_DELIVERY_COVER: "仅发送信息与封面",
+    OVERSIZE_DELIVERY_GROUP_FILE: "上传为群文件",
+}
+
+TRANSCODE_MODE_DISABLED = "disabled"
+TRANSCODE_MODE_ABOVE_SIZE = "above_size"
+TRANSCODE_MODE_ALWAYS = "always"
+TRANSCODE_MODE_LABELS = {
+    TRANSCODE_MODE_DISABLED: "关闭",
+    TRANSCODE_MODE_ABOVE_SIZE: "超过指定体积",
+    TRANSCODE_MODE_ALWAYS: "始终压缩",
+}
+
+TRANSCODE_CODECS = {
+    "libx264",
+    "libx265",
+    "libsvtav1",
+    "h264_nvenc",
+    "hevc_nvenc",
+}
+
 CARD_MODE_COMBINED = "卡片+文本同条发送"
 CARD_MODE_SPLIT = "卡片+文本分开发"
 CARD_MODE_ONLY = "仅卡片"
@@ -452,8 +476,26 @@ class DownloadConfig:
     cache_dir: str = ""
     cache_dir_available: bool = False
     max_concurrent_downloads: int = Config.DOWNLOAD_MANAGER_MAX_CONCURRENT
+    oversize_delivery: str = OVERSIZE_DELIVERY_COVER
+    group_file_timeout_seconds: int = Config.DEFAULT_GROUP_FILE_TIMEOUT_SECONDS
     transcode_oversize_video: bool = Config.DEFAULT_TRANSCODE_OVERSIZE_VIDEO
+    transcode_mode: str = TRANSCODE_MODE_ABOVE_SIZE
+    transcode_trigger_mb: float = 0.0
+    transcode_target_size_mb: float = 0.0
+    transcode_video_codec: str = "libx264"
+    transcode_preset: str = "veryfast"
+    transcode_max_height: int = 0
+    transcode_max_fps: float = 0.0
+    transcode_video_bitrate_kbps: int = 0
+    transcode_audio_bitrate_kbps: int = 0
+    transcode_crf: int = 0
+    transcode_max_attempts: int = 2
+    transcode_extra_args: str = ""
     transcode_timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS
+
+    @property
+    def group_file_enabled(self) -> bool:
+        return self.oversize_delivery == OVERSIZE_DELIVERY_GROUP_FILE
 
 
 @dataclass
@@ -907,6 +949,23 @@ class ConfigManager:
             Config.DEFAULT_SEND_VIDEO_MAX_MB,
         )
 
+        oversize_delivery = self._parse_oversize_delivery(
+            download_raw.get("oversize_delivery", "仅发送信息与封面")
+        )
+        group_file_timeout_seconds = max(
+            Config.MIN_GROUP_FILE_TIMEOUT_SECONDS,
+            min(
+                self._parse_positive_int(
+                    download_raw.get(
+                        "group_file_timeout_seconds",
+                        Config.DEFAULT_GROUP_FILE_TIMEOUT_SECONDS,
+                    ),
+                    Config.DEFAULT_GROUP_FILE_TIMEOUT_SECONDS,
+                ),
+                Config.MAX_GROUP_FILE_TIMEOUT_SECONDS,
+            ),
+        )
+
         transcode_oversize_video = self._parse_bool(
             download_raw.get(
                 "transcode_oversize_video", Config.DEFAULT_TRANSCODE_OVERSIZE_VIDEO
@@ -914,6 +973,68 @@ class ConfigManager:
             Config.DEFAULT_TRANSCODE_OVERSIZE_VIDEO,
             "download.transcode_oversize_video",
         )
+        transcode_mode = self._parse_transcode_mode(
+            download_raw.get("transcode_mode", "超过指定体积")
+        )
+        transcode_trigger_mb = self._parse_non_negative_float(
+            download_raw.get("transcode_trigger_mb", 0.0),
+            0.0,
+        )
+        transcode_target_size_mb = self._parse_non_negative_float(
+            download_raw.get("transcode_target_size_mb", 0.0),
+            0.0,
+        )
+        transcode_video_codec = str(
+            download_raw.get("transcode_video_codec", "libx264") or "libx264"
+        ).strip()
+        if transcode_video_codec not in TRANSCODE_CODECS:
+            logger.warning("download.transcode_video_codec 无效，已回落 libx264")
+            transcode_video_codec = "libx264"
+        transcode_preset = str(
+            download_raw.get("transcode_preset", "veryfast") or "veryfast"
+        ).strip()[:40]
+        if not transcode_preset:
+            transcode_preset = "veryfast"
+        transcode_max_height = self._parse_bounded_int(
+            download_raw.get("transcode_max_height", 0),
+            0,
+            0,
+            4320,
+        )
+        transcode_max_fps = min(
+            240.0,
+            self._parse_non_negative_float(
+                download_raw.get("transcode_max_fps", 0.0),
+                0.0,
+            ),
+        )
+        transcode_video_bitrate_kbps = self._parse_bounded_int(
+            download_raw.get("transcode_video_bitrate_kbps", 0),
+            0,
+            0,
+            200000,
+        )
+        transcode_audio_bitrate_kbps = self._parse_bounded_int(
+            download_raw.get("transcode_audio_bitrate_kbps", 0),
+            0,
+            0,
+            1024,
+        )
+        transcode_crf = self._parse_bounded_int(
+            download_raw.get("transcode_crf", 0),
+            0,
+            0,
+            51,
+        )
+        transcode_max_attempts = self._parse_bounded_int(
+            download_raw.get("transcode_max_attempts", 2),
+            2,
+            1,
+            3,
+        )
+        transcode_extra_args = str(
+            download_raw.get("transcode_extra_args", "") or ""
+        ).strip()[:2000]
         transcode_timeout_seconds = max(
             Config.MIN_TRANSCODE_TIMEOUT_SECONDS,
             min(
@@ -1055,7 +1176,21 @@ class ConfigManager:
             cache_dir=cache_dir,
             cache_dir_available=cache_dir_available,
             max_concurrent_downloads=max_concurrent,
+            oversize_delivery=oversize_delivery,
+            group_file_timeout_seconds=group_file_timeout_seconds,
             transcode_oversize_video=transcode_oversize_video,
+            transcode_mode=transcode_mode,
+            transcode_trigger_mb=transcode_trigger_mb,
+            transcode_target_size_mb=transcode_target_size_mb,
+            transcode_video_codec=transcode_video_codec,
+            transcode_preset=transcode_preset,
+            transcode_max_height=transcode_max_height,
+            transcode_max_fps=transcode_max_fps,
+            transcode_video_bitrate_kbps=transcode_video_bitrate_kbps,
+            transcode_audio_bitrate_kbps=transcode_audio_bitrate_kbps,
+            transcode_crf=transcode_crf,
+            transcode_max_attempts=transcode_max_attempts,
+            transcode_extra_args=transcode_extra_args,
             transcode_timeout_seconds=transcode_timeout_seconds,
         )
 
@@ -1445,6 +1580,26 @@ class ConfigManager:
             # 「跟随平台」要原样留到渲染期，那时才知道链接来自哪个站点
             return CARD_SKIN_AUTO
         return resolve_theme_key(raw)
+
+    @staticmethod
+    def _parse_oversize_delivery(value: Any) -> str:
+        text = str(value or "").strip()
+        lowered = text.lower()
+        for key, label in OVERSIZE_DELIVERY_LABELS.items():
+            if text == label or lowered == key:
+                return key
+        logger.warning("download.oversize_delivery 无效，已回落为仅发送信息与封面")
+        return OVERSIZE_DELIVERY_COVER
+
+    @staticmethod
+    def _parse_transcode_mode(value: Any) -> str:
+        text = str(value or "").strip()
+        lowered = text.lower()
+        for key, label in TRANSCODE_MODE_LABELS.items():
+            if text == label or lowered == key:
+                return key
+        logger.warning("download.transcode_mode 无效，已回落为超过指定体积")
+        return TRANSCODE_MODE_ABOVE_SIZE
 
     @staticmethod
     def _parse_bounded_int(value, default: int, minimum: int, maximum: int) -> int:

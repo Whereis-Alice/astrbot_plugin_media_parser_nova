@@ -268,6 +268,45 @@ class DownloadConfigSchemaTests(unittest.TestCase):
             Config.DEFAULT_SEND_VIDEO_MAX_MB,
         )
 
+    def test_group_file_and_compression_policy_are_independent(self):
+        config = ConfigManager(
+            {
+                "download": {
+                    "max_video_size_mb": 800,
+                    "send_video_max_mb": 50,
+                    "oversize_delivery": "上传为群文件",
+                    "transcode_oversize_video": True,
+                    "transcode_mode": "始终压缩",
+                    "transcode_trigger_mb": 120,
+                    "transcode_target_size_mb": 80,
+                    "transcode_video_codec": "libx265",
+                    "transcode_preset": "medium",
+                    "transcode_max_height": 720,
+                    "transcode_max_fps": 24,
+                    "transcode_video_bitrate_kbps": 1800,
+                    "transcode_audio_bitrate_kbps": 96,
+                    "transcode_crf": 22,
+                    "transcode_max_attempts": 3,
+                    "transcode_extra_args": "-threads 2",
+                }
+            }
+        )
+
+        download = config.download
+        self.assertTrue(download.group_file_enabled)
+        self.assertEqual(download.transcode_mode, "always")
+        self.assertEqual(download.transcode_trigger_mb, 120)
+        self.assertEqual(download.transcode_target_size_mb, 80)
+        self.assertEqual(download.transcode_video_codec, "libx265")
+        self.assertEqual(download.transcode_preset, "medium")
+        self.assertEqual(download.transcode_max_height, 720)
+        self.assertEqual(download.transcode_max_fps, 24)
+        self.assertEqual(download.transcode_video_bitrate_kbps, 1800)
+        self.assertEqual(download.transcode_audio_bitrate_kbps, 96)
+        self.assertEqual(download.transcode_crf, 22)
+        self.assertEqual(download.transcode_max_attempts, 3)
+        self.assertEqual(download.transcode_extra_args, "-threads 2")
+
     def test_send_video_max_mb_accepts_numbers_and_strings(self):
         cases = {64: 64.0, "80.5": 80.5, 0: 0.0, "0": 0.0}
         for raw, expected in cases.items():
