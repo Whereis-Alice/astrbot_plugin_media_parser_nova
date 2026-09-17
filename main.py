@@ -44,7 +44,7 @@ from .nova_core.translation import MetadataTranslator, build_card_metadata_list
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.17.0",
+    "1.17.1",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -163,6 +163,20 @@ class MediaParserNovaPlugin(Star):
         task = asyncio.create_task(self._delayed_cleanup(files, delay))
         self._cleanup_tasks.add(task)
         task.add_done_callback(self._cleanup_tasks.discard)
+
+    async def _cleanup_delivery_files(self, files, link_metadata, relay_ttl: int = 0):
+        pending = self.message_sender.pending_group_file_paths(link_metadata)
+        delay = max(0, relay_ttl)
+        if pending.intersection(files):
+            # 回执超时或取消等待不代表远端上传已停止。
+            # 同一媒体目录共用过期标记，统一延后本次结果，避免较短 TTL 覆盖。
+            delay = max(
+                600, self.config_manager.download.group_file_timeout_seconds, delay
+            )
+        if delay > 0:
+            self._schedule_delayed_cleanup(files, delay)
+        else:
+            await self._run_blocking_to_completion(cleanup_files, files)
 
     @staticmethod
     async def _wait_for_task_completion(task: asyncio.Task):
@@ -773,14 +787,11 @@ class MediaParserNovaPlugin(Star):
                     card_files,
                 )
                 if all_files:
-                    if relay_registered and not zip_requested:
-                        delay = cfg.relay.file_token_ttl
-                        self._schedule_delayed_cleanup(all_files, delay)
-                    else:
-                        await self._run_blocking_to_completion(
-                            cleanup_files,
-                            all_files,
-                        )
+                    await self._cleanup_delivery_files(
+                        all_files,
+                        build_result.link_metadata if build_result else [],
+                        cfg.relay.file_token_ttl if relay_registered and not zip_requested else 0,
+                    )
             finally:
                 self._active_media_flows = max(
                     0,

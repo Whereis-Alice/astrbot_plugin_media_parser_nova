@@ -736,7 +736,7 @@
       "group_file_timeout_seconds": {
         "description": "群文件上传超时（秒）",
         "type": "int",
-        "hint": "单个群文件等待 OneBot 协议端完成上传的最长时间，有效范围 30–3600。",
+        "hint": "单个群文件等待上传回执的最长时间，有效范围 30–3600；aiocqhttp 内层等待同步使用此值。超时只表示结果未确认，协议端可能仍在上传，请先查看群文件。",
         "condition": {
           "oversize_delivery": "上传为群文件"
         },

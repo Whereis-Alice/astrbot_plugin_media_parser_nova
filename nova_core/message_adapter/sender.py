@@ -10,19 +10,15 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
 
 from ..constants import Config
 from ..logger import logger
-from .group_file import GroupFileUploader
+from .group_file import GroupFileUploader, GroupFileUploadUnconfirmed
 from .node_builder import is_pure_image_gallery
 
 # 平台富媒体通道拒收超大文件时的特征词。QQ 的 Highway 通道会在上传中途返回
 # 102902，报错文本里没有"太大"两个字，只能靠这些关键字认出来。
 _OVERSIZE_FAILURE_KEYWORDS = (
-    "highway",
-    "httpupload",
     "102902",
     "too large",
-    "file size",
-    "rich media",
-    "上传失败",
+    "file size exceeded",
 )
 
 
@@ -45,6 +41,16 @@ class MessageSender:
 
     def can_upload_group_file(self, event: AstrMessageEvent) -> bool:
         return self.group_file_uploader.can_upload(event)
+
+    @staticmethod
+    def pending_group_file_paths(metadata_list: Any) -> set[str]:
+        """保留未确认或被取消的上传源文件，给协议端继续读取的时间。"""
+        return {
+            str(item["path"])
+            for meta in metadata_list or []
+            for item in meta.get("group_files") or []
+            if item.get("pending") and item.get("path")
+        }
 
     @staticmethod
     def _metadata_for_link(link_metadata: Optional[List[dict]], link_idx: int) -> dict:
@@ -112,8 +118,10 @@ class MessageSender:
         """把平台发送异常翻译成用户看得懂的一句话。"""
         text = str(error or "").strip()
         lowered = text.lower()
+        if "timeout" in lowered or "timed out" in lowered or "超时" in text:
+            return "等待发送回执超时，发送结果尚未确认"
         if any(keyword in lowered for keyword in _OVERSIZE_FAILURE_KEYWORDS):
-            return "视频上传被聊天平台拒收（体积过大或服务端限制）"
+            return "视频上传被聊天平台拒收（上传通道限制，未必是体积过大）"
         if not text:
             return "未知发送错误"
         return text if len(text) <= 120 else text[:117] + "..."
@@ -131,30 +139,40 @@ class MessageSender:
     ) -> None:
         if expected <= 0 or not errors:
             return
-        all_failed = succeeded <= 0
+        unconfirmed = [e for e in errors if isinstance(e, GroupFileUploadUnconfirmed)]
+        failures = [e for e in errors if not isinstance(e, GroupFileUploadUnconfirmed)]
+        all_failed = succeeded <= 0 and not unconfirmed
         error_preview = "; ".join(str(error) for error in errors[:3])
-        if all_failed:
+        if not failures:
+            logger.info(f"{label}: {len(unconfirmed)} 项群文件回执未确认；{error_preview}")
+        elif all_failed:
             logger.warning(
-                f"{label}全部发送失败: {len(errors)}/{expected} 项失败。"
+                f"{label}全部发送失败: {len(failures)}/{expected} 项失败。"
                 f"错误: {error_preview}"
             )
         else:
             logger.warning(
-                f"{label}部分发送失败: {len(errors)}/{expected} 项失败，"
-                f"其余内容已发送。错误: {error_preview}"
+                f"{label}部分发送失败: {len(failures)}/{expected} 项失败，"
+                f"{succeeded} 项已发送，{len(unconfirmed)} 项未确认。错误: {error_preview}"
             )
 
         # 即使唯一的群文件上传失败，也要把原因留在会话里；若连短文本都发不出，
         # 再抛异常交给上层按整次发送失败处理。
         reasons: List[str] = []
-        for error in errors:
+        for error in failures:
             reason = cls._describe_delivery_failure(error)
             if reason not in reasons:
                 reasons.append(reason)
-        notice = (
-            f"⚠️ 有 {len(errors)}/{expected} 项内容未能发出："
-            + "；".join(reasons[:2])
-        )
+        notice = ""
+        if failures:
+            notice = (
+                f"⚠️ 有 {len(failures)}/{expected} 项内容未能发出："
+                + "；".join(reasons[:2])
+            )
+        if unconfirmed:
+            if notice:
+                notice += "\n"
+            notice += "群文件上传结果尚未确认，可能仍在上传或已发送，请稍后查看群文件，暂勿重复解析。"
         unique_urls: List[str] = []
         for raw in failed_urls or []:
             url = str(raw or "").strip()
@@ -221,12 +239,14 @@ class MessageSender:
                 if not file_path:
                     continue
                 expected += 1
+                item["pending"] = True
                 try:
                     await self.group_file_uploader.upload(
                         event,
                         file_path,
                         file_name,
                     )
+                    item["pending"] = False
                     succeeded += 1
                     size_mb = item.get("size_mb")
                     size_text = (
@@ -237,7 +257,16 @@ class MessageSender:
                     logger.info(f"群文件上传完成: {file_name}{size_text}")
                 except asyncio.CancelledError:
                     raise
+                except GroupFileUploadUnconfirmed as exc:
+                    errors.append(exc)
+                    if source_url:
+                        failed_urls.append(source_url)
+                    logger.info(
+                        f"群文件上传回执未确认: {file_name}，不重试上传；"
+                        f"详情: {exc.__cause__ or exc}"
+                    )
                 except Exception as exc:
+                    item["pending"] = False
                     errors.append(exc)
                     if source_url:
                         failed_urls.append(source_url)

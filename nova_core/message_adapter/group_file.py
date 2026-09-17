@@ -8,11 +8,84 @@ from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
 
+from ..logger import logger
+
 _INVALID_FILE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
 class GroupFileUploadError(RuntimeError):
     """群文件投递不可用或执行失败。"""
+
+
+class GroupFileUploadUnconfirmed(GroupFileUploadError):
+    """未收到完成回执，协议端可能仍在上传，不能按失败重试。"""
+
+
+def _scoped_upload_api(bot: Any, timeout_seconds: float) -> Any:
+    """复用 aiocqhttp 连接，仅给本次调用设置超时，不修改共享客户端。"""
+    try:
+        from aiocqhttp import CQHttp
+        from aiocqhttp.api_impl import HttpApi, UnifiedApi, WebSocketReverseApi
+    except ImportError:
+        return None
+    if not isinstance(bot, CQHttp):
+        return None
+    if getattr(bot.call_action, "__func__", None) is not CQHttp.call_action:
+        return None
+    api = vars(bot).get("_api")
+    if type(api) is not UnifiedApi:
+        return None
+    transports = {}
+    for attr, expected_type in (
+        ("_wsr_api", WebSocketReverseApi),
+        ("_http_api", HttpApi),
+    ):
+        transport = vars(api).get(attr)
+        if transport is None:
+            continue
+        # 未识别的扩展实现保留原调用路径，避免绕过第三方包装。
+        if type(transport) is not expected_type:
+            return None
+        state = vars(transport)
+        try:
+            if expected_type is WebSocketReverseApi:
+                transports[attr] = WebSocketReverseApi(
+                    state["_api_clients"], state["_event_clients"], timeout_seconds
+                )
+            else:
+                transports[attr] = HttpApi(
+                    state["_api_root"], state["_access_token"], timeout_seconds
+                )
+        except KeyError:
+            return None
+    return UnifiedApi(
+        http_api=transports.get("_http_api"),
+        wsr_api=transports.get("_wsr_api"),
+    )
+
+
+def _receipt_is_uncertain(exc: Exception) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    try:
+        from aiocqhttp.exceptions import NetworkError
+    except ImportError:
+        pass
+    else:
+        if isinstance(exc, NetworkError):
+            return True
+    text = str(exc).lower()
+    return any(
+        word in text
+        for word in (
+            "websocket api call timeout",
+            "timed out",
+            "timeout",
+            "超时",
+            "connection closed",
+            "connection reset",
+        )
+    )
 
 
 def build_group_file_name(
@@ -68,9 +141,15 @@ class GroupFileUploader:
             or callable(getattr(bot, "upload_group_file", None))
         )
 
-    @staticmethod
-    async def _call_action(event: AstrMessageEvent, payload: dict) -> Any:
+    async def _call_action(self, event: AstrMessageEvent, payload: dict) -> Any:
         bot = getattr(event, "bot", None)
+        api = _scoped_upload_api(bot, self.timeout_seconds)
+        if api is not None:
+            get_self_id = getattr(event, "get_self_id", None)
+            self_id = str(get_self_id() or "") if callable(get_self_id) else ""
+            if self_id:
+                payload = {**payload, "self_id": self_id}
+            return await api.call_action("upload_group_file", **payload)
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
             return await call_action("upload_group_file", **payload)
@@ -104,18 +183,33 @@ class GroupFileUploader:
             "file": path,
             "name": str(file_name or Path(path).name),
         }
+        logger.info(
+            f"开始上传群文件: {payload['name']}，回执等待上限 {self.timeout_seconds} 秒"
+        )
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._call_action(event, payload),
                 timeout=self.timeout_seconds,
             )
+            # 某些适配器直接返回 OneBot 响应包装，不会抛 ActionFailed。
+            if isinstance(result, dict):
+                if result.get("status") == "failed":
+                    detail = (
+                        result.get("wording") or result.get("message") or "接口拒绝"
+                    )
+                    raise GroupFileUploadError(f"群文件上传失败：{detail}")
+                if result.get("status") == "async" or result.get("retcode") == 1:
+                    raise GroupFileUploadUnconfirmed(
+                        "协议端已受理，尚未确认群文件上传完成"
+                    )
+            return result
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError as exc:
-            raise GroupFileUploadError(
-                f"群文件上传超时（超过 {self.timeout_seconds} 秒）"
-            ) from exc
         except GroupFileUploadError:
             raise
         except Exception as exc:
+            if _receipt_is_uncertain(exc):
+                raise GroupFileUploadUnconfirmed(
+                    "群文件上传回执未确认，文件可能仍在上传或已发送，请稍后查看群文件"
+                ) from exc
             raise GroupFileUploadError(f"群文件上传失败：{exc}") from exc
