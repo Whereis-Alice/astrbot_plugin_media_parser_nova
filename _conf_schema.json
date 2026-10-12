@@ -256,6 +256,28 @@
             "type": "bool",
             "hint": "开启后不发送视频节点；每个视频会改为发送封面图片。解析结果有封面时直接使用封面，否则尝试截取视频第一帧。",
             "default": false
+          },
+          "twitter_gif_delivery": {
+            "description": "推特 GIF 推送方式",
+            "type": "string",
+            "options": [
+              "原 GIF 动图",
+              "视频"
+            ],
+            "hint": "推特里标记为 GIF 的内容如何发送：“原 GIF 动图”会把源视频转回 .gif 动图发送；“视频”保持原样当作视频发送。",
+            "default": "原 GIF 动图"
+          },
+          "twitter_gif_fps": {
+            "description": "推特 GIF 帧率",
+            "type": "int",
+            "hint": "仅在推送方式为“原 GIF 动图”时生效，范围 1-50，默认 15。",
+            "default": 15
+          },
+          "twitter_gif_max_width": {
+            "description": "推特 GIF 最大宽度(px)",
+            "type": "int",
+            "hint": "仅在推送方式为“原 GIF 动图”时生效，按比例缩放；填 0 表示保留原始宽度。默认 480。",
+            "default": 480
           }
         }
       },

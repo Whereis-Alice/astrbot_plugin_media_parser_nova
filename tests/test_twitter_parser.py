@@ -573,5 +573,137 @@ class TwitterTextEntityTests(unittest.TestCase):
         self.assertEqual(TwitterParser._graphql_tweet_text(tweet), "hello & bye")
 
 
+class TwitterGifDeliveryTests(unittest.TestCase):
+    def test_fxtwitter_marks_gif_videos(self):
+        parser = TwitterParser()
+        data = {
+            "tweet": {
+                "media": {
+                    "videos": [
+                        {"url": "https://v/gif.mp4", "type": "gif"},
+                        {"url": "https://v/clip.mp4", "type": "video"},
+                    ]
+                }
+            }
+        }
+
+        result = parser._parse_fxtwitter_response(data)
+        videos = result["videos"]
+
+        self.assertEqual(len(videos), 2)
+        self.assertTrue(videos[0]["is_gif"])
+        self.assertFalse(videos[1]["is_gif"])
+
+    def test_graphql_marks_animated_gif(self):
+        parser = TwitterParser()
+        data = {
+            "rest_id": "1",
+            "legacy": {
+                "extended_entities": {
+                    "media": [
+                        {
+                            "type": "animated_gif",
+                            "video_info": {
+                                "variants": [
+                                    {"url": "https://v/a.mp4", "bitrate": 100}
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        }
+
+        result = parser._parse_graphql_response(data, "1")
+        videos = result["videos"]
+
+        self.assertEqual(len(videos), 1)
+        self.assertTrue(videos[0]["is_gif"])
+
+    def test_parse_publishes_video_is_gif(self):
+        parser = TwitterParser()
+        parser._fetch_media_info = AsyncMock(
+            return_value={
+                "images": [],
+                "videos": [
+                    {"url": "https://v/gif.mp4", "is_gif": True},
+                    {"url": "https://v/clip.mp4", "is_gif": False},
+                ],
+                "text": "hello",
+                "title": "",
+                "author": "Example(@example)",
+                "avatar_url": "",
+                "timestamp": "2026-08-22 10:01:48",
+            }
+        )
+
+        result = asyncio.run(
+            parser.parse(None, "https://x.com/example/status/2090756349701554395")
+        )
+
+        self.assertEqual(result["video_is_gif"], [True, False])
+
+
+class TwitterGifTranscodeTests(unittest.TestCase):
+    def test_transcode_video_to_gif_success(self):
+        import os
+        import tempfile
+
+        from nova_core.downloader import transcode as transcode_module
+
+        src_fd, src_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(src_fd)
+        try:
+            async def _fake_capture(args, timeout=None):
+                # args[-1] 是本趟 ffmpeg 的输出文件（调色板或 GIF）。
+                with open(args[-1], "wb") as fh:
+                    fh.write(b"GIF89a fake payload")
+                return (0, "", "")
+
+            with patch.object(
+                transcode_module, "_run_capture", side_effect=_fake_capture
+            ):
+                result = asyncio.run(
+                    transcode_module.transcode_video_to_gif(
+                        src_path, fps=12, max_width=320, timeout_seconds=30
+                    )
+                )
+
+            self.assertIsNone(result.error)
+            self.assertTrue(result.file_path)
+            self.assertTrue(result.file_path.endswith(".gif"))
+            self.assertTrue(os.path.exists(result.file_path))
+            self.assertGreater(result.size_mb or 0, 0)
+            os.remove(result.file_path)
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+
+    def test_transcode_video_to_gif_missing_ffmpeg(self):
+        import tempfile
+        import os
+
+        from nova_core.downloader import transcode as transcode_module
+
+        src_fd, src_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(src_fd)
+        try:
+            async def _no_ffmpeg(args, timeout=None):
+                raise FileNotFoundError("ffmpeg")
+
+            with patch.object(
+                transcode_module, "_run_capture", side_effect=_no_ffmpeg
+            ):
+                result = asyncio.run(
+                    transcode_module.transcode_video_to_gif(src_path)
+                )
+
+            self.assertIsNotNone(result.error)
+            self.assertIsNone(result.file_path)
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,14 @@ OVERSIZE_DELIVERY_LABELS = {
     OVERSIZE_DELIVERY_GROUP_FILE: "上传为文件（群聊/私聊）",
 }
 
+# 推特 GIF 的推送方式：默认转回原始动图，可选保持视频。
+TWITTER_GIF_DELIVERY_GIF = "原 GIF 动图"
+TWITTER_GIF_DELIVERY_VIDEO = "视频"
+TWITTER_GIF_DELIVERY_MODES = {
+    TWITTER_GIF_DELIVERY_GIF,
+    TWITTER_GIF_DELIVERY_VIDEO,
+}
+
 TRANSCODE_MODE_DISABLED = "disabled"
 TRANSCODE_MODE_ABOVE_SIZE = "above_size"
 TRANSCODE_MODE_ALWAYS = "always"
@@ -349,6 +357,13 @@ class ArchiveConfig:
 @dataclass
 class MediaDisplayConfig:
     video_cover_only: bool = False
+    twitter_gif_delivery: str = TWITTER_GIF_DELIVERY_GIF
+    twitter_gif_fps: int = 15
+    twitter_gif_max_width: int = 480
+
+    @property
+    def twitter_gif_as_video(self) -> bool:
+        return self.twitter_gif_delivery == TWITTER_GIF_DELIVERY_VIDEO
 
 
 @dataclass
@@ -746,6 +761,17 @@ class ConfigManager:
                     media_display.get("video_cover_only", False),
                     False,
                     "message.media_display.video_cover_only",
+                ),
+                twitter_gif_delivery=self._parse_twitter_gif_delivery(
+                    media_display.get(
+                        "twitter_gif_delivery", TWITTER_GIF_DELIVERY_GIF
+                    )
+                ),
+                twitter_gif_fps=self._parse_bounded_int(
+                    media_display.get("twitter_gif_fps", 15), 15, 1, 50
+                ),
+                twitter_gif_max_width=self._parse_bounded_int(
+                    media_display.get("twitter_gif_max_width", 480), 480, 0, 4096
                 ),
             ),
             text_metadata=TextMetadataConfig(
@@ -1602,6 +1628,13 @@ class ConfigManager:
                 return key
         logger.warning("download.transcode_mode 无效，已回落为超过指定体积")
         return TRANSCODE_MODE_ABOVE_SIZE
+
+    @staticmethod
+    def _parse_twitter_gif_delivery(value: Any) -> str:
+        text = str(value or "").strip()
+        if text in TWITTER_GIF_DELIVERY_MODES:
+            return text
+        return TWITTER_GIF_DELIVERY_GIF
 
     @staticmethod
     def _parse_bounded_int(value, default: int, minimum: int, maximum: int) -> int:

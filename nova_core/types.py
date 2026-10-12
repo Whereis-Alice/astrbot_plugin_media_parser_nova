@@ -34,6 +34,7 @@ class MediaMetadata(TypedDict, total=False):
     video_cover_source_count: int
     video_cover_fallbacks: List[Dict[str, Any]]
     video_cover_fallback_indexes: List[int]
+    video_is_gif: List[bool]
 
     access_status: str
     restriction_type: str
@@ -65,6 +66,7 @@ class MediaMetadata(TypedDict, total=False):
     video_skip_reasons: List[Optional[str]]
     video_transcode_notes: List[Optional[str]]
     video_transcode_warnings: List[Optional[str]]
+    video_as_image: List[bool]
     image_skip_reasons: List[Optional[str]]
     media_cache_dir_available: bool
     max_video_size_mb: float

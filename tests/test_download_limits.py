@@ -265,5 +265,96 @@ class ProcessMetadataSendLimitTests(unittest.TestCase):
         self.assertEqual(result["image_urls"], [])
 
 
+class ProcessMetadataTwitterGifTests(unittest.TestCase):
+    """推特 GIF：默认转回 .gif 动图并标记为图片组件。"""
+
+    def _run(self, metadata, *, gif_result, **kwargs):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            manager = DownloadManager(
+                cache_dir=cache_dir,
+                cache_dir_available=True,
+                **kwargs,
+            )
+
+            async def fake_download(*, session, media_items, cache_dir):
+                results = []
+                for item in media_items:
+                    name = str(item["position"]) + ".mp4"
+                    path = os.path.join(cache_dir, name)
+                    with open(path, "wb") as fh:
+                        fh.write(b"x" * 2048)
+                    results.append(
+                        {
+                            "kind": item["kind"],
+                            "position": item["position"],
+                            "success": True,
+                            "file_path": path,
+                            "size_mb": 0.5,
+                        }
+                    )
+                return results
+
+            async def fake_gif(path):
+                if gif_result is None:
+                    return None
+                gif_path = os.path.join(cache_dir, "converted.gif")
+                with open(gif_path, "wb") as fh:
+                    fh.write(b"GIF89a" + b"0" * 1024)
+                return gif_path
+
+            manager._download_local_items = fake_download
+            manager._convert_video_to_gif = fake_gif
+            return asyncio.run(
+                manager.process_metadata(session=None, metadata=metadata)
+            )
+
+    def test_gif_video_is_converted_to_image(self):
+        result = self._run(
+            {
+                "url": "https://x.com/example/status/1",
+                "platform": "twitter",
+                "video_urls": [["https://v/gif.mp4"]],
+                "image_urls": [],
+                "video_is_gif": [True],
+            },
+            gif_result="ok",
+        )
+
+        self.assertEqual(result["video_modes"], ["local"])
+        self.assertEqual(result["video_as_image"], [True])
+        self.assertTrue(result["file_paths"][0].endswith(".gif"))
+
+    def test_gif_conversion_failure_falls_back_to_video(self):
+        result = self._run(
+            {
+                "url": "https://x.com/example/status/1",
+                "platform": "twitter",
+                "video_urls": [["https://v/gif.mp4"]],
+                "image_urls": [],
+                "video_is_gif": [True],
+            },
+            gif_result=None,
+        )
+
+        self.assertEqual(result["video_as_image"], [False])
+        self.assertTrue(result["file_paths"][0].endswith(".mp4"))
+
+    def test_gif_as_video_keeps_video(self):
+        result = self._run(
+            {
+                "url": "https://x.com/example/status/1",
+                "platform": "twitter",
+                "video_urls": [["https://v/gif.mp4"]],
+                "image_urls": [],
+                "video_is_gif": [True],
+            },
+            gif_result="ok",
+            gif_as_video=True,
+        )
+
+        self.assertEqual(result["video_as_image"], [False])
+        self.assertTrue(result["file_paths"][0].endswith(".mp4"))
+
+
 if __name__ == "__main__":
     unittest.main()

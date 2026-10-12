@@ -821,6 +821,7 @@ class TwitterParser(BaseVideoParser):
                         "url": video.get("url", ""),
                         "thumbnail": video.get("thumbnail_url", ""),
                         "duration": video.get("duration", 0),
+                        "is_gif": video.get("type") == "gif",
                     }
                 )
         return media_urls
@@ -1068,7 +1069,9 @@ class TwitterParser(BaseVideoParser):
             elif media_type in ("video", "animated_gif"):
                 video_url = self._best_video_variant(media)
                 if video_url:
-                    videos.append({"url": video_url})
+                    videos.append(
+                        {"url": video_url, "is_gif": media_type == "animated_gif"}
+                    )
 
         return {
             "images": images,
@@ -1317,20 +1320,24 @@ class TwitterParser(BaseVideoParser):
 
             video_urls = []
             video_cover_urls = []
+            video_is_gif: List[bool] = []
             image_urls = []
 
             for video_info in videos:
+                is_gif = False
                 if isinstance(video_info, str):
                     video_url = video_info
                     thumbnail = ""
                 elif isinstance(video_info, dict):
                     video_url = video_info.get("url")
                     thumbnail = video_info.get("thumbnail")
+                    is_gif = bool(video_info.get("is_gif"))
                 else:
                     continue
                 if video_url:
                     video_urls.append(video_url)
                     video_cover_urls.append([thumbnail] if thumbnail else [])
+                    video_is_gif.append(is_gif)
 
             image_urls = [img for img in images if img]
 
@@ -1375,6 +1382,7 @@ class TwitterParser(BaseVideoParser):
                     "image_urls": [[url] for url in image_urls],
                     "is_twitter_video": True,
                     "video_force_download": True,
+                    "video_is_gif": video_is_gif,
                 }
                 logger.debug(
                     f"[{self.name}] parse: 解析完成(视频+图片) {url}, video_count={len(video_urls)}, image_count={len(image_urls)}"
@@ -1390,6 +1398,7 @@ class TwitterParser(BaseVideoParser):
                     "image_urls": [],
                     "is_twitter_video": True,
                     "video_force_download": True,
+                    "video_is_gif": video_is_gif,
                 }
                 logger.debug(
                     f"[{self.name}] parse: 解析完成(视频) {url}, video_count={len(video_urls)}"

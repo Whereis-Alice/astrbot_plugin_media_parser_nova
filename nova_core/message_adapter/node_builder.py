@@ -365,6 +365,7 @@ def build_media_nodes(
     image_modes = metadata.get("image_modes") or []
     use_fts = metadata.get("use_file_token_service", False)
     file_token_urls = metadata.get("file_token_urls", [])
+    video_as_image = metadata.get("video_as_image") or []
 
     logger.debug(
         f"构建媒体节点: {url}, "
@@ -397,6 +398,9 @@ def build_media_nodes(
             file_idx += 1
             continue
 
+        as_image = idx < len(video_as_image) and bool(video_as_image[idx])
+        media_cls = Image if as_image else Video
+
         token_url = (
             file_token_urls[file_idx]
             if use_fts and file_idx < len(file_token_urls)
@@ -404,7 +408,7 @@ def build_media_nodes(
         )
         if token_url:
             try:
-                nodes.append(Video.fromURL(token_url))
+                nodes.append(media_cls.fromURL(token_url))
                 file_idx += 1
                 continue
             except Exception as e:
@@ -417,7 +421,7 @@ def build_media_nodes(
             and os.path.exists(file_paths[file_idx])
         ):
             try:
-                nodes.append(Video.fromFileSystem(file_paths[file_idx]))
+                nodes.append(media_cls.fromFileSystem(file_paths[file_idx]))
             except Exception as e:
                 logger.warning(f"构建视频节点失败: {file_paths[file_idx]}, 错误: {e}")
                 _mark_media_failure(
@@ -428,7 +432,7 @@ def build_media_nodes(
         else:
             actual_video_url = strip_media_prefixes(video_url)
             try:
-                nodes.append(Video.fromURL(actual_video_url))
+                nodes.append(media_cls.fromURL(actual_video_url))
             except Exception as e:
                 logger.warning(f"构建视频节点失败: {actual_video_url}, 错误: {e}")
                 _mark_media_failure(metadata, "video", idx, f"构建视频URL节点失败: {e}")

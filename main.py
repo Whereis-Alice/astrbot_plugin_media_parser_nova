@@ -92,6 +92,9 @@ class MediaParserNovaPlugin(Star):
             transcode_max_attempts=cfg.download.transcode_max_attempts,
             transcode_extra_args=cfg.download.transcode_extra_args,
             transcode_timeout_seconds=cfg.download.transcode_timeout_seconds,
+            gif_as_video=cfg.message.media_display.twitter_gif_as_video,
+            gif_fps=cfg.message.media_display.twitter_gif_fps,
+            gif_max_width=cfg.message.media_display.twitter_gif_max_width,
         )
 
         self.message_sender = MessageSender(

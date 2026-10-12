@@ -551,3 +551,92 @@ async def transcode_video_to_size(
         raise
     finally:
         cleanup_file(temp_output)
+
+
+def _resolve_gif_output_path(input_path: str) -> str:
+    """在源文件同目录生成 GIF 产物路径。"""
+    base, _ = os.path.splitext(input_path)
+    candidate = f"{base}_gif.gif"
+    suffix = 1
+    while candidate == input_path or os.path.exists(candidate):
+        candidate = f"{base}_gif{suffix}.gif"
+        suffix += 1
+    return candidate
+
+
+async def transcode_video_to_gif(
+    input_path: str,
+    *,
+    fps: int = 15,
+    max_width: int = 480,
+    timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
+) -> TranscodeResult:
+    """把短视频（通常是推特 GIF 源）转回动图 .gif。
+
+    采用两趟 palette 流程（palettegen -> paletteuse）以获得更干净的配色。
+    max_width<=0 时保留原始宽度。成功时返回新文件路径与体积，失败时只有 error。
+    """
+    fps = max(1, min(50, int(fps or 15)))
+    max_width = max(0, int(max_width or 0))
+
+    scale = (
+        f"scale={max_width}:-1:flags=lanczos," if max_width > 0 else ""
+    )
+    output_path = await run_blocking(_resolve_gif_output_path, input_path)
+    base, _ = os.path.splitext(output_path)
+    palette_path = f"{base}.palette.png"
+    started = time.monotonic()
+
+    palette_args = [
+        "ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+        "-i", input_path,
+        "-vf", f"fps={fps},{scale}palettegen",
+        palette_path,
+    ]
+    use_args = [
+        "ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+        "-i", input_path, "-i", palette_path,
+        "-lavfi", f"fps={fps},{scale}[x];[x][1:v]paletteuse",
+        "-loop", "0",
+        output_path,
+    ]
+
+    try:
+        try:
+            rc, _, stderr = await _run_capture(palette_args, timeout=timeout_seconds)
+        except FileNotFoundError:
+            return TranscodeResult(error="ffmpeg 未找到，无法转换 GIF")
+        if rc is None:
+            return TranscodeResult(error=f"GIF 转换超时（超过 {timeout_seconds}s）")
+        if rc != 0:
+            lines = [line for line in (stderr or "").splitlines() if line.strip()]
+            detail = lines[-1][:160] if lines else f"退出码 {rc}"
+            return TranscodeResult(error=f"调色板生成失败: {detail}")
+
+        remaining = timeout_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            return TranscodeResult(error=f"GIF 转换超时（超过 {timeout_seconds}s）")
+        try:
+            rc, _, stderr = await _run_capture(use_args, timeout=remaining)
+        except FileNotFoundError:
+            return TranscodeResult(error="ffmpeg 未找到，无法转换 GIF")
+        if rc is None:
+            return TranscodeResult(error=f"GIF 转换超时（超过 {timeout_seconds}s）")
+        if rc != 0:
+            lines = [line for line in (stderr or "").splitlines() if line.strip()]
+            detail = lines[-1][:160] if lines else f"退出码 {rc}"
+            return TranscodeResult(error=f"GIF 合成失败: {detail}")
+
+        try:
+            actual_bytes = await run_blocking(os.path.getsize, output_path)
+        except OSError as e:
+            return TranscodeResult(error=f"读取 GIF 产物失败: {_describe_os_error(e)}")
+        return TranscodeResult(
+            file_path=output_path,
+            size_mb=actual_bytes / 1024 / 1024,
+        )
+    except asyncio.CancelledError:
+        cleanup_file(output_path)
+        raise
+    finally:
+        cleanup_file(palette_path)

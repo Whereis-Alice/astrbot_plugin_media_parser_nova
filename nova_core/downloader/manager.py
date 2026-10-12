@@ -18,7 +18,11 @@ from ..storage import cleanup_directory, cleanup_file
 from .fileio import gather_cancel_on_error, run_blocking
 from .handler.video_cover import extract_video_cover_to_cache
 from .router import download_media
-from .transcode import TranscodeOptions, transcode_video_to_size
+from .transcode import (
+    TranscodeOptions,
+    transcode_video_to_gif,
+    transcode_video_to_size,
+)
 from .utils import check_cache_dir_available, strip_media_prefixes
 from .validator import get_video_size, validate_media_url
 
@@ -59,6 +63,9 @@ class DownloadManager:
         transcode_max_attempts: int = 2,
         transcode_extra_args: str = "",
         transcode_timeout_seconds: int = Config.DEFAULT_TRANSCODE_TIMEOUT_SECONDS,
+        gif_as_video: bool = False,
+        gif_fps: int = 15,
+        gif_max_width: int = 480,
     ):
         self.max_video_size_mb = self._normalize_size_cap(max_video_size_mb)
         self.large_video_threshold_mb = self._normalize_size_cap(
@@ -114,6 +121,9 @@ class DownloadManager:
         self.transcode_timeout_seconds = self._normalize_transcode_timeout(
             transcode_timeout_seconds
         )
+        self.gif_as_video = bool(gif_as_video)
+        self.gif_fps = max(1, min(50, int(gif_fps or 15)))
+        self.gif_max_width = max(0, int(gif_max_width or 0))
 
         self._active_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
@@ -811,6 +821,25 @@ class DownloadManager:
             "note": result.note,
         }
 
+    async def _convert_video_to_gif(self, path: str) -> Optional[str]:
+        """把推特 GIF 源视频转回 .gif 动图；失败返回 None（优雅降级）。"""
+        try:
+            result = await transcode_video_to_gif(
+                path,
+                fps=self.gif_fps,
+                max_width=self.gif_max_width,
+                timeout_seconds=self.transcode_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"推特 GIF 转码异常: {path}, 错误: {e}")
+            return None
+        if not result.file_path:
+            logger.warning(f"推特 GIF 转码失败: {result.error or '未知错误'}")
+            return None
+        return result.file_path
+
     # ── 主入口 ──────────────────────────────────────────
 
     async def process_metadata(
@@ -846,6 +875,7 @@ class DownloadManager:
         metadata["image_urls"] = image_urls
         metadata.setdefault("video_headers", {})
         metadata.setdefault("image_headers", {})
+        video_is_gif = metadata.get("video_is_gif") or []
 
         video_count = len(video_urls)
         image_count = len(image_urls)
@@ -858,6 +888,7 @@ class DownloadManager:
         video_skip_reasons: List[Optional[str]] = [None] * video_count
         video_transcode_notes: List[Optional[str]] = [None] * video_count
         video_transcode_warnings: List[Optional[str]] = [None] * video_count
+        video_as_image: List[bool] = [False] * video_count
         image_skip_reasons: List[Optional[str]] = [None] * image_count
         image_warnings: List[Optional[str]] = [None] * image_count
         has_access_denied = False
@@ -889,6 +920,11 @@ class DownloadManager:
             requires_local = self._video_requires_local(url_list, force_download)
             contains_stream = any(
                 self._is_dash_url(u) or self._is_m3u8_url(u) for u in url_list
+            )
+            is_gif_item = (
+                (not self.gif_as_video)
+                and idx < len(video_is_gif)
+                and bool(video_is_gif[idx])
             )
 
             if not url_list:
@@ -925,7 +961,7 @@ class DownloadManager:
                 {
                     "url_list": url_list,
                     "mode": mode,
-                    "needs_precheck": not contains_stream,
+                    "needs_precheck": False if is_gif_item else not contains_stream,
                 }
             )
 
@@ -985,6 +1021,11 @@ class DownloadManager:
             if on_sendable_media:
                 await on_sendable_media()
             if plan["mode"] == "local":
+                is_gif_item = (
+                    (not self.gif_as_video)
+                    and idx < len(video_is_gif)
+                    and bool(video_is_gif[idx])
+                )
                 local_items.append(
                     {
                         "kind": "video",
@@ -995,21 +1036,25 @@ class DownloadManager:
                         "headers": metadata.get("video_headers", {}),
                         "proxy": self._proxy_for(metadata, "video", proxy_addr),
                         "max_bytes": (
-                            int(self.max_video_size_mb * 1024 * 1024)
-                            if (
-                                self.max_video_size_mb > 0
-                                and (
-                                    self.transcode_enabled
-                                    or (
-                                        self.group_file_enabled
-                                        and group_file_available
+                            None
+                            if is_gif_item
+                            else (
+                                int(self.max_video_size_mb * 1024 * 1024)
+                                if (
+                                    self.max_video_size_mb > 0
+                                    and (
+                                        self.transcode_enabled
+                                        or (
+                                            self.group_file_enabled
+                                            and group_file_available
+                                        )
                                     )
                                 )
-                            )
-                            else (
-                                int(self.effective_video_cap_mb * 1024 * 1024)
-                                if self.effective_video_cap_mb > 0
-                                else None
+                                else (
+                                    int(self.effective_video_cap_mb * 1024 * 1024)
+                                    if self.effective_video_cap_mb > 0
+                                    else None
+                                )
                             )
                         ),
                     }
@@ -1111,6 +1156,28 @@ class DownloadManager:
                     video_status_codes[idx] = status_code
                 if size_mb is not None:
                     video_sizes[idx] = size_mb
+                if (
+                    not self.gif_as_video
+                    and idx < len(video_is_gif)
+                    and bool(video_is_gif[idx])
+                ):
+                    gif_path = await self._convert_video_to_gif(file_path)
+                    if gif_path:
+                        cleanup_file(file_path)
+                        file_path = gif_path
+                        try:
+                            video_sizes[idx] = (
+                                os.path.getsize(gif_path) / 1024 / 1024
+                            )
+                        except OSError:
+                            video_sizes[idx] = None
+                        video_modes[idx] = "local"
+                        video_as_image[idx] = True
+                        file_paths[position] = gif_path
+                        continue
+                    logger.warning(
+                        f"[{url}] 推特 GIF 转码失败，回退为视频发送: idx={idx}"
+                    )
                 transcode_error: Optional[str] = None
                 limit_kind, cap_mb = (
                     self._video_size_limit(size_mb)
@@ -1220,6 +1287,7 @@ class DownloadManager:
         metadata["video_skip_reasons"] = video_skip_reasons
         metadata["video_transcode_notes"] = video_transcode_notes
         metadata["video_transcode_warnings"] = video_transcode_warnings
+        metadata["video_as_image"] = video_as_image
         metadata["image_skip_reasons"] = image_skip_reasons
         metadata["image_warnings"] = image_warnings
         metadata["media_cache_dir_available"] = self.cache_dir_available
