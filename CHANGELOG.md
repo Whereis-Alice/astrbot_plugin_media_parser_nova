@@ -2,6 +2,11 @@
 
 本项目使用独立版本号；每次 Nova 维护版本的修复和改进都会记录在这里。
 
+## v1.19.2 (2026-10-12)
+
+- 增强视频下载健壮性：流式下载与 Range 分片在 CDN 中途断连（`ContentLengthError`/`ClientPayloadError`）时会按配置自动重试，不再直接判定“缓存下载失败：写入媒体文件失败”；`ClientPayloadError` 已纳入可重试异常，Range 下载最大并发由 64 收紧到 8 以降低被 CDN 断流概率。B 站、微博、抖音等共用下载器的平台一并受益。
+- 文档补充：在 [配置说明](docs/configuration.md#指令一览) 新增「指令一览」表，集中列出触发关键词、清理媒体、B 站更新 Cookie、ZIP 归档等指令的默认值与权限；平台说明补上 B 站更新 Cookie 指令名，README 快速开始增加指向。
+
 ## v1.19.1 (2026-10-12)
 
 - 修复推特 GIF 转码：palette 滤镜图在标签 [x] 前多了一个逗号，导致 paletteuse 阶段被 ffmpeg 当成空滤镜而报 `Invalid argument`，GIF 永远合成失败并回退为视频。现改为先拼接无尾逗号的滤镜链，转原始 GIF 动图恢复正常。

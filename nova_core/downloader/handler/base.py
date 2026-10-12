@@ -28,6 +28,7 @@ def _is_retryable_exception(exc: BaseException) -> bool:
         aiohttp.ServerDisconnectedError,
         aiohttp.ServerTimeoutError,
         aiohttp.ClientOSError,
+        aiohttp.ClientPayloadError,
         asyncio.TimeoutError,
     )
     if isinstance(exc, retryable_types):
@@ -252,39 +253,53 @@ async def range_download_file(
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def download_chunk(chunk_idx: int) -> Tuple[int, bool]:
-        """并发下载单个分片并写入目标文件的正确偏移。"""
+        """并发下载单个分片并写入目标文件的正确偏移（失败按配置重试）。"""
         async with semaphore:
             start = chunk_idx * chunk_size
             end = min(start + chunk_size - 1, file_size - 1)
-            data = await _download_range(
-                session,
-                url,
-                start,
-                end,
-                headers,
-                proxy,
-                chunk_idx,
-                file_size,
-            )
-            if data is None:
-                return chunk_idx, False
-
             expected_size = end - start + 1
-            if len(data) != expected_size:
-                logger.warning(
-                    f"Range分片长度异常: chunk={chunk_idx}, "
-                    f"expected={expected_size}, actual={len(data)}"
+            attempts = max(1, Config.DOWNLOAD_RETRY_ATTEMPTS)
+            for attempt in range(1, attempts + 1):
+                data = await _download_range(
+                    session,
+                    url,
+                    start,
+                    end,
+                    headers,
+                    proxy,
+                    chunk_idx,
+                    file_size,
                 )
-                return chunk_idx, False
+                if data is None:
+                    if attempt < attempts:
+                        await _sleep_before_retry(attempt)
+                        continue
+                    return chunk_idx, False
 
-            try:
-                await run_blocking(_write_range_chunk, temp_path, start, data)
-                return chunk_idx, True
-            except Exception as write_error:
-                logger.warning(
-                    f"写入Range分片失败: chunk={chunk_idx}, 错误: {write_error}"
-                )
-                return chunk_idx, False
+                if len(data) != expected_size:
+                    logger.warning(
+                        f"Range分片长度异常: chunk={chunk_idx}, "
+                        f"expected={expected_size}, actual={len(data)} "
+                        f"(第{attempt}/{attempts}次)"
+                    )
+                    if attempt < attempts:
+                        await _sleep_before_retry(attempt)
+                        continue
+                    return chunk_idx, False
+
+                try:
+                    await run_blocking(_write_range_chunk, temp_path, start, data)
+                    return chunk_idx, True
+                except Exception as write_error:
+                    logger.warning(
+                        f"写入Range分片失败: chunk={chunk_idx}, 错误: {write_error} "
+                        f"(第{attempt}/{attempts}次)"
+                    )
+                    if attempt < attempts:
+                        await _sleep_before_retry(attempt)
+                        continue
+                    return chunk_idx, False
+            return chunk_idx, False
 
     tasks = [asyncio.create_task(download_chunk(i)) for i in range(num_chunks)]
     try:
@@ -426,7 +441,6 @@ async def download_media_stream(
         await active_budget.release(written)
         raise
     except Exception as e:
-        logger.warning(f"下载媒体流失败: {file_path}, 错误: {e}")
         if output_file is not None:
             try:
                 await run_blocking(output_file.close)
@@ -434,6 +448,10 @@ async def download_media_stream(
                 pass
         cleanup_file(temp_path)
         await active_budget.release(written)
+        if _is_retryable_exception(e):
+            # 流式下载中途断连（如 ClientPayloadError/ContentLengthError）交由上层重试
+            raise
+        logger.warning(f"下载媒体流失败: {file_path}, 错误: {e}")
         return False
 
 

@@ -54,7 +54,7 @@ astrbot_plugin_media_parser_nova
 
 装好即用：各平台默认为「全部发送」，直接在聊天里发一条支持的链接就会解析。
 
-三种触发方式：自动解析链接、引用消息后发关键词、手动关键词（默认含 `媒体解析`）。全部配置项见 [配置说明](docs/configuration.md)。
+三种触发方式：自动解析链接、引用消息后发关键词、手动关键词（默认含 `媒体解析`）。全部指令默认值见 [指令一览](docs/configuration.md#指令一览)，其余配置项见 [配置说明](docs/configuration.md)。
 
 ## YouTube 已独立
 
