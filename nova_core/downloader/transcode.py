@@ -579,9 +579,9 @@ async def transcode_video_to_gif(
     fps = max(1, min(50, int(fps or 15)))
     max_width = max(0, int(max_width or 0))
 
-    scale = (
-        f"scale={max_width}:-1:flags=lanczos," if max_width > 0 else ""
-    )
+    filter_chain = f"fps={fps}"
+    if max_width > 0:
+        filter_chain += f",scale={max_width}:-1:flags=lanczos"
     output_path = await run_blocking(_resolve_gif_output_path, input_path)
     base, _ = os.path.splitext(output_path)
     palette_path = f"{base}.palette.png"
@@ -590,13 +590,13 @@ async def transcode_video_to_gif(
     palette_args = [
         "ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", input_path,
-        "-vf", f"fps={fps},{scale}palettegen",
+        "-vf", f"{filter_chain},palettegen",
         palette_path,
     ]
     use_args = [
         "ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", input_path, "-i", palette_path,
-        "-lavfi", f"fps={fps},{scale}[x];[x][1:v]paletteuse",
+        "-lavfi", f"{filter_chain}[x];[x][1:v]paletteuse",
         "-loop", "0",
         output_path,
     ]

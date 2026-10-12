@@ -704,6 +704,56 @@ class TwitterGifTranscodeTests(unittest.TestCase):
             if os.path.exists(src_path):
                 os.remove(src_path)
 
+    def test_transcode_filtergraph_has_no_dangling_comma(self):
+        """回归：paletteuse 的 -lavfi 里标签 [x] 前不能有逗号。"""
+        import os
+        import tempfile
+
+        from nova_core.downloader import transcode as transcode_module
+
+        captured = []
+        result = None
+
+        src_fd, src_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(src_fd)
+        try:
+            async def _fake_capture(args, timeout=None):
+                captured.append(list(args))
+                with open(args[-1], "wb") as fh:
+                    fh.write(b"GIF89a fake payload")
+                return (0, "", "")
+
+            with patch.object(
+                transcode_module, "_run_capture", side_effect=_fake_capture
+            ):
+                result = asyncio.run(
+                    transcode_module.transcode_video_to_gif(
+                        src_path, fps=15, max_width=480, timeout_seconds=30
+                    )
+                )
+
+            self.assertIsNone(result.error)
+            self.assertEqual(len(captured), 2)
+            palette_vf = captured[0][captured[0].index("-vf") + 1]
+            use_lavfi = captured[1][captured[1].index("-lavfi") + 1]
+
+            self.assertTrue(palette_vf.endswith(",palettegen"))
+            self.assertIn("scale=480:-1:flags=lanczos", palette_vf)
+
+            # 关键回归点：标签 [x] 前若带逗号，ffmpeg 会解析出空滤镜并报 Invalid argument。
+            self.assertNotIn(",[x]", use_lavfi)
+            self.assertIn("[x];[x][1:v]paletteuse", use_lavfi)
+            self.assertTrue(
+                use_lavfi.startswith("fps=15,scale=480:-1:flags=lanczos[x]")
+            )
+            if result.file_path and os.path.exists(result.file_path):
+                os.remove(result.file_path)
+        finally:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+            if result and result.file_path and os.path.exists(result.file_path):
+                os.remove(result.file_path)
+
 
 if __name__ == "__main__":
     unittest.main()
