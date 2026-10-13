@@ -55,6 +55,7 @@ astrbot_plugin_media_parser_nova/
     │   ├── router.py                # 下载路由：dash/m3u8/image/video/range
     │   ├── transcode.py             # 独立可配置的 ffmpeg 视频重编码策略
     │   ├── utils.py                 # 缓存路径、扩展名、URL 前缀、Content-Type 工具
+    │   ├── mirror.py                # B站 CDN 镜像候选生成，坏节点换源
     │   ├── validator.py             # 媒体预检、大小探测、响应校验
     │   └── handler/
     │       ├── base.py              # 通用流式下载、Range 下载、重试
@@ -260,6 +261,8 @@ video_count .. video_count + image_count   图片
 - `range:`：普通视频路径中先尝试并发 Range 下载，失败降级普通视频下载。
 - `image`：进入图片处理器；非 jpg/jpeg/png 会尝试 ffmpeg 转 PNG。
 - 其他：普通视频流式下载。
+
+B站 CDN 直链在 `range_download_file()` 与 `download_media_from_url()` 中会通过 `mirror.py` 生成候选源：境外出口常被 playurl 路由到限流镜像（表现为 `status=532` 或传输中断流），此时保持签名路径与查询不变、只替换 CDN 主机重试，优先 Akamai 全球节点；候选源按顺序尝试，全部失败才判定下载失败。非 B站 CDN 直链只有自身一个候选，行为不变。
 
 独立压缩策略由 `transcode.py` 承担，在 `process_metadata()` 回填下载结果时按视频顺序串行触发（`_fit_video_to_send_limit()`）：
 

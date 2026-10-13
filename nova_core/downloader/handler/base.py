@@ -5,6 +5,7 @@ import os
 import re
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -17,6 +18,7 @@ from ..budget import ByteBudget, DownloadLimitExceeded, resolve_max_bytes
 from ..fileio import run_blocking
 from ..security import safe_request
 from ...constants import Config
+from ..mirror import build_mirror_candidates
 
 
 def _is_retryable_exception(exc: BaseException) -> bool:
@@ -42,6 +44,25 @@ async def _sleep_before_retry(attempt: int) -> None:
     """按指数退避等待下一次重试。"""
     delay = Config.DOWNLOAD_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
     await asyncio.sleep(delay)
+
+
+def _resolve_download_attempts() -> int:
+    """读取流式下载的重试次数（至少 1 次）。"""
+    try:
+        return max(1, int(Config.DOWNLOAD_RETRY_ATTEMPTS))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _resolve_chunk_attempts(candidate_count: int) -> int:
+    """Range 分片的每片尝试次数。
+
+    存在多个 CDN 镜像候选时只尝试一次：单镜像反复重试修不好坏节点，
+    快速失败换源比在坏镜像上耗时间更划算。
+    """
+    if candidate_count > 1:
+        return 1
+    return _resolve_download_attempts()
 
 
 def _format_download_error(exc: BaseException) -> str:
@@ -217,23 +238,37 @@ async def range_download_file(
         chunk_size = Config.RANGE_DOWNLOAD_CHUNK_SIZE
         max_concurrent = min(16, Config.RANGE_DOWNLOAD_MAX_CONCURRENT)
 
-    file_size = await _get_file_size(session, url, headers, proxy)
+    candidates = build_mirror_candidates(url)
+    chunk_attempts = _resolve_chunk_attempts(len(candidates))
+    read_url = candidates[0]
+    file_size = None
+    probe_failures = []
+    for mirror_index, candidate in enumerate(candidates):
+        if mirror_index:
+            logger.debug(
+                f"换源重试Range下载: {candidate}（原始主机 "
+                f"{urlsplit(candidates[0]).hostname or '未知'}）"
+            )
+        file_size = await _get_file_size(session, candidate, headers, proxy)
+        if file_size is not None:
+            read_url = candidate
+            if mirror_index:
+                logger.info(
+                    f"Range下载已切换CDN镜像: {urlsplit(candidate).netloc}"
+                )
+            break
+        probe_failures.append(urlsplit(candidate).netloc or candidate)
     if file_size is None:
-        logger.debug(f"Range下载无法获取文件大小: {url}")
+        logger.warning(
+            f"Range下载无法获取文件大小: {url}（已尝试 {len(probe_failures)} 个源）"
+        )
         return None
 
     active_budget = budget or ByteBudget(resolve_max_bytes(max_bytes, is_video=True))
-    try:
-        await active_budget.consume(file_size)
-    except DownloadLimitExceeded as e:
-        logger.warning(f"Range下载已拒绝: {url}, 错误: {e}")
-        return None
-    budget_reserved = file_size
 
     num_chunks = (file_size + chunk_size - 1) // chunk_size
     if num_chunks <= 1:
         logger.debug(f"Range下载文件分片数不足，跳过Range模式: {url}, size={file_size}")
-        await active_budget.release(budget_reserved)
         return None
 
     logger.debug(
@@ -241,13 +276,23 @@ async def range_download_file(
         f"size={file_size}, chunks={num_chunks}, concurrent={max_concurrent}"
     )
 
+    try:
+        if file_size > active_budget.remaining:
+            raise DownloadLimitExceeded(
+                "下载内容超过硬限制"
+                f"（{file_size / 1024 / 1024:.1f}MB > "
+                f"{active_budget.limit / 1024 / 1024:.1f}MB）"
+            )
+    except DownloadLimitExceeded as e:
+        logger.warning(f"Range下载已拒绝: {url}, 错误: {e}")
+        return None
+
     temp_path = _temporary_path(output_path)
     try:
         await run_blocking(_prepare_range_file, temp_path, file_size)
     except Exception as e:
         logger.warning(f"创建Range目标文件失败: {output_path}, 错误: {e}")
         cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
         return None
 
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -258,11 +303,12 @@ async def range_download_file(
             start = chunk_idx * chunk_size
             end = min(start + chunk_size - 1, file_size - 1)
             expected_size = end - start + 1
-            attempts = max(1, Config.DOWNLOAD_RETRY_ATTEMPTS)
-            for attempt in range(1, attempts + 1):
+            # 预算按成功落盘的分片扣减：换源重试会回滚本次实际写入量，
+            # 不会把预算耗在已放弃的来源或失败分片上
+            for attempt in range(1, chunk_attempts + 1):
                 data = await _download_range(
                     session,
-                    url,
+                    read_url,
                     start,
                     end,
                     headers,
@@ -270,82 +316,110 @@ async def range_download_file(
                     chunk_idx,
                     file_size,
                 )
-                if data is None:
-                    if attempt < attempts:
-                        await _sleep_before_retry(attempt)
-                        continue
-                    return chunk_idx, False
-
-                if len(data) != expected_size:
-                    logger.warning(
-                        f"Range分片长度异常: chunk={chunk_idx}, "
-                        f"expected={expected_size}, actual={len(data)} "
-                        f"(第{attempt}/{attempts}次)"
-                    )
-                    if attempt < attempts:
+                if data is None or len(data) != expected_size:
+                    if data is not None:
+                        logger.warning(
+                            f"Range分片长度异常: chunk={chunk_idx}, "
+                            f"expected={expected_size}, actual={len(data)} "
+                            f"(第{attempt}/{chunk_attempts}次)"
+                        )
+                    if attempt < chunk_attempts:
                         await _sleep_before_retry(attempt)
                         continue
                     return chunk_idx, False
 
                 try:
+                    # 先落盘再扣预算：写失败时预算未被占用，无需回滚
                     await run_blocking(_write_range_chunk, temp_path, start, data)
+                    await active_budget.consume(expected_size)
                     return chunk_idx, True
+                except DownloadLimitExceeded:
+                    raise
                 except Exception as write_error:
                     logger.warning(
-                        f"写入Range分片失败: chunk={chunk_idx}, 错误: {write_error} "
-                        f"(第{attempt}/{attempts}次)"
+                        f"写入Range分片失败: chunk={chunk_idx}, 错误: "
+                        f"{write_error} (第{attempt}/{chunk_attempts}次)"
                     )
-                    if attempt < attempts:
+                    if attempt < chunk_attempts:
                         await _sleep_before_retry(attempt)
                         continue
                     return chunk_idx, False
             return chunk_idx, False
 
-    tasks = [asyncio.create_task(download_chunk(i)) for i in range(num_chunks)]
-    try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
-        raise
-    except Exception as e:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.warning(f"Range下载写入流程失败: {url}, 错误: {e}")
-        cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
-        return None
+    completed = False
+    attempt_consumed = [0]
 
-    failed_chunks: List[Optional[int]] = []
-    for result in results:
-        if isinstance(result, BaseException) and not isinstance(result, Exception):
-            # CancelledError 等非 Exception 异常必须向上传播，不能当成普通失败吞掉
+    def _consumed_from_results(results) -> int:
+        """统计本轮实际扣减过预算的分片字节数。"""
+        total = 0
+        for result in results:
+            if isinstance(result, tuple) and len(result) == 2 and result[1]:
+                start = result[0] * chunk_size
+                end = min(start + chunk_size - 1, file_size - 1)
+                total += end - start + 1
+        return total
+
+    for candidate in candidates:
+        if candidate != read_url:
+            # 当前镜像全部分片失败后，换源重试；签名与路径保持不变
+            logger.info(f"Range下载换源重试: {urlsplit(candidate).netloc}")
+            read_url = candidate
+        tasks = [asyncio.create_task(download_chunk(i)) for i in range(num_chunks)]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             cleanup_file(temp_path)
-            await active_budget.release(budget_reserved)
-            raise result
-        if isinstance(result, Exception):
-            logger.warning(f"Chunk下载异常: {result}")
-            failed_chunks.append(None)
-        elif isinstance(result, tuple) and len(result) == 2:
-            chunk_idx, success = result
-            if not success:
-                failed_chunks.append(chunk_idx)
-        else:
-            failed_chunks.append(None)
+            await active_budget.release(attempt_consumed[0])
+            raise
+        except Exception as e:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.warning(f"Range下载写入流程失败: {read_url}, 错误: {e}")
+            cleanup_file(temp_path)
+            await active_budget.release(attempt_consumed[0])
+            return None
 
-    if failed_chunks:
+        attempt_consumed[0] = _consumed_from_results(results)
+        failed_chunks: List[Optional[int]] = []
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, Exception):
+                # CancelledError 等非 Exception 异常必须向上传播，不能当成普通失败吞掉
+                cleanup_file(temp_path)
+                await active_budget.release(attempt_consumed[0])
+                raise result
+            if isinstance(result, DownloadLimitExceeded):
+                cleanup_file(temp_path)
+                raise result
+            if isinstance(result, tuple) and len(result) == 2 and result[1]:
+                continue
+            if isinstance(result, Exception):
+                logger.warning(f"Chunk下载异常: {result}")
+                failed_chunks.append(None)
+            elif isinstance(result, tuple) and len(result) == 2:
+                chunk_idx, success = result
+                if not success:
+                    failed_chunks.append(chunk_idx)
+            else:
+                failed_chunks.append(None)
+
+        if not failed_chunks:
+            completed = True
+            break
+
+        await active_budget.release(attempt_consumed[0])
         logger.warning(
             f"部分chunks下载失败 ({len(failed_chunks)}/{num_chunks})，"
-            f"放弃Range结果: {url}"
+            f"放弃Range结果: {read_url}"
         )
+
+    if not completed:
         cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
         return None
 
     try:
@@ -353,7 +427,7 @@ async def range_download_file(
     except Exception as e:
         logger.warning(f"读取Range下载文件大小失败: {output_path}, 错误: {e}")
         cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
+        await active_budget.release(attempt_consumed[0])
         return None
 
     if actual_size != file_size:
@@ -361,19 +435,19 @@ async def range_download_file(
             f"Range下载文件大小异常: {url}, expected={file_size}, actual={actual_size}"
         )
         cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
+        await active_budget.release(attempt_consumed[0])
         return None
 
     try:
         await run_blocking(_replace_file, temp_path, output_path)
     except asyncio.CancelledError:
         cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
+        await active_budget.release(attempt_consumed[0])
         raise
     except Exception as e:
         logger.warning(f"提交Range下载文件失败: {output_path}, 错误: {e}")
         cleanup_file(temp_path)
-        await active_budget.release(budget_reserved)
+        await active_budget.release(attempt_consumed[0])
         return None
 
     size_mb = actual_size / (1024 * 1024)
@@ -455,7 +529,7 @@ async def download_media_stream(
         return False
 
 
-async def download_media_from_url(
+async def _download_single_url(
     session: aiohttp.ClientSession,
     media_url: str,
     file_path_generator: Callable[[str, str], str],
@@ -465,8 +539,9 @@ async def download_media_from_url(
     retry_enabled: bool = True,
     max_bytes: Optional[int] = None,
     budget: Optional[ByteBudget] = None,
+    attempts_override: Optional[int] = None,
 ) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[str]]:
-    """通用媒体下载函数，封装公共的下载逻辑
+    """对单个媒体直链执行流式下载（同一链接内按配置重试）。
 
     Args:
         session: aiohttp会话
@@ -480,7 +555,11 @@ async def download_media_from_url(
         (file_path, size_mb, status_code, error) 元组；
         成功时 error 为 None，失败时尽量保留 HTTP 状态码与错误文本。
     """
-    attempts = Config.DOWNLOAD_RETRY_ATTEMPTS if retry_enabled else 1
+    attempts = (
+        attempts_override
+        if attempts_override is not None
+        else (_resolve_download_attempts() if retry_enabled else 1)
+    )
     last_error = None
     last_status_code = None
     for attempt in range(1, attempts + 1):
@@ -569,3 +648,55 @@ async def download_media_from_url(
         last_status_code,
         _format_download_error(last_error) if last_error else "下载失败",
     )
+
+
+async def download_media_from_url(
+    session: aiohttp.ClientSession,
+    media_url: str,
+    file_path_generator: Callable[[str, str], str],
+    is_video: bool = True,
+    headers: dict = None,
+    proxy: str = None,
+    retry_enabled: bool = True,
+    max_bytes: Optional[int] = None,
+    budget: Optional[ByteBudget] = None,
+) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[str]]:
+    """通用媒体下载入口：必要时在 CDN 镜像之间换源。
+
+    对 B站 CDN 直链，主镜像彻底失败后自动更换主机名重试（签名与路径
+    保持不变）；其它平台直链只有自身一个候选，等价于单链接下载。
+    """
+    candidates = build_mirror_candidates(media_url)
+    attempts = _resolve_download_attempts() if retry_enabled else 1
+    if len(candidates) > 1:
+        # 换源重试本身相当于额外的整链路尝试，单镜像内部不再叠加重复额度
+        attempts = 1
+    last_status_code = None
+    last_error = None
+    for mirror_index, candidate in enumerate(candidates):
+        if mirror_index:
+            logger.debug(
+                f"换源重试普通下载: {candidate}（原始主机 "
+                f"{urlsplit(candidates[0]).hostname or '未知'}）"
+            )
+        file_path, size_mb, status_code, error = await _download_single_url(
+            session=session,
+            media_url=candidate,
+            file_path_generator=file_path_generator,
+            is_video=is_video,
+            headers=headers,
+            proxy=proxy,
+            retry_enabled=retry_enabled,
+            max_bytes=max_bytes,
+            budget=budget,
+            attempts_override=attempts,
+        )
+        if file_path:
+            if mirror_index:
+                logger.info(
+                    f"普通下载已切换CDN镜像: {urlsplit(candidate).netloc}"
+                )
+            return file_path, size_mb, status_code, error
+        last_status_code = status_code or last_status_code
+        last_error = error or last_error
+    return None, None, last_status_code, last_error or "下载失败"
