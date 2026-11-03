@@ -27,6 +27,7 @@ from .nova_core.message_adapter.node_builder import (
     summarize_node_counts,
 )
 from .nova_core.message_adapter.sender import MessageSender
+from .nova_core.metadata_visibility import access_notice_message
 from .nova_core.parser import ParserManager
 from .nova_core.parser.utils import extract_url_from_card_data
 from .nova_core.storage import (
@@ -44,7 +45,7 @@ from .nova_core.translation import MetadataTranslator, build_card_metadata_list
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.18.0",
+    "1.20.0",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -436,6 +437,8 @@ class MediaParserNovaPlugin(Star):
 
         text_enabled = bool(metadata.get("_enable_text_metadata", True))
         rich_enabled = bool(metadata.get("_enable_rich_media", True))
+        if (text_enabled or rich_enabled) and access_notice_message(metadata):
+            return True
         has_media = bool(metadata.get("video_urls")) or bool(metadata.get("image_urls"))
         has_text = (
             self._has_text_metadata(metadata)

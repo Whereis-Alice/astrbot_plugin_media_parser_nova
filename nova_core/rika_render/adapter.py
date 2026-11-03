@@ -22,6 +22,9 @@ PLATFORM_DISPLAY_NAMES: Dict[str, str] = {
     "twitter": "推特",
     "tiktok": "TikTok",
     "pixiv": "Pixiv",
+    "niconico": "niconico",
+    "steam": "Steam",
+    "zhihu": "知乎",
     "toutiao": "今日头条",
     "xianyu": "闲鱼",
     "xiaoheihe": "小黑盒",
@@ -258,7 +261,22 @@ def build_parse_result(
     online = str(metadata.get("online") or "").strip()
     if online:
         extra["online"] = online
-    warnings = metadata.get("limit_warnings") or []
+    raw_warnings = metadata.get("limit_warnings") or []
+    warnings = (
+        [
+            str(warning).strip() for warning in raw_warnings
+            if warning is not None and str(warning).strip()
+        ]
+        if isinstance(raw_warnings, (list, tuple))
+        else [str(raw_warnings).strip()]
+    )
+    access_message = str(metadata.get("access_message") or "").strip()
+    if (
+        access_message
+        and (metadata.get("access_status") != "full" or metadata.get("is_preview_only"))
+        and access_message not in warnings
+    ):
+        warnings.append(access_message)
     if warnings:
         extra["limit_warnings"] = list(warnings)
 

@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import aiohttp
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from ...logger import logger
 
@@ -37,6 +39,25 @@ class M3U8DownloadError(RuntimeError):
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class _HLSResource(str):
+    """Keep per-segment encryption data while preserving the URL interface."""
+
+    def __new__(cls, url: str, key_uri: str, iv: bytes):
+        resource = super().__new__(cls, url)
+        resource.key_uri = key_uri
+        resource.iv = iv
+        return resource
+
+
+def _attribute(line: str, name: str) -> Optional[str]:
+    match = re.search(
+        rf'(?:^|[:,])\s*{re.escape(name)}=(?:"([^"]*)"|([^,\s]+))',
+        line,
+        re.IGNORECASE,
+    )
+    return (match.group(1) if match.group(1) is not None else match.group(2)) if match else None
 
 
 def _status_code_from_exception(exc: BaseException) -> Optional[int]:
@@ -107,6 +128,72 @@ class M3U8Handler:
         self.headers = headers or {}
         self.proxy = proxy
         self.max_concurrent_segments = max_concurrent_segments
+        self._aes_keys: Dict[str, bytes] = {}
+        self._aes_key_lock = asyncio.Lock()
+
+    async def _get_aes_key(
+        self, key_uri: str, budget: Optional[ByteBudget] = None
+    ) -> bytes:
+        """Fetch only a 16-byte identity key through the protected HTTP path."""
+        async with self._aes_key_lock:
+            if key_uri in self._aes_keys:
+                return self._aes_keys[key_uri]
+            if len(self._aes_keys) >= 256:
+                raise M3U8DownloadError("M3U8密钥数量超过安全限制")
+            for attempt in range(1, Config.DOWNLOAD_RETRY_ATTEMPTS + 1):
+                consumed = 0
+                try:
+                    response = await safe_request(
+                        self.session,
+                        "GET",
+                        key_uri,
+                        headers=self.headers,
+                        proxy=self.proxy,
+                        timeout=aiohttp.ClientTimeout(total=Config.VIDEO_SIZE_CHECK_TIMEOUT),
+                    )
+                    async with response:
+                        response.raise_for_status()
+                        key = bytearray()
+                        async for chunk in response.content.iter_chunked(17):
+                            if len(key) + len(chunk) > 16:
+                                raise M3U8DownloadError("AES-128密钥长度必须为16字节")
+                            if budget is not None:
+                                await budget.consume(len(chunk))
+                                consumed += len(chunk)
+                            key.extend(chunk)
+                        if len(key) != 16:
+                            raise M3U8DownloadError("AES-128密钥长度必须为16字节")
+                    self._aes_keys[key_uri] = bytes(key)
+                    return bytes(key)
+                except asyncio.CancelledError:
+                    if budget is not None:
+                        await budget.release(consumed)
+                    raise
+                except Exception as exc:
+                    if budget is not None:
+                        await budget.release(consumed)
+                    if attempt < Config.DOWNLOAD_RETRY_ATTEMPTS and _is_retryable_exception(exc):
+                        await _sleep_before_retry(attempt)
+                        continue
+                    if isinstance(exc, M3U8DownloadError):
+                        raise
+                    raise M3U8DownloadError(
+                        _format_download_error(exc), _status_code_from_exception(exc)
+                    ) from exc
+            raise M3U8DownloadError("无法取得AES-128密钥")
+
+    async def _aes_context(
+        self, resource: str, budget: Optional[ByteBudget]
+    ):
+        if not isinstance(resource, _HLSResource):
+            return None, None
+        if len(resource.iv) != 16:
+            raise M3U8DownloadError("AES-128 IV长度必须为16字节")
+        key = await self._get_aes_key(resource.key_uri, budget)
+        return (
+            Cipher(algorithms.AES(key), modes.CBC(resource.iv)).decryptor(),
+            padding.PKCS7(128).unpadder(),
+        )
 
     async def fetch_text(self, url: str) -> str:
         """获取文本内容
@@ -177,6 +264,7 @@ class M3U8Handler:
         for attempt in range(1, attempts + 1):
             consumed = 0
             try:
+                decryptor, unpadder = await self._aes_context(url, active_budget)
                 response = await safe_request(
                     self.session,
                     "GET",
@@ -196,7 +284,14 @@ class M3U8Handler:
                         if consumed > MAX_HLS_INIT_BYTES:
                             raise M3U8DownloadError("M3U8初始化分片超过安全大小限制")
                         chunks.append(chunk)
-                    return b"".join(chunks)
+                    payload = b"".join(chunks)
+                    if decryptor is not None:
+                        try:
+                            plain = decryptor.update(payload) + decryptor.finalize()
+                            return unpadder.update(plain) + unpadder.finalize()
+                        except ValueError as exc:
+                            raise M3U8DownloadError("AES-128初始化分片解密失败") from exc
+                    return payload
             except asyncio.CancelledError:
                 await active_budget.release(consumed)
                 raise
@@ -231,6 +326,7 @@ class M3U8Handler:
             consumed = 0
             output_file = None
             try:
+                decryptor, unpadder = await self._aes_context(url, active_budget)
                 await run_blocking(
                     os.makedirs, os.path.dirname(output_path), exist_ok=True
                 )
@@ -250,7 +346,15 @@ class M3U8Handler:
                     ):
                         await active_budget.consume(len(chunk))
                         consumed += len(chunk)
+                        if decryptor is not None:
+                            chunk = unpadder.update(decryptor.update(chunk))
                         await run_blocking(output_file.write, chunk)
+                    if decryptor is not None:
+                        try:
+                            tail = unpadder.update(decryptor.finalize()) + unpadder.finalize()
+                        except ValueError as exc:
+                            raise M3U8DownloadError("AES-128视频分片解密失败") from exc
+                        await run_blocking(output_file.write, tail)
                     await run_blocking(output_file.flush)
                     await run_blocking(os.fsync, output_file.fileno())
                     await run_blocking(output_file.close)
@@ -293,13 +397,40 @@ class M3U8Handler:
         content = await self.fetch_text(url)
         init_seg = None
         segments = []
+        key_uri = None
+        explicit_iv = None
+        sequence = 0
 
         for line in content.split("\n"):
             line = line.strip()
             upper_line = line.upper()
+            if upper_line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    sequence = int(line.split(":", 1)[1].strip())
+                    if not 0 <= sequence < (1 << 128):
+                        raise ValueError
+                except ValueError as exc:
+                    raise M3U8DownloadError("M3U8媒体序号无效") from exc
+                continue
             if upper_line.startswith("#EXT-X-KEY"):
-                if "METHOD=NONE" not in upper_line:
-                    raise M3U8DownloadError("加密M3U8暂不支持")
+                method = (_attribute(line, "METHOD") or "").upper()
+                if method == "NONE":
+                    key_uri = None
+                    explicit_iv = None
+                    continue
+                key_format = _attribute(line, "KEYFORMAT") or "identity"
+                if method != "AES-128" or key_format != "identity":
+                    raise M3U8DownloadError("仅支持普通AES-128 HLS，不支持SAMPLE-AES或DRM")
+                uri = _extract_uri_attribute(line)
+                if not uri:
+                    raise M3U8DownloadError("AES-128 HLS缺少密钥URI")
+                key_uri = urljoin(url, uri)
+                iv = _attribute(line, "IV")
+                explicit_iv = None
+                if iv is not None:
+                    if not re.fullmatch(r"0[xX][0-9a-fA-F]{32}", iv):
+                        raise M3U8DownloadError("AES-128 IV必须是16字节十六进制数")
+                    explicit_iv = bytes.fromhex(iv[2:])
                 continue
             if upper_line.startswith("#EXT-X-BYTERANGE") or (
                 upper_line.startswith("#EXT-X-MAP") and "BYTERANGE=" in upper_line
@@ -310,13 +441,22 @@ class M3U8Handler:
             if upper_line.startswith("#EXT-X-MAP"):
                 uri = _extract_uri_attribute(line)
                 if uri:
-                    init_seg = uri
+                    absolute_uri = urljoin(url, uri)
+                    if key_uri:
+                        if explicit_iv is None:
+                            raise M3U8DownloadError("加密HLS初始化分片必须指定IV")
+                        init_seg = _HLSResource(absolute_uri, key_uri, explicit_iv)
+                    else:
+                        init_seg = absolute_uri
             elif line and not line.startswith("#"):
-                segments.append(line)
-
-        if init_seg:
-            init_seg = urljoin(url, init_seg)
-        segments = [urljoin(url, segment) for segment in segments]
+                absolute_uri = urljoin(url, line)
+                if key_uri:
+                    if sequence >= (1 << 128):
+                        raise M3U8DownloadError("M3U8媒体序号超过IV范围")
+                    segments.append(_HLSResource(absolute_uri, key_uri, explicit_iv or sequence.to_bytes(16, "big")))
+                else:
+                    segments.append(absolute_uri)
+                sequence += 1
         return init_seg, segments
 
     async def download_segments(

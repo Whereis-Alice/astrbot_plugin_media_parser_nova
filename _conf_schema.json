@@ -124,6 +124,39 @@
           "仅富媒体"
         ],
         "default": "全部发送"
+      },
+      "niconico": {
+        "description": "niconico（ニコニコ）",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅富媒体"
+        ],
+        "default": "全部发送"
+      },
+      "steam": {
+        "description": "Steam",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅富媒体"
+        ],
+        "default": "全部发送"
+      },
+      "zhihu": {
+        "description": "知乎",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅富媒体"
+        ],
+        "default": "全部发送"
       }
     }
   },
@@ -750,9 +783,10 @@
         "type": "string",
         "options": [
           "仅发送信息与封面",
-          "上传为文件（群聊/私聊）"
+          "上传为文件（群聊/私聊）",
+          "超限直接上传原文件（不压缩）"
         ],
-        "hint": "视频在压缩策略执行后仍超限时，可改为文件发送：QQ 群聊上传群文件，QQ 私聊发送给当前用户。需要 aiocqhttp / OneBot v11 协议端支持对应文件接口；不支持或明确拒绝时提示原因并保留原链接。",
+        "hint": "超限直接上传原文件：超过普通视频发送上限后直接发送 QQ 群文件/私聊文件，优先于所有压缩设置。原文件仍受下载硬上限限制。原“上传为文件”模式继续先按配置压缩，再回退文件。需要可用缓存和支持文件上传的协议端。",
         "default": "仅发送信息与封面"
       },
       "group_file_timeout_seconds": {
@@ -764,7 +798,7 @@
       "transcode_oversize_video": {
         "description": "启用视频压缩",
         "type": "bool",
-        "hint": "独立的视频重编码策略。需要宿主安装 ffmpeg，压缩期间会占用 CPU；关闭后不会因为普通发送上限而隐式压缩。",
+        "hint": "独立的视频重编码策略。需要宿主安装 ffmpeg，压缩期间会占用 CPU；关闭后不会因为普通发送上限而隐式压缩。 选择“超限直接上传原文件（不压缩）”时忽略所有压缩设置。",
         "default": true
       },
       "transcode_mode": {
@@ -1129,6 +1163,30 @@
             "default": true
           }
         }
+      },
+      "niconico": {
+        "description": "niconico 解析与媒体下载使用代理",
+        "type": "bool",
+        "hint": "需要先填写“代理地址”。",
+        "default": false
+      },
+      "steam": {
+        "description": "Steam 解析与媒体下载使用代理",
+        "type": "bool",
+        "hint": "需要先填写“代理地址”。",
+        "default": false
+      },
+      "weibo": {
+        "description": "微博 解析与媒体下载使用代理",
+        "type": "bool",
+        "hint": "需要先填写“代理地址”。",
+        "default": false
+      },
+      "zhihu": {
+        "description": "知乎 解析与媒体下载使用代理",
+        "type": "bool",
+        "hint": "需要先填写“代理地址”。",
+        "default": false
       }
     }
   },
@@ -1178,6 +1236,89 @@
         "type": "bool",
         "hint": "输出完整工作流详细日志",
         "default": false
+      }
+    }
+  },
+  "niconico": {
+    "description": "niconico 设置",
+    "type": "object",
+    "hint": "公开内容通常可匿名解析；账号可访问的内容可填浏览器 Cookie（包含 user_session）。会员、地区和版权限制仍按账号权限处理。",
+    "items": {
+      "cookie": {
+        "description": "浏览器 Cookie（可选）",
+        "type": "string",
+        "hint": "只用于对应平台的本地请求；请勿公开分享。留空使用匿名访问。",
+        "default": ""
+      }
+    }
+  },
+  "tiktok": {
+    "description": "TikTok 设置",
+    "type": "object",
+    "hint": "视频、图集与分享短链。遇到风控或登录页可填浏览器 Cookie，并配置可访问 TikTok 的代理。",
+    "items": {
+      "cookie": {
+        "description": "浏览器 Cookie（可选）",
+        "type": "string",
+        "hint": "只用于对应平台的本地请求；请勿公开分享。留空使用匿名访问。",
+        "default": ""
+      }
+    }
+  },
+  "weibo": {
+    "description": "微博设置",
+    "type": "object",
+    "hint": "支持桌面、移动端、视频与 t.cn 短链。访客接口被风控时可填已登录的浏览器 Cookie。",
+    "items": {
+      "cookie": {
+        "description": "浏览器 Cookie（可选）",
+        "type": "string",
+        "hint": "只用于对应平台的本地请求；请勿公开分享。留空使用匿名访问。",
+        "default": ""
+      }
+    }
+  },
+  "zhihu": {
+    "description": "知乎设置",
+    "type": "object",
+    "hint": "支持回答、问题和专栏文章。匿名访问被限制时可填已登录 Cookie；登录可见、付费与删除内容不会绕过权限。",
+    "items": {
+      "cookie": {
+        "description": "浏览器 Cookie（可选）",
+        "type": "string",
+        "hint": "只用于对应平台的本地请求；请勿公开分享。留空使用匿名访问。",
+        "default": ""
+      }
+    }
+  },
+  "steam": {
+    "description": "Steam 设置",
+    "type": "object",
+    "hint": "解析游戏商店页信息、截图和宣传视频；宣传视频通常需要 ffmpeg 合并 HLS。",
+    "items": {
+      "language": {
+        "description": "商店语言",
+        "type": "string",
+        "default": "schinese",
+        "hint": "Steam 语言代码，如 schinese、english、japanese。"
+      },
+      "country_code": {
+        "description": "商店地区",
+        "type": "string",
+        "default": "CN",
+        "hint": "两位国家/地区代码，影响价格和商店可用性，如 CN、US、JP。"
+      },
+      "max_screenshots": {
+        "description": "最多截图数",
+        "type": "int",
+        "default": 6,
+        "hint": "0–20，0 不发送截图。"
+      },
+      "max_trailers": {
+        "description": "最多宣传视频数",
+        "type": "int",
+        "default": 1,
+        "hint": "0–5，0 不发送宣传视频。"
       }
     }
   }

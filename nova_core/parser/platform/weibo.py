@@ -1,18 +1,19 @@
 """微博解析器实现。"""
 
+import asyncio
 import html as html_lib
 import json
 import re
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 
 import aiohttp
 
 from ...logger import logger
 
 from .base import BaseVideoParser
-from ..utils import build_request_headers
+from ..utils import SkipParse, build_request_headers, trim_url_tail
 
 
 class WeiboParser(BaseVideoParser):
@@ -23,10 +24,17 @@ class WeiboParser(BaseVideoParser):
     CN_HOSTS = frozenset({"weibo.cn", "www.weibo.cn"})
     MOBILE_HOST = "m.weibo.cn"
     VIDEO_HOST = "video.weibo.com"
+    SHORT_HOST = "t.cn"
 
-    def __init__(self, hot_comment_count: int = 0):
+    def __init__(
+        self, hot_comment_count: int = 0, cookie: str = "",
+        use_proxy: bool = False, proxy_url: Optional[str] = None,
+    ):
         """初始化微博解析器"""
         super().__init__("weibo")
+        self.cookie = str(cookie or "").replace("\r", "").replace("\n", "").strip()
+        self.proxy_url = proxy_url if use_proxy and proxy_url else None
+        self.semaphore = asyncio.Semaphore(10)
         try:
             self.hot_comment_count = max(0, int(hot_comment_count))
         except (TypeError, ValueError):
@@ -60,10 +68,11 @@ class WeiboParser(BaseVideoParser):
         links: List[str] = []
         seen = set()
         for match in self.HTTP_URL_RE.finditer(text or ""):
-            link = match.group(0).rstrip(".,!?)]}>\"'，。！？；：）】》」")
+            link = trim_url_tail(match.group(0))
             if not self.can_parse(link):
                 continue
-            key = link.lower()
+            identity = self._identify_url(link)
+            key = identity if identity else link
             if key in seen:
                 continue
             seen.add(key)
@@ -81,7 +90,8 @@ class WeiboParser(BaseVideoParser):
                 return None
             if parsed.username or parsed.password:
                 return None
-            if parsed.port not in {None, 80, 443}:
+            expected_port = 80 if parsed.scheme.lower() == "http" else 443
+            if parsed.port not in {None, expected_port}:
                 return None
         except (TypeError, ValueError):
             return None
@@ -100,14 +110,53 @@ class WeiboParser(BaseVideoParser):
             if status_match:
                 return "weibo_com", status_match.group(1)
         elif host == cls.MOBILE_HOST:
-            detail_match = re.fullmatch(r"/detail/(\d+)/?", path)
+            detail_match = re.fullmatch(r"/(?:detail|status)/([A-Za-z0-9]+)/?", path)
             if detail_match:
                 return "m_weibo_cn", detail_match.group(1)
         elif host == cls.VIDEO_HOST and path.rstrip("/") == "/show":
             video_ids = parse_qs(parsed.query).get("fid") or []
             if video_ids and re.fullmatch(r"\d+:\d+", video_ids[0]):
                 return "video_weibo", video_ids[0]
+        elif host == cls.SHORT_HOST:
+            short_match = re.fullmatch(r"/([A-Za-z0-9]+)/?", path)
+            if short_match:
+                return "short_weibo", short_match.group(1)
         return None
+
+    async def _resolve_short_url(self, session: aiohttp.ClientSession, url: str) -> str:
+        """只展开 t.cn 分享，其他网站的 t.cn 分享交还其他解析器。"""
+        current = url
+        for _ in range(5):
+            identity = self._identify_url(current)
+            if not identity:
+                raise SkipParse("t.cn 分享目标不是受支持的微博作品")
+            if identity[0] != "short_weibo":
+                return current
+            async with session.get(
+                current, allow_redirects=False, proxy=self.proxy_url,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status not in {301, 302, 303, 307, 308}:
+                    raise RuntimeError("微博短链未返回可用跳转")
+                location = response.headers.get("Location", "")
+                if not location:
+                    raise RuntimeError("微博短链跳转缺少目标地址")
+                current = urljoin(current, location)
+        raise RuntimeError("微博短链重定向次数过多")
+
+    async def _read_json(self, response: aiohttp.ClientResponse) -> Dict[str, Any]:
+        """微博风控可能返回 HTTP 200 HTML，明确说明需要登录/重试。"""
+        if response.status != 200:
+            raise RuntimeError(f"微博接口请求失败: HTTP {response.status}")
+        try:
+            data = await response.json(content_type=None)
+        except (json.JSONDecodeError, ValueError, aiohttp.ContentTypeError) as error:
+            raise RuntimeError("微博返回登录或风控页面，可配置微博 Cookie 后重试") from error
+        if not isinstance(data, dict):
+            raise RuntimeError("微博接口返回的数据不是对象")
+        if data.get("ok") == 0:
+            raise RuntimeError(f"微博作品不可访问: {data.get('msg') or '需要登录或作品已删除'}")
+        return data
 
     def _get_url_type(self, url: str) -> str:
         """根据URL判断微博链接类型
@@ -203,7 +252,10 @@ class WeiboParser(BaseVideoParser):
 
         data = {"cb": "visitor_gray_callback"}
 
-        async with session.post(url, headers=headers, data=data) as response:
+        async with session.post(
+            url, headers=headers, data=data, proxy=self.proxy_url,
+            allow_redirects=False, timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
             if response.status != 200:
                 raise Exception(f"获取cookie失败，状态码: {response.status}")
 
@@ -218,7 +270,9 @@ class WeiboParser(BaseVideoParser):
 
             if "XSRF-TOKEN" not in cookie_str:
                 async with session.get(
-                    "https://weibo.com", headers={"user-agent": headers["user-agent"]}
+                    "https://weibo.com", headers={"user-agent": headers["user-agent"]},
+                    proxy=self.proxy_url, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as page_response:
                     if page_response.status == 200:
                         for cookie in page_response.cookies.values():
@@ -257,7 +311,7 @@ class WeiboParser(BaseVideoParser):
         normalized = url.strip()
         if normalized.startswith("//"):
             return "https:" + normalized
-        return normalized
+        return normalized if normalized.startswith(("http://", "https://")) else ""
 
     def _extract_video_url_from_dict(self, urls: Dict[str, str]) -> Optional[str]:
         """从URL字典中提取视频URL
@@ -295,6 +349,24 @@ class WeiboParser(BaseVideoParser):
         stream_url = media_info.get("stream_url")
         if isinstance(stream_url, str) and stream_url.strip():
             return self._normalize_url(stream_url)
+        playback_list = media_info.get("playback_list") or []
+        choices = []
+        for entry in playback_list if isinstance(playback_list, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            info = entry.get("play_info") or {}
+            if not isinstance(info, dict):
+                continue
+            candidate = self._normalize_url(info.get("url"))
+            if not candidate:
+                continue
+            try:
+                quality = float(info.get("bitrate") or 0)
+            except (TypeError, ValueError):
+                quality = 0
+            choices.append((quality, candidate))
+        if choices:
+            return max(choices, key=lambda item: item[0])[1]
         return None
 
     def _extract_pic_url(self, pic_data: Dict[str, Any]) -> Optional[str]:
@@ -397,6 +469,10 @@ class WeiboParser(BaseVideoParser):
             'image_urls': image_urls,
             'image_headers': image_headers,
             'video_headers': video_headers,
+            'platform': 'weibo',
+            'use_image_proxy': bool(self.proxy_url),
+            'use_video_proxy': bool(self.proxy_url),
+            'proxy_url': self.proxy_url,
         }
         if video_urls:
             result["video_force_download"] = True
@@ -529,6 +605,8 @@ class WeiboParser(BaseVideoParser):
             headers=headers,
             params=params,
             timeout=aiohttp.ClientTimeout(total=15),
+            proxy=self.proxy_url,
+            allow_redirects=False,
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -573,196 +651,117 @@ class WeiboParser(BaseVideoParser):
                 f"uid={uid}, 错误: {e}"
             )
 
+    async def _status_to_result(
+        self, session: aiohttp.ClientSession, url: str, cookies: str,
+        status: Dict[str, Any], requested_id: str,
+    ) -> Dict[str, Any]:
+        """桌面/移动接口统一保留正文、长文、图片和混合媒体。"""
+        self._assert_status_matches_requested(status, requested_id)
+        status_id = str(status.get("idstr") or status.get("id") or status.get("mid") or requested_id)
+        long_text = status.get("longText") or {}
+        if not isinstance(long_text, dict):
+            long_text = {}
+        full_text = status.get("longTextContent") or long_text.get("longTextContent")
+        partial = False
+        if status.get("isLongText") and not full_text:
+            try:
+                async with session.get(
+                    "https://m.weibo.cn/statuses/extend", params={"id": status_id},
+                    headers=self._build_weibo_headers("https://m.weibo.cn/", cookies),
+                    proxy=self.proxy_url, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    extended = await self._read_json(response)
+                    payload = extended.get("data") or {}
+                    if isinstance(payload, dict):
+                        full_text = payload.get("longTextContent")
+            except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
+                partial = True
+            partial = partial or not full_text
+        raw_text = full_text or status.get("text_raw") or status.get("text") or ""
+        clean_text = self._clean_html_text(str(raw_text))
+        media_urls = self._extract_media_urls(status)
+        if not media_urls and not clean_text:
+            raise RuntimeError("微博未返回可用正文或媒体，作品可能不可访问")
+        if partial:
+            clean_text += "\n（微博长文未能获取，已显示公开摘要）"
+        user = status.get("user") or {}
+        if not isinstance(user, dict):
+            user = {}
+        video_urls, image_urls = self._separate_media_urls(media_urls)
+        result = self._build_result_dict(
+            url, self._format_author(user.get("screen_name", ""), user.get("id", "")),
+            clean_text, self._format_timestamp(status.get("created_at", "")),
+            video_urls, image_urls, self._extract_avatar_url(user),
+        )
+        page_info = status.get("page_info") or {}
+        if video_urls and isinstance(page_info, dict):
+            page_pic = page_info.get("page_pic")
+            if isinstance(page_pic, dict):
+                page_pic = page_pic.get("url")
+            cover = self._normalize_url(page_pic)
+            if cover:
+                result["video_cover_urls"] = [[cover]]
+        if partial:
+            result["is_preview_only"] = True
+            result["restriction_label"] = "长文摘要"
+            result["access_message"] = "微博长文未能获取，已显示公开摘要"
+        await self._attach_hot_comments_to_result(
+            session, result, cookies, status_id, str(user.get("id") or ""),
+        )
+        return result
+
     async def _parse_weibo_com(
         self, session: aiohttp.ClientSession, url: str, cookies: str
     ) -> Dict[str, Any]:
-        """解析 weibo.com 链接
-
-        Args:
-            session: aiohttp 会话
-            url: 微博链接
-            cookies: cookie 字符串
-
-        Returns:
-            解析结果字典
-
-        Raises:
-            Exception: 解析失败
-        """
+        """使用桌面公开接口解析正文和混合媒体。"""
         page_id = self._extract_page_id(url)
-
-        api_url = f"https://weibo.com/ajax/statuses/show?id={page_id}&locale=zh-CN&isGetLongText=true"
-
-        xsrf_token = None
-        for cookie_item in cookies.split("; "):
-            if cookie_item.startswith("XSRF-TOKEN="):
-                xsrf_token = cookie_item.split("=", 1)[1]
-                break
-
-        headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-            "referer": url,
-            "cookie": cookies,
-            "accept": "application/json, text/plain, */*",
-            "accept-encoding": "gzip, deflate",
-            "x-requested-with": "XMLHttpRequest",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "accept-language": "zh-CN,zh;q=0.9",
-        }
-
-        if xsrf_token:
-            headers["x-xsrf-token"] = xsrf_token
-
-        async with session.get(api_url, headers=headers) as response:
-            if response.status == 200:
-                json_data = await response.json()
-
-                if not isinstance(json_data, dict):
-                    raise RuntimeError("微博接口返回的 JSON 不是对象")
-
-                if json_data.get("ok") == 0:
-                    error_msg = json_data.get("msg", "未知错误")
-                    raise Exception(f"获取微博数据失败: {error_msg}")
-
-                if "data" in json_data and isinstance(json_data["data"], dict):
-                    json_data = json_data["data"]
-
-                self._assert_status_matches_requested(json_data, page_id)
-
-                media_urls = self._extract_media_urls(json_data)
-                if not media_urls:
-                    raise Exception("未找到媒体文件")
-
-                user = json_data.get("user") or {}
-                if not isinstance(user, dict):
-                    user = {}
-                created_at = json_data.get("created_at", "")
-                formatted_timestamp = self._format_timestamp(created_at)
-
-                raw_text = json_data.get("text_raw", "") or json_data.get("text", "")
-                clean_text = self._clean_html_text(raw_text)
-
-                screen_name = user.get("screen_name", "")
-                user_id = user.get("id", "")
-                author = self._format_author(screen_name, user_id)
-                avatar_url = self._extract_avatar_url(user)
-
-                video_urls, image_urls = self._separate_media_urls(media_urls)
-                status_id = str(json_data.get("id") or json_data.get("mid") or page_id)
-                uid = str(user_id or "")
-                result = self._build_result_dict(
-                    url, author, clean_text, formatted_timestamp,
-                    video_urls, image_urls, avatar_url
-                )
-                await self._attach_hot_comments_to_result(
-                    session=session,
-                    result=result,
-                    cookies=cookies,
-                    status_id=status_id,
-                    uid=uid,
-                )
-                return result
-            else:
-                text = await response.text()
-                raise Exception(
-                    f"获取微博数据失败，状态码: {response.status}, 响应: {text}"
-                )
+        async with session.get(
+            "https://weibo.com/ajax/statuses/show",
+            params={"id": page_id, "locale": "zh-CN", "isGetLongText": "true"},
+            headers=self._build_weibo_headers(url, cookies),
+            proxy=self.proxy_url, allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            data = await self._read_json(response)
+        status = data.get("data") if isinstance(data.get("data"), dict) else data
+        return await self._status_to_result(session, url, cookies, status, page_id)
 
     async def _parse_m_weibo_cn(
         self, session: aiohttp.ClientSession, url: str, cookies: str
     ) -> Dict[str, Any]:
-        """解析 m.weibo.cn 链接
-
-        Args:
-            session: aiohttp 会话
-            url: m.weibo.cn 链接
-            cookies: cookie 字符串
-
-        Returns:
-            解析结果字典
-
-        Raises:
-            Exception: 解析失败
-        """
+        """优先移动 JSON 接口，兼容仍嵌入 render_data 的旧页面。"""
         blog_id = self._extract_blog_id(url)
-        detail_url = f"https://m.weibo.cn/detail/{blog_id}"
-
-        headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-            "referer": "https://visitor.passport.weibo.cn/",
-            "cookie": cookies,
-            "accept-encoding": "gzip, deflate",
-        }
-
-        async with session.get(detail_url, headers=headers) as response:
-            if response.status == 200:
-                html = await response.text()
-                match = re.search(
-                    r"var \$render_data = (\[.*?\])\[0\]", html, re.DOTALL
-                )
-                if match:
-                    json_str = match.group(1)
-                    try:
-                        json_data = json.loads(json_str)
-                        if isinstance(json_data, list) and json_data:
-                            status_data = json_data[0]
-                            if not isinstance(status_data, dict):
-                                raise RuntimeError("微博移动页作品数据不是对象")
-                            media_urls = self._extract_media_urls_m_weibo(status_data)
-
-                            if not media_urls:
-                                raise Exception("未找到媒体文件")
-
-                            status = status_data.get("status") or {}
-                            self._assert_status_matches_requested(status, blog_id)
-                            user = status.get("user") or {}
-                            if not isinstance(user, dict):
-                                user = {}
-                            created_at = status.get("created_at", "")
-                            formatted_timestamp = self._format_timestamp(created_at)
-
-                            raw_text = status.get("text_raw", "") or status.get(
-                                "text", ""
-                            )
-                            clean_text = self._clean_html_text(raw_text)
-
-                            screen_name = user.get("screen_name", "")
-                            user_id = user.get("id", "")
-                            author = self._format_author(screen_name, user_id)
-                            avatar_url = self._extract_avatar_url(user)
-
-                            video_urls, image_urls = self._separate_media_urls(
-                                media_urls
-                            )
-                            status_id = str(
-                                status.get("id") or status.get("mid") or blog_id
-                            )
-                            uid = str(user_id or "")
-                            result = self._build_result_dict(
-                                url, author, clean_text, formatted_timestamp,
-                                video_urls, image_urls, avatar_url
-                            )
-                            await self._attach_hot_comments_to_result(
-                                session=session,
-                                result=result,
-                                cookies=cookies,
-                                status_id=status_id,
-                                uid=uid,
-                            )
-                            return result
-                        else:
-                            raise Exception("JSON 数据为空")
-                    except json.JSONDecodeError as e:
-                        raise Exception(f"解析 JSON 失败: {str(e)}")
-                else:
-                    raise Exception("未找到 $render_data 数据")
-            else:
-                text = await response.text()
-                raise Exception(
-                    f"获取微博数据失败，状态码: {response.status}, 响应: {text[:200]}"
-                )
+        headers = self._build_weibo_headers("https://m.weibo.cn/", cookies)
+        try:
+            async with session.get(
+                "https://m.weibo.cn/statuses/show", params={"id": blog_id},
+                headers=headers, proxy=self.proxy_url, allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                data = await self._read_json(response)
+            status = data.get("data") if isinstance(data.get("data"), dict) else data
+            return await self._status_to_result(session, url, cookies, status, blog_id)
+        except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError) as api_error:
+            async with session.get(
+                f"https://m.weibo.cn/detail/{blog_id}", headers=headers,
+                proxy=self.proxy_url, allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status != 200:
+                    raise api_error
+                page = await response.text()
+            match = re.search(r"var \$render_data\s*=\s*(\[.*?\])\s*\[0\]", page, re.DOTALL)
+            if not match:
+                raise api_error
+            try:
+                rendered = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                raise api_error
+            if not isinstance(rendered, list) or not rendered or not isinstance(rendered[0], dict):
+                raise api_error
+            status = rendered[0].get("status") or {}
+            return await self._status_to_result(session, url, cookies, status, blog_id)
 
     async def _parse_video_weibo(
         self, session: aiohttp.ClientSession, url: str, cookies: str
@@ -794,9 +793,12 @@ class WeiboParser(BaseVideoParser):
 
         payload = {"data": json.dumps({"Component_Play_Playinfo": {"oid": video_id}})}
 
-        async with session.post(api_url, headers=headers, data=payload) as response:
+        async with session.post(
+            api_url, headers=headers, data=payload, proxy=self.proxy_url,
+            allow_redirects=False, timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
             if response.status == 200:
-                json_data = await response.json()
+                json_data = await self._read_json(response)
                 if not isinstance(json_data, dict):
                     raise RuntimeError("微博视频接口返回的 JSON 不是对象")
                 response_data = json_data.get("data") or {}
@@ -835,9 +837,8 @@ class WeiboParser(BaseVideoParser):
                 )
                 return result
             else:
-                text = await response.text()
                 raise Exception(
-                    f"获取视频数据失败，状态码: {response.status}, 响应: {text}"
+                    f"获取微博视频数据失败: HTTP {response.status}"
                 )
 
     def _extract_media_urls(self, json_data: Dict[str, Any]) -> List[str]:
@@ -879,7 +880,12 @@ class WeiboParser(BaseVideoParser):
 
         pic_infos = json_data.get("pic_infos") or {}
         if isinstance(pic_infos, dict):
-            for pic_info in pic_infos.values():
+            pic_ids = json_data.get("pic_ids") or []
+            ordered_pics = (
+                [pic_infos[key] for key in pic_ids if key in pic_infos]
+                if isinstance(pic_ids, list) and pic_ids else list(pic_infos.values())
+            )
+            for pic_info in ordered_pics:
                 if not isinstance(pic_info, dict):
                     continue
                 pic_type = pic_info.get("type", "")
@@ -924,7 +930,7 @@ class WeiboParser(BaseVideoParser):
             if isinstance(video_url, dict) and video_url:
                 max_quality = max(
                     video_url.keys(),
-                    key=lambda x: int(x) if x.isdigit() else 0,
+                    key=lambda x: int(x) if str(x).isdigit() else 0,
                     default=None,
                 )
                 if max_quality:
@@ -934,7 +940,7 @@ class WeiboParser(BaseVideoParser):
                         if url:
                             media_urls.append(url)
 
-        return media_urls
+        return list(dict.fromkeys(media_urls))
 
     def _extract_media_urls_m_weibo(self, json_data: Dict[str, Any]) -> List[str]:
         """从 m.weibo.cn JSON 数据中提取所有媒体链接
@@ -945,26 +951,10 @@ class WeiboParser(BaseVideoParser):
         Returns:
             媒体链接列表
         """
-        media_urls = []
         status = json_data.get("status") or {}
         if not isinstance(status, dict):
-            return media_urls
-
-        pics = status.get("pics", [])
-        if isinstance(pics, list):
-            for pic in pics:
-                pic_url = self._extract_pic_url(pic)
-                if pic_url:
-                    media_urls.append(pic_url)
-
-        page_info = status.get("page_info") or {}
-        if isinstance(page_info, dict) and page_info.get("type") == "video":
-            urls = page_info.get("urls", {})
-            video_url = self._extract_video_url_from_dict(urls)
-            if video_url:
-                media_urls.append(video_url)
-
-        return media_urls
+            return []
+        return self._extract_media_urls(status)
 
     def _extract_media_urls_video(self, json_data: Dict[str, Any]) -> List[str]:
         """从 video.weibo.com JSON 数据中提取视频链接
@@ -1053,32 +1043,21 @@ class WeiboParser(BaseVideoParser):
     async def parse(
         self, session: aiohttp.ClientSession, url: str
     ) -> Optional[Dict[str, Any]]:
-        """解析单个微博链接
-
-        Args:
-            session: aiohttp 会话
-            url: 微博链接
-
-        Returns:
-            解析结果字典，包含以下字段：
-            - url: 原始url（必需）
-            - title: 标题（可选）
-            - author: 作者（可选）
-            - desc: 简介（可选）
-            - timestamp: 上传时间（Y-M-D格式，可选）
-            - video_urls: 视频URL列表，每个元素是单个媒体的可用URL列表（List[List[str]]），即使只有一条直链也要是列表的列表（必需，可为空列表）
-            - image_urls: 图片URL列表，每个元素是单个媒体的可用URL列表（List[List[str]]），即使只有一条直链也要是列表的列表（必需，可为空列表）
-
-        Raises:
-            Exception: 解析失败时抛出异常
-        """
-        logger.debug(f"[{self.name}] parse: 开始解析 {url}")
-        url_type = self._get_url_type(url)
-        logger.debug(f"[{self.name}] parse: URL类型 {url_type}")
-
-        cookies = await self._get_visitor_cookies(session)
-
-        try:
+        """解析微博作品；登录 Cookie 可选，取消不会被吞掉。"""
+        async with self.semaphore:
+            original_url = url
+            url_type = self._get_url_type(url)
+            if url_type == "short_weibo":
+                url = await self._resolve_short_url(session, url)
+                url_type = self._get_url_type(url)
+            cookies = self.cookie
+            if not cookies:
+                try:
+                    cookies = await self._get_visitor_cookies(session)
+                except Exception as error:
+                    # 访客接口偶尔不返回 Cookie，公开作品仍可尝试匿名解析。
+                    logger.debug("微博访客会话不可用，尝试公开接口: %s", type(error).__name__)
+                    cookies = ""
             if url_type == "weibo_com":
                 result = await self._parse_weibo_com(session, url, cookies)
             elif url_type == "m_weibo_cn":
@@ -1086,13 +1065,7 @@ class WeiboParser(BaseVideoParser):
             elif url_type == "video_weibo":
                 result = await self._parse_video_weibo(session, url, cookies)
             else:
-                logger.debug(f"[{self.name}] parse: 不支持的URL类型 {url_type}")
-                raise ValueError(f"不支持的URL类型: {url_type}")
-            if result:
-                logger.debug(
-                    f"[{self.name}] parse: 解析完成 {url}, video_count={len(result.get('video_urls', []))}, image_count={len(result.get('image_urls', []))}"
-                )
+                raise ValueError(f"不支持的微博 URL 类型: {url_type}")
+            if result and original_url != url:
+                result["source_url"] = original_url
             return result
-        except Exception as e:
-            logger.debug(f"[{self.name}] parse: 解析失败 {url}, 错误: {e}")
-            raise

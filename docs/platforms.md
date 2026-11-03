@@ -52,4 +52,20 @@ Nitter 抓取成功后就不会再去试 X 公开页（那条路线已经不返�
 
 ## 其他平台
 
-抖音、TikTok、快手、微博、小红书、闲鱼、今日头条、Pixiv 均无需额外凭据，按默认配置即可使用。它们的取数思路、接口选择和已知坑位记录在 [各平台解析思路备忘](PARSER_METHOD_MEMO.md)。
+### niconico
+
+支持 `www.nicovideo.jp/watch/sm...`、`nm...`、`so...`、数字视频 ID 和 `nico.ms` 视频短链。先请求官方 watch API，再申请 Domand HLS 播放权限；封面、简介与作者可独立展示。公开内容可匿名访问，登录内容可填写 `niconico.cookie`（含 `user_session`），但仍受会员、地区、版权和账号权限限制。媒体下载支持标准 AES-128 HLS，合并需要 ffmpeg；SAMPLE-AES 等 DRM 内容不支持。
+
+### Steam
+
+支持 `store.steampowered.com/app/<appid>` 游戏商店页，使用官方 `appdetails` API 获取介绍、发行信息、价格、封面、截图与宣传视频。当前 Steam 宣传视频已迁移到 HLS，兼容旧 MP4/WebM 字段。默认最多 6 张截图和 1 条宣传视频，可分别设为 0 关闭。`steam.language` 和 `steam.country_code` 控制语言及地区；下架或在指定地区不可用的游戏会明确提示。
+
+### 微博、TikTok 和知乎
+
+微博支持桌面帖子、`m.weibo.cn/detail/...`、`m.weibo.cn/status/...`、视频页面和 `t.cn` 短链。访客 Cookie 失败不会阻断后续公共接口；无媒体的纯文字帖子也可返回。匿名接口被登录页或风控页替换时会提示填写 `weibo.cookie`。
+
+TikTok 支持标准视频、图集和 `vm`/`vt`/`/t/` 分享短链，提供页面 JSON 与 curl 回退。可配置 `tiktok.cookie` 和代理；登录、地区或风控限制不会被当作成功解析。curl 回退有总耗时预算。
+
+知乎支持问题、回答和 `zhuanlan.zhihu.com/p/...` 文章，按公开 API、页面初始数据和 JSON-LD 回退，提取作者、正文和图片，存在公开视频地址时一并返回。可填写 `zhihu.cookie`。匿名 403、登录验证、付费和删除内容会提示受限；页面只有摘要时会说明，不将摘要标记为全文。
+
+以上平台在「解析器与输出模式」中独立启停；对应代理开关需要先填写代理地址。抖音、快手、小红书、闲鱼、今日头条、Pixiv 等既有平台的取数思路、接口选择和已知坑位见 [各平台解析思路备忘](PARSER_METHOD_MEMO.md)。

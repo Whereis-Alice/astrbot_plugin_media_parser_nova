@@ -18,6 +18,7 @@
 - 热评可直接合并到同一张卡片中
 - B 站支持 Cookie 解析、高画质与管理员协助扫码更新
 - 视频下载硬上限、普通发送预算、独立可调压缩策略，以及可选 QQ 群聊/私聊文件投递
+- 超限视频可直接以原文件发送，跳过所有压缩设置
 - 媒体缓存、媒体中转、ZIP 归档，以及对下载体积、解析频率、缓存清理和公网 URL 的兜底
 
 ## 支持平台
@@ -35,6 +36,9 @@
 | 小黑盒 | 视频、图片、文本；BBS 帖子热评 | `xiaoheihe.cn/app/topic`、`xiaoheihe.cn/app/bbs/link` |
 | Twitter/X | 视频、图片、文本；热评与互动统计需配置 Nitter | `twitter.com/.../status/...`、`x.com/.../status/...` |
 | Pixiv | 插画、漫画多页图片、文本 | `pixiv.net/artworks/...`、`pixiv.net/i/...` |
+| niconico | 视频、封面、标题、作者、简介 | `nicovideo.jp/watch/sm...`、`nico.ms/sm...` |
+| Steam | 游戏商店信息、截图、宣传视频 | `store.steampowered.com/app/...` |
+| 知乎 | 回答、问题、专栏文章、正文图片及可获取的视频 | `zhihu.com/question/.../answer/...`、`zhuanlan.zhihu.com/p/...` |
 
 平台页面结构、登录状态、地区限制和风控策略会变化，「支持平台」不代表每条链接在任何网络环境下都一定可访问。
 
@@ -53,6 +57,10 @@ astrbot_plugin_media_parser_nova
 ## 快速开始
 
 装好即用：各平台默认为「全部发送」，直接在聊天里发一条支持的链接就会解析。
+
+niconico、TikTok、Steam、微博、知乎也可在「解析器与输出模式」中独立关闭。微博、知乎和 TikTok 遇到登录或风控限制时，可在对应平台设置中填写浏览器 Cookie，并按需开启代理。Steam 默认最多发送 6 张截图、1 条宣传视频。
+
+要让大视频直接以群文件发送：将「下载设置 → 超限视频投递方式」设为「超限直接上传原文件（不压缩）」。超过普通视频发送上限后，QQ 群聊上传群文件，私聊上传私聊文件；这个选项优先于所有压缩设置，仍遵守下载硬上限。需要可用缓存和支持文件上传的 OneBot v11 协议端。niconico 和 Steam 的 HLS 视频需要 ffmpeg。
 
 三种触发方式：自动解析链接、引用消息后发关键词、手动关键词（默认含 `媒体解析`）。全部指令默认值见 [指令一览](docs/configuration.md#指令一览)，其余配置项见 [配置说明](docs/configuration.md)。
 

@@ -90,7 +90,9 @@ class DownloadManager:
         self._download_semaphore = asyncio.Semaphore(concurrency)
         self.video_cover_only = bool(video_cover_only)
         self.oversize_delivery = (
-            "group_file" if str(oversize_delivery) == "group_file" else "cover"
+            str(oversize_delivery)
+            if str(oversize_delivery) in {"group_file", "group_file_original"}
+            else "cover"
         )
         self.transcode_oversize_video = bool(transcode_oversize_video)
         self.transcode_mode = (
@@ -193,6 +195,7 @@ class DownloadManager:
         """视频压缩策略是否具备执行条件。"""
         if (
             not self.transcode_oversize_video
+            or self.oversize_delivery == "group_file_original"
             or not self.cache_dir_available
             or self.transcode_mode == "disabled"
         ):
@@ -203,7 +206,7 @@ class DownloadManager:
 
     @property
     def group_file_enabled(self) -> bool:
-        return self.oversize_delivery == "group_file"
+        return self.oversize_delivery in {"group_file", "group_file_original"}
 
     @property
     def effective_transcode_trigger_mb(self) -> float:

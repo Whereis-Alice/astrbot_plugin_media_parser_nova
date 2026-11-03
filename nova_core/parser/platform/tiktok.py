@@ -44,17 +44,28 @@ class TikTokRedirectError(RuntimeError):
 class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
     """TikTok 解析器实现。"""
 
-    def __init__(self, use_proxy: bool = False, proxy_url: str = None):
+    def __init__(
+        self, use_proxy: bool = False, proxy_url: Optional[str] = None,
+        cookie: str = "",
+    ):
         super().__init__("tiktok")
         self.use_proxy = bool(use_proxy)
         self.proxy_url = proxy_url
+        self.cookie = str(cookie or "").replace("\r", "").replace("\n", "").strip()
         self.tiktok_headers = {
             "User-Agent": TIKTOK_USER_AGENT,
             "Referer": TIKTOK_REFERER,
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate",
         }
+        if self.cookie:
+            self.tiktok_headers["Cookie"] = self.cookie
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
+
+    @staticmethod
+    def _object(value: Any) -> Dict[str, Any]:
+        """平台页面中的可选 JSON 字段可能为 null 或错误类型。"""
+        return value if isinstance(value, dict) else {}
 
     def _get_proxy(self) -> Optional[str]:
         if self.use_proxy and self.proxy_url:
@@ -215,17 +226,20 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
         cls, data: Dict[str, Any], item_id: str = ""
     ) -> Optional[Dict[str, Any]]:
         """从 TikTok 页面 JSON 中抽取 itemStruct。"""
+        if not isinstance(data, dict):
+            return None
         fallback_item = None
 
         if "__DEFAULT_SCOPE__" in data:
-            scope = data.get("__DEFAULT_SCOPE__", {})
-            detail = scope.get("webapp.video-detail") or {}
-            item_info = detail.get("itemInfo") or {}
-            item = item_info.get("itemStruct") or {}
+            scope = cls._object(data.get("__DEFAULT_SCOPE__"))
+            detail = cls._object(scope.get("webapp.video-detail"))
+            item_info = cls._object(detail.get("itemInfo"))
+            item = cls._object(item_info.get("itemStruct"))
             if item and (not item_id or str(item.get("id")) == str(item_id)):
                 return item
-            user_detail = scope.get("webapp.user-detail") or {}
-            for candidate in user_detail.get("itemList") or []:
+            user_detail = cls._object(scope.get("webapp.user-detail"))
+            item_list = user_detail.get("itemList") or []
+            for candidate in item_list if isinstance(item_list, list) else []:
                 if not isinstance(candidate, dict):
                     continue
                 if not item_id or str(candidate.get("id")) == str(item_id):
@@ -234,7 +248,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
                 fallback_item = item
 
         if "ItemModule" in data and isinstance(data["ItemModule"], dict):
-            if item_id and item_id in data["ItemModule"]:
+            if item_id and isinstance(data["ItemModule"].get(item_id), dict):
                 return data["ItemModule"][item_id]
             for item in data["ItemModule"].values():
                 if isinstance(item, dict):
@@ -279,13 +293,19 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
             raise TikTokRedirectError("TikTok 请求 URL 不受信任")
 
         current_url = url
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + Config.DEFAULT_TIMEOUT
         request_method = session.head if method.upper() == "HEAD" else session.get
         for redirect_count in range(TIKTOK_MAX_REDIRECTS + 1):
+            remaining_timeout = deadline - loop.time()
+            if remaining_timeout <= 0:
+                raise asyncio.TimeoutError("TikTok 页面重定向超时")
             async with request_method(
                 current_url,
                 headers=self.tiktok_headers,
                 allow_redirects=False,
                 proxy=self._get_proxy(),
+                timeout=aiohttp.ClientTimeout(total=remaining_timeout),
             ) as response:
                 status = int(response.status)
                 if status in TIKTOK_REDIRECT_STATUSES:
@@ -334,6 +354,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
                 headers=self.tiktok_headers,
                 allow_redirects=False,
                 proxy=self._get_proxy(),
+                timeout=aiohttp.ClientTimeout(total=Config.DEFAULT_TIMEOUT),
             ) as response:
                 if response.status >= 400:
                     return None
@@ -377,6 +398,8 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
         proxy = self._get_proxy()
         if proxy:
             curl_args.extend(["-x", proxy])
+        if self.cookie:
+            curl_args.extend(["-H", f"Cookie: {self.cookie}"])
         curl_args.extend(
             [
                 "-w",
@@ -439,8 +462,10 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
         last_page_data = None
         max_time = max(0.1, float(Config.TIKTOK_CURL_MAX_TIME))
         loop = asyncio.get_running_loop()
-        for attempt in range(5):
-            deadline = loop.time() + max_time
+        deadline = loop.time() + max_time
+        for attempt in range(2):
+            if loop.time() >= deadline:
+                break
             current_url = page_url
             for redirect_count in range(TIKTOK_MAX_REDIRECTS + 1):
                 remaining_timeout = deadline - loop.time()
@@ -484,12 +509,13 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
                     return page_data
                 break
 
-            if attempt < 4:
-                await asyncio.sleep(0.6)
+            if attempt < 1 and loop.time() < deadline:
+                await asyncio.sleep(min(0.6, max(0.0, deadline - loop.time())))
 
         return last_page_data
 
     def _extract_tiktok_video_url_list(self, video_info: Dict[str, Any]) -> List[str]:
+        video_info = self._object(video_info)
         urls: List[str] = []
         self._extend_unique_urls(
             urls, self._extract_nested_http_urls(video_info.get("playAddr"))
@@ -500,10 +526,11 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
         self._extend_unique_urls(
             urls, self._extract_nested_http_urls(video_info.get("PlayAddrStruct"))
         )
-        for bitrate_info in video_info.get("bitrateInfo") or []:
+        bitrate_items = video_info.get("bitrateInfo") or []
+        for bitrate_info in bitrate_items if isinstance(bitrate_items, list) else []:
             self._extend_unique_urls(
                 urls,
-                self._extract_nested_http_urls((bitrate_info or {}).get("PlayAddr")),
+                self._extract_nested_http_urls(self._object(bitrate_info).get("PlayAddr")),
             )
         return urls
 
@@ -570,7 +597,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
         detail_data: Optional[Dict[str, Any]] = None,
         oembed_info: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        author_info = item_info.get("author", {})
+        author_info = self._object(item_info.get("author"))
         unique_id = (
             author_info.get("uniqueId")
             or author_info.get("unique_id")
@@ -584,7 +611,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
 
         image_url_lists = self._extract_tiktok_image_url_lists(item_info)
         is_gallery = bool(image_url_lists)
-        video_info = item_info.get("video") or {}
+        video_info = self._object(item_info.get("video"))
         video_url_list: List[str] = []
         if not is_gallery:
             video_url_list = self._extract_tiktok_video_url_list(video_info)
@@ -606,19 +633,18 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
                 cover_urls,
                 self._extract_nested_http_urls(video_info.get("originCover"))
             )
-            for bitrate_info in video_info.get("bitrateInfo") or []:
+            bitrate_items = video_info.get("bitrateInfo") or []
+            for bitrate_info in bitrate_items if isinstance(bitrate_items, list) else []:
                 self._extend_unique_urls(
                     cover_urls,
                     self._extract_nested_http_urls(
-                        (bitrate_info or {}).get("cover")
+                        self._object(bitrate_info).get("cover")
                     )
                 )
             if cover_urls:
                 video_cover_urls.append(cover_urls)
 
-        share_meta = (
-            detail_data.get("shareMeta") if isinstance(detail_data, dict) else {}
-        ) or {}
+        share_meta = self._object(self._object(detail_data).get("shareMeta"))
         title = (
             item_info.get("desc")
             or share_meta.get("desc")
@@ -626,6 +652,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
             or (oembed_info or {}).get("title")
             or "TikTok"
         )
+        title = str(title)
         item_id = str(item_info.get("id") or "").strip()
         return {
             "title": title,
@@ -694,11 +721,14 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
             except Exception:
                 continue
 
-            default_scope = json_data.get("__DEFAULT_SCOPE__", {})
-            detail_data = default_scope.get("webapp.video-detail", {})
+            json_data = self._object(json_data)
+            default_scope = self._object(json_data.get("__DEFAULT_SCOPE__"))
+            detail_data = self._object(default_scope.get("webapp.video-detail"))
             item_info = {}
             if isinstance(detail_data, dict):
-                item_info = (detail_data.get("itemInfo") or {}).get("itemStruct", {})
+                item_info = self._object(
+                    self._object(detail_data.get("itemInfo")).get("itemStruct")
+                )
             if not item_info:
                 item_info = (
                     self._extract_tiktok_item_from_json(json_data, target_item_id) or {}
@@ -790,7 +820,10 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
             raise TikTokRedirectError("TikTok 最终 URL 不受信任")
         result = await self.fetch_tiktok_info(session, redirected_url)
         if not result:
-            raise RuntimeError(f"无法获取TikTok视频信息: {original_url}")
+            raise RuntimeError(
+                "TikTok 未返回目标作品的播放数据，作品可能不可用或被地区/登录/风控限制；"
+                "可配置 TikTok Cookie 或代理后重试"
+            )
         return result
 
     @staticmethod

@@ -8,7 +8,10 @@ from astrbot.api.message_components import Image, Plain, Video
 from ..downloader.utils import strip_media_prefixes
 from ..logger import logger
 from ..message_text import split_message_text
-from ..metadata_visibility import text_metadata_field_enabled
+from ..metadata_visibility import (
+    access_notice_message as _access_notice_message,
+    text_metadata_field_enabled,
+)
 from ..parser.utils import format_duration_ms
 from ..types import BuildAllNodesResult, LinkBuildMeta
 from .group_file import build_group_file_name
@@ -97,10 +100,14 @@ def _append_media_notices(
     max_video_size_mb: float = 0.0,
     *,
     has_text_metadata: bool = True,
+    include_access_notice: bool = True,
 ) -> None:
     """渲染解析失败、体积超限与逐项跳过原因，供文本节点与仅卡片模式共用。"""
     if metadata.get("error"):
         text_parts.append(f"解析失败：{metadata['error']}")
+    access_message = _access_notice_message(metadata)
+    if include_access_notice and access_message:
+        text_parts.append(f"提示：{access_message}")
 
     if (
         metadata.get("has_valid_media") is False
@@ -181,10 +188,14 @@ def build_text_node(
     """
     if not enable_text_metadata:
         error = str(metadata.get("error") or "").strip()
-        if not error:
+        access_message = _access_notice_message(metadata)
+        if not error and not access_message:
             return None
         url = str(metadata.get("url") or metadata.get("source_url") or "").strip()
-        text = f"解析失败：{error}"
+        text_parts = [f"解析失败：{error}"] if error else []
+        if access_message:
+            text_parts.append(f"提示：{access_message}")
+        text = "\n".join(text_parts)
         if url:
             text += f"\n原始链接：{url}"
         return Plain(text)
@@ -227,8 +238,7 @@ def build_text_node(
         )
     )
 
-    access_status = metadata.get("access_status")
-    access_message = metadata.get("access_message")
+    access_message = _access_notice_message(metadata)
     available_length_ms = metadata.get("available_length_ms")
     timelength_ms = metadata.get("timelength_ms")
     is_preview_only = metadata.get("is_preview_only")
@@ -236,7 +246,7 @@ def build_text_node(
     # 拿不到流」。后者挂在「时长：」下面读起来完全不通，所以按有没有可解析时长
     # 分流：带时长的仍用「时长」，纯限制说明改用中性的「提示」，并把真实时长
     # 单独补一行，免得这一行把时长的位置占了却什么都没说。
-    if access_status and access_status != "full" and access_message:
+    if access_message:
         if available_length_ms:
             text_parts.append(f"时长：{access_message}")
         else:
@@ -271,6 +281,7 @@ def build_text_node(
         metadata,
         max_video_size_mb,
         has_text_metadata=has_text_metadata,
+        include_access_notice=False,
     )
 
     if text_metadata_field_enabled(metadata, "original_link") and metadata.get("url"):
@@ -562,7 +573,7 @@ def _build_node_parts_for_link(
         nodes.extend(display_text_nodes)
     elif card_mode == "仅卡片":
         display_text_nodes = []
-        if effective_text_metadata:
+        if effective_text_metadata or _access_notice_message(metadata):
             notice_node = build_media_notice_node(metadata, max_video_size_mb)
             display_text_nodes.extend(_split_plain_node(notice_node))
         if (

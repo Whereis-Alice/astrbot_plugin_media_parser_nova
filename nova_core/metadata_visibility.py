@@ -11,6 +11,13 @@ TEXT_METADATA_FIELD_DEFAULTS = {
 }
 
 
+def access_notice_message(metadata: Dict[str, Any]) -> str:
+    """访问限制应在文本、卡片和纯媒体输出中保持可见。"""
+    if metadata.get("access_status") == "full" and not metadata.get("is_preview_only"):
+        return ""
+    return str(metadata.get("access_message") or "").strip()
+
+
 def text_metadata_field_enabled(
     metadata: Dict[str, Any],
     field_name: str,

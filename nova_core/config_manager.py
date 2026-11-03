@@ -13,7 +13,9 @@ from .parser.platform import (
     BilibiliParser,
     DouyinParser,
     KuaishouParser,
+    NiconicoParser,
     PixivParser,
+    SteamParser,
     TikTokParser,
     ToutiaoParser,
     TwitterParser,
@@ -21,6 +23,7 @@ from .parser.platform import (
     XianyuParser,
     XiaoheiheParser,
     XiaohongshuParser,
+    ZhihuParser,
 )
 from .translation.provider_defs import (
     LLM_PROVIDER_DEFAULTS,
@@ -52,6 +55,9 @@ PARSER_OUTPUT_KEYS = (
     "xiaoheihe",
     "twitter",
     "pixiv",
+    "niconico",
+    "steam",
+    "zhihu",
 )
 
 OUTPUT_MODE_DISABLED = "关闭"
@@ -61,9 +67,11 @@ OUTPUT_MODE_RICH_ONLY = "仅富媒体"
 
 OVERSIZE_DELIVERY_COVER = "cover"
 OVERSIZE_DELIVERY_GROUP_FILE = "group_file"
+OVERSIZE_DELIVERY_ORIGINAL_FILE = "group_file_original"
 OVERSIZE_DELIVERY_LABELS = {
     OVERSIZE_DELIVERY_COVER: "仅发送信息与封面",
     OVERSIZE_DELIVERY_GROUP_FILE: "上传为文件（群聊/私聊）",
+    OVERSIZE_DELIVERY_ORIGINAL_FILE: "超限直接上传原文件（不压缩）",
 }
 
 # 推特 GIF 的推送方式：默认转回原始动图，可选保持视频。
@@ -510,7 +518,9 @@ class DownloadConfig:
 
     @property
     def group_file_enabled(self) -> bool:
-        return self.oversize_delivery == OVERSIZE_DELIVERY_GROUP_FILE
+        return self.oversize_delivery in {
+            OVERSIZE_DELIVERY_GROUP_FILE, OVERSIZE_DELIVERY_ORIGINAL_FILE
+        }
 
 
 @dataclass
@@ -556,6 +566,10 @@ class ProxyConfig:
     twitter_use_video_proxy: bool = True
     tiktok_use_proxy: bool = False
     pixiv_use_proxy: bool = False
+    niconico_use_proxy: bool = False
+    steam_use_proxy: bool = False
+    weibo_use_proxy: bool = False
+    zhihu_use_proxy: bool = False
 
 
 @dataclass
@@ -575,6 +589,19 @@ class BilibiliEnhancedConfig:
 @dataclass
 class PixivConfig:
     cookie: str = ""
+
+
+@dataclass
+class PlatformAccessConfig:
+    cookie: str = ""
+
+
+@dataclass
+class SteamConfig:
+    language: str = "schinese"
+    country_code: str = "CN"
+    max_screenshots: int = 6
+    max_trailers: int = 1
 
 
 @dataclass
@@ -697,6 +724,9 @@ class ConfigManager:
         self._enable_xiaoheihe = self._parser_enabled("xiaoheihe")
         self._enable_twitter = self._parser_enabled("twitter")
         self._enable_pixiv = self._parser_enabled("pixiv")
+        self._enable_niconico = self._parser_enabled("niconico")
+        self._enable_steam = self._parser_enabled("steam")
+        self._enable_zhihu = self._parser_enabled("zhihu")
 
         # --- message ---
         message_raw = self._as_dict(config.get("message"))
@@ -1328,6 +1358,29 @@ class ConfigManager:
             cookie=str(pixiv_raw.get("cookie", "") or "").strip(),
         )
 
+        # 平台凭据只由本地配置注入，不落入解析结果和媒体中转地址。
+        for platform_name in ("niconico", "tiktok", "weibo", "zhihu"):
+            raw = self._as_dict(config.get(platform_name))
+            setattr(
+                self, platform_name,
+                PlatformAccessConfig(cookie=str(raw.get("cookie", "") or "").strip()),
+            )
+        steam_raw = self._as_dict(config.get("steam"))
+        language = str(steam_raw.get("language", "schinese") or "schinese").strip()
+        country_code = str(steam_raw.get("country_code", "CN") or "CN").strip().upper()
+        self.steam = SteamConfig(
+            language=language if language.isascii() and language.isalpha() else "schinese",
+            country_code=country_code if (
+                country_code.isascii() and country_code.isalpha() and len(country_code) == 2
+            ) else "CN",
+            max_screenshots=self._parse_bounded_int(
+                steam_raw.get("max_screenshots", 6), 6, minimum=0, maximum=20,
+            ),
+            max_trailers=self._parse_bounded_int(
+                steam_raw.get("max_trailers", 1), 1, minimum=0, maximum=5,
+            ),
+        )
+
         # --- proxy ---
         proxy_raw = self._as_dict(config.get("proxy"))
         twitter_proxy = self._as_dict(proxy_raw.get("twitter"))
@@ -1362,6 +1415,18 @@ class ConfigManager:
                 proxy_raw.get("pixiv", False),
                 False,
                 "proxy.pixiv",
+            ),
+            niconico_use_proxy=self._parse_bool(
+                proxy_raw.get("niconico", False), False, "proxy.niconico",
+            ),
+            steam_use_proxy=self._parse_bool(
+                proxy_raw.get("steam", False), False, "proxy.steam",
+            ),
+            weibo_use_proxy=self._parse_bool(
+                proxy_raw.get("weibo", False), False, "proxy.weibo",
+            ),
+            zhihu_use_proxy=self._parse_bool(
+                proxy_raw.get("zhihu", False), False, "proxy.zhihu",
             ),
         )
 
@@ -1462,12 +1527,18 @@ class ConfigManager:
                 TikTokParser(
                     use_proxy=self.proxy.tiktok_use_proxy,
                     proxy_url=proxy_addr,
+                    cookie=self.tiktok.cookie,
                 )
             )
         if self._enable_kuaishou:
             parsers.append(KuaishouParser())
         if self._enable_weibo:
-            parsers.append(WeiboParser(hot_comment_count=weibo_hc))
+            parsers.append(WeiboParser(
+                hot_comment_count=weibo_hc,
+                cookie=self.weibo.cookie,
+                use_proxy=self.proxy.weibo_use_proxy,
+                proxy_url=proxy_addr,
+            ))
         if self._enable_xiaohongshu:
             parsers.append(XiaohongshuParser(hot_comment_count=xhs_hc))
         if self._enable_xianyu:
@@ -1508,6 +1579,31 @@ class ConfigManager:
                     proxy=proxy_addr if self.proxy.pixiv_use_proxy else None,
                 )
             )
+        if self._enable_niconico:
+            _, include_media = self.parser_output.output_for_controller("niconico")
+            parsers.append(NiconicoParser(
+                use_proxy=self.proxy.niconico_use_proxy,
+                proxy_url=proxy_addr,
+                cookie=self.niconico.cookie,
+                include_media=include_media,
+            ))
+        if self._enable_steam:
+            parsers.append(SteamParser(
+                use_proxy=self.proxy.steam_use_proxy,
+                proxy_url=proxy_addr,
+                language=self.steam.language,
+                country_code=self.steam.country_code,
+                max_screenshots=self.steam.max_screenshots,
+                max_trailers=self.steam.max_trailers,
+            ))
+        if self._enable_zhihu:
+            _, include_media = self.parser_output.output_for_controller("zhihu")
+            parsers.append(ZhihuParser(
+                cookie=self.zhihu.cookie,
+                use_proxy=self.proxy.zhihu_use_proxy,
+                proxy_url=proxy_addr,
+                include_media=include_media,
+            ))
         return parsers
 
     # ── 静态辅助 ────────────────────────────────────────
