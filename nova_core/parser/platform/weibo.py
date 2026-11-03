@@ -15,6 +15,8 @@ from ...logger import logger
 from .base import BaseVideoParser
 from ..utils import SkipParse, build_request_headers, trim_url_tail
 
+MAX_COMMENT_RESPONSE_BYTES = 5 * 1024 * 1024
+
 
 class WeiboParser(BaseVideoParser):
     """微博解析器实现。"""
@@ -548,15 +550,21 @@ class WeiboParser(BaseVideoParser):
     def _normalize_hot_comment_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """将微博热评结构规范化为统一字段。"""
         user = item.get("user") or {}
-        try:
-            likes = int(item.get("like_counts", 0) or 0)
-        except (TypeError, ValueError):
-            likes = 0
+        if not isinstance(user, dict):
+            user = {}
+        raw_likes = item.get("like_counts", item.get("like_count"))
+        likes = (
+            raw_likes if isinstance(raw_likes, int) and not isinstance(raw_likes, bool)
+            else int(raw_likes) if isinstance(raw_likes, str) and raw_likes.isdigit()
+            else None
+        )
+        if likes is not None and likes < 0:
+            likes = None
         message = self._clean_html_text(
             str(item.get("text_raw") or item.get("text") or "")
         )
         time_text = self._format_comment_time(str(item.get("created_at", "") or ""))
-        return {
+        result = {
             "username": str(user.get("screen_name", "") or ""),
             "uid": str(user.get("id", "") or ""),
             # 卡片评论区要画真头像；大图优先，退回普通尺寸
@@ -570,61 +578,82 @@ class WeiboParser(BaseVideoParser):
             "message": message,
             "time": time_text,
         }
+        if likes is None:
+            result["likes_text"] = "未知"
+        return result
+
+    @staticmethod
+    async def _read_comment_json(response: aiohttp.ClientResponse) -> Dict[str, Any]:
+        """仅评论接口按解压后字节流限至 5 MiB，页面接口保持原逻辑。"""
+        if response.status != 200:
+            raise RuntimeError(f"微博评论接口不可访问: HTTP {response.status}")
+        body = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if len(body) + len(chunk) > MAX_COMMENT_RESPONSE_BYTES:
+                raise RuntimeError("微博评论响应超过 5 MiB 限制")
+            body.extend(chunk)
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("微博评论接口未返回有效 JSON") from error
+        if not isinstance(data, dict):
+            raise RuntimeError("微博评论接口返回的数据不是对象")
+        if data.get("ok") == 0:
+            raise RuntimeError("微博评论不可访问，可能需要有效 Cookie")
+        return data
 
     async def _fetch_hot_comments(
-        self,
-        session: aiohttp.ClientSession,
-        cookies: str,
-        status_id: str,
-        uid: str = "",
+        self, session: aiohttp.ClientSession, cookies: str,
+        status_id: str, uid: str = "",
     ) -> List[Dict[str, Any]]:
-        """异步拉取微博热评列表。"""
+        """桌面热评失败时尝试官方移动热评，两次请求共用 15 秒预算。"""
         if self.hot_comment_count <= 0:
             return []
         status_id = str(status_id or "").strip()
         uid = str(uid or "").strip()
         if not status_id:
             return []
-
         params = {
-            "id": status_id,
-            "flow": 0,
-            "is_reload": 1,
-            "is_show_bulletin": 2,
-            "is_mix": 0,
-            "count": max(20, self.hot_comment_count),
+            "id": status_id, "flow": 0, "is_reload": 1,
+            "is_show_bulletin": 2, "is_mix": 0,
+            "count": min(50, max(20, self.hot_comment_count)),
         }
         if uid:
             params["uid"] = uid
-
-        headers = self._build_weibo_headers(
-            referer=f"https://weibo.com/0/{status_id}", cookies=cookies
-        )
-        async with session.get(
-            "https://weibo.com/ajax/statuses/buildComments",
-            headers=headers,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=15),
-            proxy=self.proxy_url,
-            allow_redirects=False,
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(
-                    f"获取微博热评失败: HTTP {resp.status}, response: {body[:300]}"
-                )
-            data = await resp.json(content_type=None)
-        comment_list = data.get("data")
-        if not isinstance(comment_list, list):
-            raise RuntimeError(f"微博热评接口返回异常: {data}")
-        comments = [
-            self._normalize_hot_comment_item(item)
-            for item in comment_list
-            if isinstance(item, dict)
+        endpoints = [
+            ("https://weibo.com/ajax/statuses/buildComments", params, "https://weibo.com/"),
+            ("https://m.weibo.cn/comments/hotflow", {"id": status_id, "mid": status_id, "max_id_type": "0"}, "https://m.weibo.cn/"),
         ]
-        comments = [item for item in comments if item.get("message")]
-        comments.sort(key=lambda x: x.get("likes", 0), reverse=True)
-        return comments[: self.hot_comment_count]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        for endpoint, query, referer in endpoints:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("微博评论请求超时")
+            try:
+                async with session.get(
+                    endpoint, params=query,
+                    headers=self._build_weibo_headers(referer, cookies),
+                    timeout=aiohttp.ClientTimeout(total=remaining),
+                    proxy=self.proxy_url, allow_redirects=False,
+                ) as response:
+                    data = await self._read_comment_json(response)
+                items = data.get("data")
+                if isinstance(items, dict):
+                    items = items.get("data")
+                if not isinstance(items, list):
+                    raise RuntimeError("微博评论接口未返回列表")
+                comments = [
+                    self._normalize_hot_comment_item(item)
+                    for item in items if isinstance(item, dict)
+                ]
+                comments = [item for item in comments if item.get("message")]
+                comments.sort(key=lambda item: item["likes"] if item["likes"] is not None else -1, reverse=True)
+                return comments[:self.hot_comment_count]
+            except (RuntimeError, aiohttp.ClientError, ValueError):
+                # 不记录响应体，登录页和错误响应可能包含敏感会话字段。
+                continue
+        raise RuntimeError("微博评论接口不可访问，可配置有效微博 Cookie 或稍后重试")
 
     async def _attach_hot_comments_to_result(
         self,
@@ -645,6 +674,8 @@ class WeiboParser(BaseVideoParser):
             )
             if comments:
                 result["hot_comments"] = comments
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(
                 f"[{self.name}] 获取热评失败: status_id={status_id}, "

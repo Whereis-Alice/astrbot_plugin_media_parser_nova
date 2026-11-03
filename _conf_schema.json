@@ -433,7 +433,7 @@
       "hot_comments": {
         "description": "附加内容：热评",
         "type": "object",
-        "hint": "仅对输出模式包含文本的支持平台生效；先将条数设为大于 0，下面的平台开关才有作用。",
+        "hint": "条数为0关闭评论；输出模式包含文本时才获取。Steam为玩家评测，niconico为弹幕摘选。获取失败不影响正文和媒体；“热评合并到卡片”及“在普通文本中显示热评”可独立控制展示。",
         "items": {
           "count": {
             "description": "热评条数",
@@ -479,6 +479,30 @@
             "type": "string",
             "hint": "留空则不使用。X 已停止对未登录访问输出带回复的服务端渲染页，填入一个可用的 Nitter 实例（例如自建的 http://127.0.0.1:8585）后即可恢复 Twitter 热评，并顺带补全推文的喜欢/转发/评论/阅读统计。可用逗号分隔多个实例按顺序回退；指向本机或内网的地址会自动绕过代理。",
             "default": ""
+          },
+          "niconico": {
+            "description": "niconico 弹幕摘选",
+            "type": "bool",
+            "hint": "近期弹幕，附播放位置和真实Nicoる互动数；不是普通评论区。",
+            "default": true
+          },
+          "tiktok": {
+            "description": "TikTok 评论",
+            "type": "bool",
+            "hint": "使用官方评论接口，部分作品可能需要Cookie或可用代理。",
+            "default": true
+          },
+          "steam": {
+            "description": "Steam 玩家评测",
+            "type": "bool",
+            "hint": "使用新版官方评测接口，“有帮助”票数不当作普通点赞。",
+            "default": true
+          },
+          "zhihu": {
+            "description": "知乎评论",
+            "type": "bool",
+            "hint": "问题、回答、文章或视频评论可能需要已登录Cookie。",
+            "default": true
           }
         }
       },

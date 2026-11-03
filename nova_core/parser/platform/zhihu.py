@@ -25,6 +25,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 )
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+COMMENT_TIMEOUT_SECONDS = 12
 ACCESS_ERROR = (
     "知乎访问受限（登录、验证或内容权限），可在插件设置中配置知乎 Cookie 后重试"
 )
@@ -144,6 +145,7 @@ class ZhihuParser(BaseVideoParser):
         use_proxy: bool = False,
         proxy_url: str | None = None,
         include_media: bool = True,
+        hot_comment_count: int = 0,
     ) -> None:
         super().__init__("zhihu")
         self.cookie = str(cookie or "").strip()
@@ -153,6 +155,10 @@ class ZhihuParser(BaseVideoParser):
         self.use_proxy = bool(use_proxy)
         self.proxy_url = proxy_url
         self.include_media = bool(include_media)
+        try:
+            self.hot_comment_count = min(100, max(0, int(hot_comment_count)))
+        except (TypeError, ValueError, OverflowError):
+            self.hot_comment_count = 0
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
 
     @staticmethod
@@ -527,6 +533,113 @@ class ZhihuParser(BaseVideoParser):
                 candidates.append(value)
         return list(dict.fromkeys(candidates))
 
+    @staticmethod
+    def _normalize_hot_comments(payload: Any, count: int) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict) or count <= 0:
+            return []
+        items = payload.get("data")
+        if not isinstance(items, list):
+            return []
+        comments: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict) or item.get("type", "comment") != "comment":
+                continue
+            message = _plain(item.get("content") or item.get("text"))
+            if not message:
+                continue
+            author = _dict(item.get("author"))
+            author = _dict(author.get("member")) or author
+            uid = str(author.get("id") or author.get("url_token") or "").strip()
+            comment_id = str(item.get("id") or "").strip()
+            identity = comment_id or f"{uid}:{message}"
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                likes = max(
+                    0,
+                    int(
+                        item.get("like_count")
+                        if item.get("like_count") is not None
+                        else item.get("vote_count", 0)
+                    ),
+                )
+            except (TypeError, ValueError, OverflowError):
+                likes = 0
+            comments.append(
+                {
+                    "comment_id": comment_id,
+                    "username": _plain(author.get("name")),
+                    "uid": uid,
+                    "avatar_url": _media_url(
+                        author.get("avatar_url") or author.get("avatarUrl")
+                    ),
+                    "message": message,
+                    "likes": likes,
+                    "time": ZhihuParser._timestamp(
+                        item.get("created_time")
+                        or item.get("published_time")
+                        or item.get("createdTime")
+                    ),
+                }
+            )
+        comments.sort(key=lambda item: item["likes"], reverse=True)
+        return comments[:count]
+
+    async def _fetch_hot_comments(
+        self, session: aiohttp.ClientSession, kind: str, content_id: str
+    ) -> list[dict[str, Any]]:
+        if self.hot_comment_count <= 0:
+            return []
+        bucket = {
+            "answer": "answers",
+            "question": "questions",
+            "article": "articles",
+            "zvideo": "zvideos",
+        }.get(kind)
+        if not bucket or not re.fullmatch(r"\d{1,24}", content_id):
+            return []
+        count = min(100, max(20, self.hot_comment_count))
+        endpoints = (
+            f"https://www.zhihu.com/api/v4/comment_v5/{bucket}/{content_id}/root_comment?order_by=score&limit={count}&offset=",
+            f"https://www.zhihu.com/api/v4/{bucket}/{content_id}/root_comments?order=normal&limit={count}&offset=0",
+        )
+        for endpoint in endpoints:
+            try:
+                payload = await self._fetch_json(session, endpoint)
+                if isinstance(payload.get("data"), list):
+                    return self._normalize_hot_comments(payload, self.hot_comment_count)
+            except (TimeoutError, aiohttp.ClientError, RuntimeError, ValueError):
+                continue
+        return []
+
+    async def _attach_hot_comments(
+        self,
+        session: aiohttp.ClientSession,
+        kind: str,
+        content_id: str,
+        result: MediaMetadata,
+    ) -> None:
+        if self.hot_comment_count <= 0:
+            return
+        try:
+            comments = await asyncio.wait_for(
+                self._fetch_hot_comments(session, kind, content_id),
+                timeout=COMMENT_TIMEOUT_SECONDS,
+            )
+            if comments:
+                result["hot_comments"] = comments
+        except (
+            TimeoutError,
+            aiohttp.ClientError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            OSError,
+        ) as exc:
+            logger.debug("知乎热评暂不可用：%s", type(exc).__name__)
+
     async def parse(self, session: aiohttp.ClientSession, url: str) -> MediaMetadata:
         kind, content_id = self._identity(url)
         if not kind:
@@ -602,4 +715,6 @@ class ZhihuParser(BaseVideoParser):
             raise RuntimeError(
                 "知乎未返回可访问的正文或媒体，完整内容可能需要登录或权限"
             )
+        async with self.semaphore:
+            await self._attach_hot_comments(session, kind, content_id, result)
         return result

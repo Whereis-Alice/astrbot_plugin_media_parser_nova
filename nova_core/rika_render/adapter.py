@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .data import Author, ImageContent, ParseResult, Platform, VideoContent
+from ..comment_display import comment_likes_label, comment_likes_text, comment_section_title
 from .task import PathTask
 
 PLATFORM_DISPLAY_NAMES: Dict[str, str] = {
@@ -301,7 +302,10 @@ def build_parse_result(
                         "likes": item.get("likes", 0),
                         # 平台只给压缩值（YouTube 的 "1.1K"）时原样带过去，
                         # 避免卡片把 1.1K 显示成假精确的 1100
-                        "likes_text": str(item.get("likes_text") or "").strip(),
+                        "likes_text": str(item.get("likes_text") or "").strip()
+                        or ("未知" if comment_likes_text(item) == "未知" else ""),
+                        "likes_label": comment_likes_label(item),
+                        "position_text": str(item.get("position_text") or "").strip(),
                         "time": str(item.get("time") or "").strip(),
                         "message": message,
                         "avatar_url": avatar_urls[0] if avatar_urls else "",
@@ -313,6 +317,7 @@ def build_parse_result(
                 )
             if normalized_comments:
                 extra["hot_comments"] = normalized_comments
+                extra["comment_section_title"] = comment_section_title(metadata, "")
                 if any(task is not None for task in comment_avatars):
                     extra["hot_comment_avatars"] = comment_avatars
 

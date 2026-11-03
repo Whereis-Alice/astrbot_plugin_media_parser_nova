@@ -5,6 +5,7 @@ import html
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -26,6 +27,9 @@ NICONICO_PAGE_HOSTS = frozenset(
     }
 )
 MAX_API_BYTES = 4 * 1024 * 1024
+MAX_COMMENT_BYTES = 2 * 1024 * 1024
+COMMENT_TIMEOUT_SECONDS = 10
+NICONICO_COMMENT_HOSTS = frozenset({"public.nvcomment.nicovideo.jp"})
 _VIDEO_ID = r"(?:sm|nm|so|ss)?\d+"
 _RESTRICTIONS = {
     "DOMESTIC_VIDEO": "此视频仅限日本地区观看",
@@ -55,11 +59,16 @@ class NiconicoParser(BaseVideoParser):
         proxy_url: str | None = None,
         cookie: str = "",
         include_media: bool = True,
+        hot_comment_count: int = 0,
     ) -> None:
         super().__init__("niconico")
         self.proxy_url = proxy_url if use_proxy else None
         self.cookie = str(cookie or "").strip()
         self.include_media = bool(include_media)
+        try:
+            self.hot_comment_count = max(0, min(50, int(hot_comment_count)))
+        except (TypeError, ValueError, OverflowError):
+            self.hot_comment_count = 0
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
         self.headers = {
             "User-Agent": "Mozilla/5.0",
@@ -152,6 +161,8 @@ class NiconicoParser(BaseVideoParser):
         headers: dict[str, str],
         params: dict[str, str] | None = None,
         body: dict[str, Any] | None = None,
+        max_bytes: int = MAX_API_BYTES,
+        timeout_seconds: int = Config.DEFAULT_TIMEOUT,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         async with session.request(
             method,
@@ -161,7 +172,7 @@ class NiconicoParser(BaseVideoParser):
             json=body,
             proxy=self.proxy_url,
             allow_redirects=False,
-            timeout=aiohttp.ClientTimeout(total=Config.DEFAULT_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
         ) as response:
             if response.status in {301, 302, 303, 307, 308}:
                 raise ValueError("niconico API 返回了意外重定向，请检查登录或代理设置")
@@ -176,7 +187,7 @@ class NiconicoParser(BaseVideoParser):
             total = 0
             async for chunk in response.content.iter_chunked(64 * 1024):
                 total += len(chunk)
-                if total > MAX_API_BYTES:
+                if total > max_bytes:
                     raise ValueError("niconico API 响应超过大小限制")
                 chunks.append(chunk)
             try:
@@ -268,6 +279,198 @@ class NiconicoParser(BaseVideoParser):
             and item["id"]
         ]
 
+    @staticmethod
+    def _comment_endpoint(value: Any) -> str:
+        """A watch response may only select the official public comment server."""
+        if not isinstance(value, str):
+            return ""
+        try:
+            parsed = urlsplit(value.strip())
+            if (
+                parsed.scheme.lower() != "https"
+                or (parsed.hostname or "").lower() not in NICONICO_COMMENT_HOSTS
+                or parsed.port not in {None, 443}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                return ""
+            return f"https://{parsed.hostname.lower()}/v1/threads"
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _comment_number(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)
+            return number if abs(number) <= (1 << 63) - 1 else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @classmethod
+    def _normalize_danmaku(
+        cls, response: dict[str, Any], count: int
+    ) -> list[dict[str, Any]]:
+        """Select recent distinct viewer messages; NG score is not popularity."""
+        if count <= 0:
+            return []
+        threads = _object(response.get("data")).get("threads")
+        if not isinstance(threads, list):
+            return []
+        candidates = []
+        for thread in threads:
+            if (
+                not isinstance(thread, dict)
+                or not isinstance(thread.get("fork"), str)
+                or thread["fork"] not in {"main", "easy"}
+            ):
+                continue
+            comments = thread.get("comments")
+            if not isinstance(comments, list):
+                continue
+            for comment in comments[:10000]:
+                if not isinstance(comment, dict) or comment.get("isDeleted") is True:
+                    continue
+                body = comment.get("body")
+                if not isinstance(body, str) or not body.strip():
+                    continue
+                message = html.unescape(body).strip()[:2000]
+                time_text = comment.get("postedAt")
+                time_text = time_text if isinstance(time_text, str) else ""
+                try:
+                    posted_timestamp = datetime.fromisoformat(
+                        time_text.replace("Z", "+00:00")
+                    ).timestamp()
+                except (ValueError, OverflowError, OSError):
+                    posted_timestamp = 0.0
+                position_ms = cls._comment_number(comment.get("vposMs"))
+                position_ms = (
+                    position_ms
+                    if position_ms is not None and position_ms >= 0
+                    else None
+                )
+                position_text = ""
+                if position_ms is not None:
+                    seconds = position_ms // 1000
+                    hours, remainder = divmod(seconds, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    clock = (
+                        f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        if hours
+                        else f"{minutes:02d}:{seconds:02d}"
+                    )
+                    position_text = f"弹幕位置 {clock}"
+                nicoru_count = max(
+                    0, cls._comment_number(comment.get("nicoruCount")) or 0
+                )
+                username = comment.get("userName")
+                username = username.strip() if isinstance(username, str) else ""
+                # userId is usually an anonymous hash, not a resolvable account ID.
+                username = username or "弹幕用户"
+                normalized = {
+                    "username": username,
+                    "author": username,
+                    "uid": "",
+                    "user_id": str(comment.get("userId") or ""),
+                    "avatar_url": "",
+                    "message": message,
+                    "likes": nicoru_count,
+                    "likes_label": "Nicoる",
+                    "nicoru_count": nicoru_count,
+                    "score": cls._comment_number(comment.get("score")),
+                    "time": time_text,
+                    "position_ms": position_ms,
+                    "position_text": position_text,
+                    "comment_kind": "danmaku",
+                    "comment_id": str(comment.get("id") or ""),
+                }
+                candidates.append((posted_timestamp, normalized))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = []
+        seen_messages = set()
+        for _, comment in candidates:
+            dedup_key = re.sub(r"\s+", " ", comment["message"])
+            if dedup_key in seen_messages:
+                continue
+            seen_messages.add(dedup_key)
+            selected.append(comment)
+            if len(selected) >= count:
+                break
+        return selected
+
+    async def _attach_danmaku(
+        self,
+        session: aiohttp.ClientSession,
+        watch_data: dict[str, Any],
+        result: MediaMetadata,
+    ) -> None:
+        if self.hot_comment_count <= 0:
+            return
+        try:
+            info = _object(_object(watch_data.get("comment")).get("nvComment"))
+            endpoint = self._comment_endpoint(info.get("server"))
+            thread_key = info.get("threadKey")
+            params = _object(info.get("params"))
+            targets = params.get("targets")
+            if (
+                not endpoint
+                or not isinstance(thread_key, str)
+                or not thread_key
+                or not isinstance(targets, list)
+            ):
+                return
+            targets = [
+                {"id": target["id"], "fork": target["fork"]}
+                for target in targets[:20]
+                if isinstance(target, dict)
+                and isinstance(target.get("id"), str)
+                and target["id"].isdigit()
+                and isinstance(target.get("fork"), str)
+                and target.get("fork") in {"main", "easy"}
+            ]
+            if not targets:
+                return
+            language = params.get("language")
+            language = language if isinstance(language, str) else "ja-jp"
+            response, _ = await self._request_json(
+                session,
+                "POST",
+                endpoint,
+                headers={
+                    **self.headers,
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Origin": NICONICO_ORIGIN,
+                    "X-Client-Os-Type": "others",
+                },
+                body={
+                    "additionals": {},
+                    "params": {"targets": targets, "language": language},
+                    "threadKey": thread_key,
+                },
+                max_bytes=MAX_COMMENT_BYTES,
+                timeout_seconds=COMMENT_TIMEOUT_SECONDS,
+            )
+            if (
+                not isinstance(response, dict)
+                or _object(response.get("meta")).get("status") != 200
+            ):
+                self.logger.debug("niconico 弹幕接口未返回成功状态，保留媒体结果")
+                return
+            comments = self._normalize_danmaku(response, self.hot_comment_count)
+            if comments:
+                result["hot_comments"] = comments
+                result["comment_section_title"] = "弹幕摘选"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.debug(
+                f"niconico 弹幕获取失败，保留媒体结果（{type(exc).__name__}）"
+            )
+
     async def parse(
         self, session: aiohttp.ClientSession, url: str
     ) -> MediaMetadata | None:
@@ -303,11 +506,13 @@ class NiconicoParser(BaseVideoParser):
                     access_message=message,
                     can_access_full_video=False,
                 )
+                await self._attach_danmaku(session, data, result)
                 return result
             if not isinstance(data.get("video"), dict):
                 raise ValueError("niconico watch API 未返回有效视频信息")
             result = self._metadata(video_id, data)
             self._apply_media_proxy(result)
+            await self._attach_danmaku(session, data, result)
             if not self.include_media:
                 return result
             domand = _object(_object(data.get("media")).get("domand"))

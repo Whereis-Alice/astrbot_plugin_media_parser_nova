@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from nova_core.parser.platform.steam import SteamParser
 
@@ -109,9 +109,13 @@ class SteamParserTests(unittest.TestCase):
 
     def test_legacy_webm_only_trailer_is_available(self):
         app = self.app()
-        app["movies"] = [{"webm": {"max": "https://cdn.akamai.steamstatic.com/old.webm"}}]
+        app["movies"] = [
+            {"webm": {"max": "https://cdn.akamai.steamstatic.com/old.webm"}}
+        ]
         result = self.parser._build_metadata("570", app)
-        self.assertEqual(result["video_urls"], [["https://cdn.akamai.steamstatic.com/old.webm"]])
+        self.assertEqual(
+            result["video_urls"], [["https://cdn.akamai.steamstatic.com/old.webm"]]
+        )
 
     def test_default_limits_avoid_sending_every_trailer(self):
         app = self.app()
@@ -195,6 +199,136 @@ class SteamParserTests(unittest.TestCase):
             asyncio.run(
                 self.parser.parse(_Session({}, status=429), "https://s.team/a/570")
             )
+
+    @staticmethod
+    def review(review_id, steam_id, votes, text="评测正文", recommended=True):
+        return {
+            "recommendationid": review_id,
+            "author": {"steamid": steam_id},
+            "review": text,
+            "voted_up": recommended,
+            "votes_up": votes,
+            "timestamp_created": 1700000000,
+        }
+
+    def test_player_reviews_use_actual_helpful_votes_and_are_deduplicated(self):
+        reviews = [
+            self.review("1", "111", 4),
+            self.review("2", "222", 9, recommended=False),
+            self.review("2", "222", 9, "重复评测"),
+            None,
+            {"review": None},
+        ]
+        normalized = SteamParser._normalize_reviews(
+            {"response": {"reviews": reviews}}, 2
+        )
+        self.assertEqual([item["comment_id"] for item in normalized], ["2", "1"])
+        self.assertEqual(normalized[0]["uid"], "222")
+        self.assertEqual(normalized[0]["username"], "Steam 玩家")
+        self.assertEqual(normalized[0]["avatar_url"], "")
+        self.assertEqual(normalized[0]["likes"], 9)
+        self.assertEqual(normalized[0]["likes_label"], "有帮助")
+        self.assertEqual(normalized[0]["message"], "不推荐\n评测正文")
+        self.assertEqual(normalized[0]["time"], "2023-11-14 22:13:20")
+
+    def test_malformed_review_fields_do_not_create_fake_votes(self):
+        normalized = SteamParser._normalize_reviews(
+            {
+                "reviews": [
+                    {
+                        "review": "正文",
+                        "author": [],
+                        "votes_up": "invalid",
+                        "timestamp_created": "invalid",
+                    }
+                ]
+            },
+            3,
+        )
+        self.assertEqual(normalized[0]["likes"], 0)
+        self.assertEqual(normalized[0]["time"], "")
+        self.assertEqual(normalized[0]["uid"], "")
+
+    def test_count_zero_never_calls_player_review_api(self):
+        parser = SteamParser(hot_comment_count=0)
+        parser._fetch_app = AsyncMock(return_value=self.app())
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+        asyncio.run(parser.parse(None, "https://s.team/a/570"))
+        parser._fetch_hot_comments.assert_not_awaited()
+        self.assertEqual(
+            asyncio.run(
+                SteamParser(hot_comment_count=0)._fetch_hot_comments(None, "570")
+            ),
+            [],
+        )
+
+    def test_official_replacement_review_api_uses_input_json_and_proxy(self):
+        parser = SteamParser(
+            hot_comment_count=2, use_proxy=True, proxy_url="http://127.0.0.1:7890"
+        )
+        parser._fetch_app = AsyncMock(return_value=self.app())
+        session = _Session({"response": {"reviews": [self.review("1", "111", 4)]}})
+        result = asyncio.run(parser.parse(session, "https://s.team/a/570"))
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(
+            session.calls[0][0],
+            "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/",
+        )
+        parameters = json.loads(session.calls[0][1]["params"]["input_json"])
+        self.assertEqual(parameters["appid"], 570)
+        self.assertEqual(parameters["filter"], 0)
+        self.assertEqual(parameters["languages"], ["all"])
+        self.assertEqual(parameters["day_range"], 0)
+        self.assertEqual(parameters["cursor"], "*")
+        self.assertLessEqual(parameters["num_per_page"], 100)
+        self.assertEqual(session.calls[0][1]["proxy"], "http://127.0.0.1:7890")
+        self.assertFalse(session.calls[0][1]["allow_redirects"])
+        self.assertEqual(result["comment_section_title"], "玩家评测")
+        self.assertEqual(result["hot_comments"][0]["likes"], 4)
+
+    def test_review_api_failure_does_not_block_game_content(self):
+        parser = SteamParser(hot_comment_count=2)
+        parser._fetch_app = AsyncMock(return_value=self.app())
+        result = asyncio.run(
+            parser.parse(_Session({}, status=429), "https://s.team/a/570")
+        )
+        self.assertEqual(result["title"], "Example & Game")
+        self.assertNotIn("hot_comments", result)
+
+    def test_player_review_request_has_a_total_timeout_and_is_cancelled(self):
+        parser = SteamParser(hot_comment_count=2)
+        parser._fetch_app = AsyncMock(return_value=self.app())
+        cancelled = []
+
+        async def slow_reviews(*_args):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                cancelled.append(True)
+
+        parser._fetch_hot_comments = slow_reviews
+        with patch("nova_core.parser.platform.steam.REVIEW_TIMEOUT_SECONDS", 0.01):
+            result = asyncio.run(parser.parse(None, "https://s.team/a/570"))
+        self.assertEqual(result["title"], "Example & Game")
+        self.assertEqual(cancelled, [True])
+
+    def test_player_review_response_size_is_limited(self):
+        parser = SteamParser(hot_comment_count=2)
+        session = _Session(
+            {"response": {"reviews": [self.review("1", "111", 4, "x" * 1000)]}}
+        )
+        with (
+            patch("nova_core.parser.platform.steam.MAX_RESPONSE_BYTES", 128),
+            self.assertRaisesRegex(RuntimeError, "大小限制"),
+        ):
+            asyncio.run(parser._fetch_hot_comments(session, "570"))
+
+    def test_player_review_cancellation_propagates(self):
+        parser = SteamParser(hot_comment_count=2)
+        parser._fetch_app = AsyncMock(return_value=self.app())
+        parser._fetch_hot_comments = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(parser.parse(None, "https://s.team/a/570"))
 
 
 if __name__ == "__main__":

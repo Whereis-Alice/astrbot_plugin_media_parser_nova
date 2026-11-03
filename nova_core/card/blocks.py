@@ -1909,7 +1909,8 @@ class TabBarBlock(Block):
         count = _stat_value(ctx, ("comment",))
         if not count and model.comments:
             count = str(len(model.comments))
-        active = f"评论 {count}".strip() if count else "评论"
+        label = model.comment_section_title or "评论"
+        active = f"{label} {count}".strip() if count else label
         return active, self._secondary(ctx)
 
     @staticmethod
@@ -2240,6 +2241,8 @@ class CommentsBlock(Block):
 
         # X 的回复是「正文下方一排 💬 / 🔁 / ❤️ 迷你操作行」，而不是名字右侧一枚赞
         act_kinds = _chrome(ctx).comment_actions if self.variant == "bili" else ()
+        if any(item.likes_label != "点赞" for item in items):
+            act_kinds = ()
         act_icon = max(11, int(round(m.f_caption * 1.06)))
         act_h = (act_icon + m.gap_xs) if act_kinds else 0
         plan["act_kinds"] = act_kinds
@@ -2255,7 +2258,9 @@ class CommentsBlock(Block):
             h += ctx.ts.line_height(name_f, 1.15)
             h += ctx.ts.paragraph_height(lines, text_f, m.lh_snug)
             meta_h = 0
-            if self.variant == "bili" and item.time and not act_kinds:
+            if item.time and not act_kinds and (
+                self.variant == "bili" or ctx.model.comment_section_title
+            ):
                 meta_h = ctx.ts.line_height(meta_f, 1.35)
                 h += meta_h
             h += act_h
@@ -2330,6 +2335,10 @@ class CommentsBlock(Block):
         if self.variant == "bili":
             head_lh = ctx.ts.line_height(head_f, 1.0)
             head_text, sort_text = _chrome(ctx).comment_head
+            if ctx.model.comment_section_title:
+                head_text = ctx.model.comment_section_title
+                if head_text == "弹幕摘选":
+                    sort_text = "近期弹幕"
             ctx.text(layer, (x, y), head_text, head_f, ctx.ink_muted)
             sort_f = ctx.font(m.f_caption)
             sw = ctx.ts.width(sort_text, sort_f)
@@ -2346,7 +2355,7 @@ class CommentsBlock(Block):
             )
             cursor = y + int(plan["head_h"])
         else:
-            title = f"热门评论 · {len(rows)}"
+            title = f"{ctx.model.comment_section_title or '热门评论'} · {len(rows)}"
             ctx.text(layer, (x, y), title, head_f, ctx.accent_text, tracking=ctx.theme.tracking_eyebrow, bold=True)
             line_y = y + ctx.ts.line_height(head_f, 1.0) + m.gap_xs
             surface.hairline(layer, x, line_y, x + width, ctx.hair)
@@ -2374,6 +2383,9 @@ class CommentsBlock(Block):
                 avail = max(20, x + width - tx)
                 act_kinds = plan.get("act_kinds") or ()
                 likes = str(item.likes) if item.likes and item.likes != "0" else ""
+                custom_metric = item.likes_label != "点赞"
+                if custom_metric and item.likes:
+                    likes = f"{item.likes_label}: {item.likes}"
                 if act_kinds:
                     # X 形态：名字后面直接跟「· 时间」，赞数交给下方迷你操作行
                     head_line = item.username
@@ -2387,7 +2399,7 @@ class CommentsBlock(Block):
                         ctx.ink_muted,
                     )
                 else:
-                    icon_w = max(9, int(m.f_meta * 0.95)) if likes else 0
+                    icon_w = max(9, int(m.f_meta * 0.95)) if likes and not custom_metric else 0
                     tail_w = (icon_w + m.gap_2xs + ctx.ts.width(likes, meta_f)) if likes else 0
                     ctx.text(
                         layer,
@@ -2399,12 +2411,13 @@ class CommentsBlock(Block):
                     if likes:
                         tail_x = x + width - tail_w
                         gy = ty + max(0, (ctx.ts.line_height(name_f, 1.0) - icon_w) // 2)
-                        surface.glyph(
-                            layer,
-                            (tail_x, gy, tail_x + icon_w, gy + icon_w),
-                            "like",
-                            alpha(ctx.ink_muted, 255),
-                        )
+                        if icon_w:
+                            surface.glyph(
+                                layer,
+                                (tail_x, gy, tail_x + icon_w, gy + icon_w),
+                                "like",
+                                alpha(ctx.ink_muted, 255),
+                            )
                         ctx.text(layer, (tail_x + icon_w + m.gap_2xs, ty), likes, name_f, ctx.ink_muted)
                 ty += ctx.ts.line_height(name_f, 1.15)
                 ty += ctx.para(layer, (tx, ty), row["lines"], text_f, ctx.ink, leading=m.lh_snug)
@@ -2413,7 +2426,8 @@ class CommentsBlock(Block):
                         ctx, layer, tx, ty + m.gap_xs, act_kinds, int(plan["act_icon"]), likes, meta_f
                     )
                 elif row.get("meta_h"):
-                    ctx.text(layer, (tx, ty + m.gap_2xs), f"{item.time} 回复", meta_f, ctx.ink_muted)
+                    caption = item.time if ctx.model.comment_section_title else f"{item.time} 回复"
+                    ctx.text(layer, (tx, ty + m.gap_2xs), caption, meta_f, ctx.ink_muted)
                 cursor += h + row_gap
                 continue
             if self.variant == "cards":
@@ -2454,7 +2468,10 @@ class CommentsBlock(Block):
                 )
             avail = max(20, x + width - tx - pad)
             likes = str(item.likes) if item.likes and item.likes != "0" else ""
-            heart_w = int(m.f_meta * 0.82) if likes else 0
+            custom_metric = item.likes_label != "点赞"
+            if custom_metric and item.likes:
+                likes = f"{item.likes_label}: {item.likes}"
+            heart_w = int(m.f_meta * 0.82) if likes and not custom_metric else 0
             tail_w = (ctx.ts.width(likes, meta_f) + heart_w + m.gap_2xs) if likes else 0
             ctx.text(
                 layer,
@@ -2468,11 +2485,12 @@ class CommentsBlock(Block):
                 tail_x = x + width - pad - tail_w
                 heart_h = max(4, int(heart_w * 0.9))
                 heart_y = ty + max(0, (ctx.ts.line_height(meta_f, 1.0) - heart_h) // 2)
-                surface.heart(
-                    layer,
-                    (tail_x, heart_y, tail_x + heart_w, heart_y + heart_h),
-                    alpha(ctx.accent, 235),
-                )
+                if heart_w:
+                    surface.heart(
+                        layer,
+                        (tail_x, heart_y, tail_x + heart_w, heart_y + heart_h),
+                        alpha(ctx.accent, 235),
+                    )
                 ctx.text(
                     layer,
                     (tail_x + heart_w + m.gap_2xs, ty),
@@ -2481,7 +2499,9 @@ class CommentsBlock(Block):
                     ctx.accent_text,
                 )
             ty += ctx.ts.line_height(name_f, 1.15)
-            ctx.para(layer, (tx, ty), row["lines"], text_f, ctx.ink_dim, leading=m.lh_snug)
+            ty += ctx.para(layer, (tx, ty), row["lines"], text_f, ctx.ink_dim, leading=m.lh_snug)
+            if row.get("meta_h"):
+                ctx.text(layer, (tx, ty + m.gap_2xs), item.time, meta_f, ctx.ink_muted)
             cursor += h + row_gap
 
 

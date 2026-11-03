@@ -13,6 +13,7 @@ from typing import Any
 
 from . import surface
 from .typeset import clean_text, limit_chars
+from ..comment_display import comment_likes_text
 
 # 统计行 emoji -> 中文标签
 STAT_LABELS: dict[str, str] = {
@@ -129,6 +130,7 @@ class CommentItem:
     time: str
     message: str
     avatar: Path | None = None
+    likes_label: str = "点赞"
 
 
 @dataclass(slots=True)
@@ -160,6 +162,7 @@ class CardModel:
     online: str = ""
     warnings: list[str] = field(default_factory=list)
     comments: list[CommentItem] = field(default_factory=list)
+    comment_section_title: str = ""
     quote: QuoteItem | None = None
     url: str = ""
     watermark: str = ""
@@ -213,14 +216,20 @@ def normalize_comments(
         if not message:
             continue
         avatar_path = avatar_map.get(index)
+        likes = comment_likes_text(entry)
+        if likes.isdecimal() and not entry.get("likes_text"):
+            likes = compact_number(int(likes))
         items.append(
             CommentItem(
                 username=clean_text(str(entry.get("username") or "未知用户")) or "未知用户",
                 uid=clean_text(str(entry.get("uid") or "")),
                 # 平台自己给的压缩文案优先（YouTube 只给 "1.1K"，换算成 1100 是假精度）
-                likes=clean_text(str(entry.get("likes_text") or ""))
-                or compact_number(entry.get("likes", 0)),
-                time=clean_text(str(entry.get("time") or "")),
+                likes=likes,
+                time=clean_text(" · ".join(
+                    str(entry.get(key) or "").strip()
+                    for key in ("time", "position_text") if entry.get(key)
+                )),
+                likes_label=clean_text(str(entry.get("likes_label") or "点赞")),
                 message=message,
                 avatar=Path(str(avatar_path)) if avatar_path else None,
             )
@@ -326,6 +335,7 @@ def build_model(
             comment_max_chars,
             avatars=images.get("comment_avatars") or {},
         ),
+        comment_section_title=clean_text(str(extra.get("comment_section_title") or ""))[:32],
         quote=quote,
         url=str(getattr(result, "url", "") or "").strip() if show_url else "",
         watermark=str(watermark or "").strip() if show_watermark else "",

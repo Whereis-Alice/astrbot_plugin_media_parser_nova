@@ -45,8 +45,83 @@ ACCESS_RESPONSE = {
     "data": {"contentUrl": "https://delivery.domand.nicovideo.jp/master.m3u8"},
 }
 
+COMMENT_INFO = {
+    "server": "https://public.nvcomment.nicovideo.jp",
+    "threadKey": "official-thread-key",
+    "params": {
+        "targets": [
+            {"id": "1173108780", "fork": "owner"},
+            {"id": "1173108780", "fork": "main"},
+            {"id": "1173108780", "fork": "easy"},
+        ],
+        "language": "ja-jp",
+    },
+}
+
+COMMENT_RESPONSE = {
+    "meta": {"status": 200},
+    "data": {
+        "threads": [
+            {
+                "fork": "owner",
+                "comments": [
+                    {"body": "/owner script", "postedAt": "2026-11-04T00:00:00Z"}
+                ],
+            },
+            {
+                "fork": "main",
+                "comments": [
+                    {
+                        "id": "a",
+                        "body": "older &amp; liked",
+                        "vposMs": 125000,
+                        "postedAt": "2026-11-03T10:00:00Z",
+                        "score": -2200,
+                        "nicoruCount": 7,
+                        "userId": "anonymous-hash",
+                    },
+                    {
+                        "id": "b",
+                        "body": "newest",
+                        "vposMs": 30000,
+                        "postedAt": "2026-11-03T12:00:00Z",
+                        "score": 0,
+                        "nicoruCount": 0,
+                    },
+                    {
+                        "id": "c",
+                        "body": "same message",
+                        "vposMs": 65000,
+                        "postedAt": "2026-11-03T11:00:00Z",
+                        "score": 100000,
+                        "nicoruCount": 2,
+                    },
+                    {"body": "", "postedAt": "2026-11-04T00:00:00Z"},
+                    {"body": "deleted", "isDeleted": True},
+                    None,
+                ],
+            },
+            {
+                "fork": "easy",
+                "comments": [
+                    {
+                        "body": "same message",
+                        "postedAt": "2026-11-03T09:00:00Z",
+                        "nicoruCount": 9,
+                    }
+                ],
+            },
+        ]
+    },
+}
+
 
 class NiconicoParserTests(unittest.IsolatedAsyncioTestCase):
+    def _watch_with_comment_info(self):
+        response = copy.deepcopy(WATCH_RESPONSE)
+        response["data"]["comment"] = {"nvComment": copy.deepcopy(COMMENT_INFO)}
+        return response
+
     def test_supported_links_are_deduplicated_in_input_order(self):
         parser = NiconicoParser()
         self.assertEqual(
@@ -128,6 +203,190 @@ class NiconicoParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["title"], "陰陽師")
         self.assertEqual(result["video_urls"], [])
         parser._request_json.assert_awaited_once()
+
+    async def test_danmaku_disabled_does_not_request_comment_server(self):
+        parser = NiconicoParser(hot_comment_count=0, include_media=False)
+        parser._request_json = AsyncMock(
+            return_value=(self._watch_with_comment_info(), {})
+        )
+        result = await parser.parse(None, "https://www.nicovideo.jp/watch/sm9")
+        self.assertNotIn("hot_comments", result)
+        parser._request_json.assert_awaited_once()
+
+    async def test_text_only_can_select_official_danmaku(self):
+        parser = NiconicoParser(hot_comment_count=3, include_media=False)
+        parser._request_json = AsyncMock(
+            side_effect=[
+                (self._watch_with_comment_info(), {}),
+                (copy.deepcopy(COMMENT_RESPONSE), {}),
+            ]
+        )
+        result = await parser.parse(None, "https://www.nicovideo.jp/watch/sm9")
+        self.assertEqual(result["comment_section_title"], "弹幕摘选")
+        self.assertEqual(
+            [comment["message"] for comment in result["hot_comments"]],
+            ["newest", "same message", "older & liked"],
+        )
+        older = result["hot_comments"][2]
+        self.assertEqual(older["likes"], 7)
+        self.assertEqual(older["nicoru_count"], 7)
+        self.assertEqual(older["score"], -2200)
+        self.assertEqual(older["likes_label"], "Nicoる")
+        self.assertEqual(older["username"], "弹幕用户")
+        self.assertEqual(older["uid"], "")
+        self.assertEqual(older["position_ms"], 125000)
+        self.assertEqual(older["position_text"], "弹幕位置 02:05")
+        self.assertEqual(older["comment_kind"], "danmaku")
+        self.assertEqual(result["video_urls"], [])
+        call = parser._request_json.await_args_list[1]
+        self.assertEqual(
+            call.args[2], "https://public.nvcomment.nicovideo.jp/v1/threads"
+        )
+        self.assertEqual(call.kwargs["body"]["threadKey"], "official-thread-key")
+        self.assertEqual(
+            [item["fork"] for item in call.kwargs["body"]["params"]["targets"]],
+            ["main", "easy"],
+        )
+        self.assertEqual(
+            call.kwargs["headers"]["Content-Type"], "text/plain;charset=UTF-8"
+        )
+        self.assertLessEqual(call.kwargs["timeout_seconds"], 10)
+        self.assertLessEqual(call.kwargs["max_bytes"], 2 * 1024 * 1024)
+        self.assertNotIn("Cookie", call.kwargs["headers"])
+
+    async def test_comment_failure_does_not_interrupt_media_authorization(self):
+        parser = NiconicoParser(hot_comment_count=3)
+        parser._request_json = AsyncMock(
+            side_effect=[
+                (self._watch_with_comment_info(), {}),
+                TimeoutError(),
+                (copy.deepcopy(ACCESS_RESPONSE), {"domand_bid": "cookie"}),
+            ]
+        )
+        result = await parser.parse(None, "https://www.nicovideo.jp/watch/sm9")
+        self.assertEqual(len(result["video_urls"]), 1)
+        self.assertNotIn("hot_comments", result)
+        self.assertEqual(parser._request_json.await_count, 3)
+
+    async def test_comment_request_cancellation_propagates(self):
+        parser = NiconicoParser(hot_comment_count=3, include_media=False)
+        parser._request_json = AsyncMock(
+            side_effect=[
+                (self._watch_with_comment_info(), {}),
+                asyncio.CancelledError(),
+            ]
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await parser.parse(None, "https://www.nicovideo.jp/watch/sm9")
+
+    async def test_comment_response_byte_limit_is_enforced_before_json_decode(self):
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"123456"
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Session:
+            def request(self, *args, **kwargs):
+                return Response()
+
+        parser = NiconicoParser()
+        with self.assertRaisesRegex(ValueError, "大小限制"):
+            await parser._request_json(
+                Session(),
+                "POST",
+                "https://public.nvcomment.nicovideo.jp/v1/threads",
+                headers={},
+                max_bytes=5,
+                timeout_seconds=10,
+            )
+
+    async def test_comment_server_whitelist_blocks_foreign_or_credential_urls(self):
+        for server in (
+            "https://public.nvcomment.nicovideo.jp.evil.com",
+            "https://user:key@public.nvcomment.nicovideo.jp",
+            "https://public.nvcomment.nicovideo.jp:8080",
+            "http://public.nvcomment.nicovideo.jp",
+            "https://127.0.0.1",
+            "https://public.nvcomment.nicovideo.jp/path",
+            "https://public.nvcomment.nicovideo.jp?redirect=https://evil.com",
+        ):
+            response = self._watch_with_comment_info()
+            response["data"]["comment"]["nvComment"]["server"] = server
+            parser = NiconicoParser(hot_comment_count=3, include_media=False)
+            parser._request_json = AsyncMock(return_value=(response, {}))
+            with self.subTest(server=server):
+                result = await parser.parse(None, "https://www.nicovideo.jp/watch/sm9")
+                self.assertNotIn("hot_comments", result)
+                parser._request_json.assert_awaited_once()
+
+    async def test_malformed_comment_shapes_are_optional(self):
+        for comment_info in (
+            None,
+            [],
+            {**COMMENT_INFO, "threadKey": None},
+            {**COMMENT_INFO, "params": []},
+            {**COMMENT_INFO, "params": {"targets": None}},
+        ):
+            response = self._watch_with_comment_info()
+            response["data"]["comment"]["nvComment"] = comment_info
+            parser = NiconicoParser(hot_comment_count=3, include_media=False)
+            parser._request_json = AsyncMock(return_value=(response, {}))
+            with self.subTest(comment_info=comment_info):
+                result = await parser.parse(None, "https://www.nicovideo.jp/watch/sm9")
+                self.assertEqual(result["title"], "陰陽師")
+                self.assertNotIn("hot_comments", result)
+                parser._request_json.assert_awaited_once()
+
+    def test_danmaku_normalizer_handles_null_threads_and_missing_numbers(self):
+        for response in (
+            {"data": None},
+            {"data": {"threads": None}},
+            {
+                "data": {
+                    "threads": [
+                        None,
+                        {"fork": [], "comments": []},
+                        {"fork": "main", "comments": None},
+                    ]
+                }
+            },
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(NiconicoParser._normalize_danmaku(response, 3), [])
+        result = NiconicoParser._normalize_danmaku(
+            {
+                "data": {
+                    "threads": [
+                        {
+                            "fork": "main",
+                            "comments": [
+                                {
+                                    "body": "valid message",
+                                    "nicoruCount": "invalid",
+                                    "vposMs": "invalid",
+                                    "score": [1],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+            3,
+        )
+        self.assertEqual(result[0]["likes"], 0)
+        self.assertIsNone(result[0]["position_ms"])
+        self.assertEqual(result[0]["position_text"], "")
+        self.assertIsNone(result[0]["score"])
+        self.assertEqual(NiconicoParser._normalize_danmaku(COMMENT_RESPONSE, 0), [])
 
     async def test_access_right_created_status_is_success(self):
         access = copy.deepcopy(ACCESS_RESPONSE)

@@ -35,6 +35,7 @@ TIKTOK_PAGE_HOSTS = frozenset(
 TIKTOK_MAX_REDIRECTS = 5
 TIKTOK_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 TIKTOK_CURL_MARKER = "__CURL_RESPONSE_METADATA__:"
+MAX_COMMENT_RESPONSE_BYTES = 5 * 1024 * 1024
 
 
 class TikTokRedirectError(RuntimeError):
@@ -46,12 +47,16 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
 
     def __init__(
         self, use_proxy: bool = False, proxy_url: Optional[str] = None,
-        cookie: str = "",
+        cookie: str = "", hot_comment_count: int = 0,
     ):
         super().__init__("tiktok")
         self.use_proxy = bool(use_proxy)
         self.proxy_url = proxy_url
         self.cookie = str(cookie or "").replace("\r", "").replace("\n", "").strip()
+        try:
+            self.hot_comment_count = max(0, int(hot_comment_count))
+        except (TypeError, ValueError):
+            self.hot_comment_count = 0
         self.tiktok_headers = {
             "User-Agent": TIKTOK_USER_AGENT,
             "Referer": TIKTOK_REFERER,
@@ -71,6 +76,119 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
         if self.use_proxy and self.proxy_url:
             return self.proxy_url
         return None
+
+    @staticmethod
+    async def _read_comment_json(response: aiohttp.ClientResponse) -> Dict[str, Any]:
+        """按 aiohttp 解压后的流限制评论响应，不影响页面解析。"""
+        if response.status != 200:
+            raise RuntimeError(f"TikTok 评论接口不可访问: HTTP {response.status}")
+        body = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if len(body) + len(chunk) > MAX_COMMENT_RESPONSE_BYTES:
+                raise RuntimeError("TikTok 评论响应超过 5 MiB 限制")
+            body.extend(chunk)
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("TikTok 评论接口未返回有效 JSON") from error
+        if not isinstance(data, dict):
+            raise RuntimeError("TikTok 评论接口返回的数据不是对象")
+        return data
+
+    @classmethod
+    def _normalize_hot_comment_item(cls, item: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化官方评论字段；缺失互动数字保留未知，避免冒充零。"""
+        user = cls._object(item.get("user"))
+        raw_likes = item.get("digg_count")
+        likes = (
+            raw_likes if isinstance(raw_likes, int) and not isinstance(raw_likes, bool)
+            else int(raw_likes) if isinstance(raw_likes, str) and raw_likes.isdigit()
+            else None
+        )
+        if likes is not None and likes < 0:
+            likes = None
+        nickname = str(user.get("nickname") or "").strip()
+        unique_id = str(user.get("unique_id") or user.get("uniqueId") or "").lstrip("@")
+        username = cls._build_tiktok_author(nickname, unique_id)
+        result = {
+            "username": username,
+            "author": username,
+            "uid": str(user.get("uid") or user.get("id") or ""),
+            "avatar_url": cls._extract_avatar_url(user),
+            "message": str(item.get("text") or "").strip(),
+            "likes": likes,
+            "time": cls._format_timestamp(item.get("create_time")),
+        }
+        if likes is None:
+            result["likes_text"] = "未知"
+        return result
+
+    async def _fetch_hot_comments(
+        self, session: aiohttp.ClientSession, item_id: str, page_url: str = "",
+    ) -> List[Dict[str, Any]]:
+        """读取官方网页评论接口第一页，未启用时不发送额外请求。"""
+        item_id = str(item_id or "").strip()
+        if self.hot_comment_count <= 0 or not re.fullmatch(r"\d+", item_id):
+            return []
+        headers = dict(self.tiktok_headers)
+        if self._is_tiktok_url(page_url):
+            headers["Referer"] = page_url
+        headers["Accept"] = "application/json, text/plain, */*"
+        params = {
+            "aid": "1988", "app_name": "tiktok_web", "aweme_id": item_id,
+            "count": str(min(20, self.hot_comment_count)), "cursor": "0",
+        }
+        async with session.get(
+            "https://www.tiktok.com/api/comment/list/", params=params,
+            headers=headers, proxy=self._get_proxy(), allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            data = await self._read_comment_json(response)
+        if not isinstance(data, dict) or str(data.get("status_code", 0)) != "0":
+            raise RuntimeError("TikTok 评论接口未返回可用数据，可能受登录、地区或风控限制")
+        items = data.get("comments")
+        if items is None and "comments" in data:
+            return []
+        if not isinstance(items, list):
+            raise RuntimeError("TikTok 评论接口返回的数据结构无效")
+        comments = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            comment_item_id = str(item.get("aweme_id") or "").strip()
+            if comment_item_id and comment_item_id != item_id:
+                continue
+            normalized = self._normalize_hot_comment_item(item)
+            if not normalized["message"]:
+                continue
+            key = str(item.get("cid") or "") or (normalized["uid"], normalized["message"])
+            if key in seen:
+                continue
+            seen.add(key)
+            comments.append(normalized)
+        comments.sort(key=lambda item: item["likes"] if item["likes"] is not None else -1, reverse=True)
+        return comments[:self.hot_comment_count]
+
+    async def _attach_hot_comments_to_result(
+        self, session: aiohttp.ClientSession, result: Dict[str, Any], item_id: str = "",
+    ) -> None:
+        """评论失败不丢正文或媒体，任务取消照常传播。"""
+        if self.hot_comment_count <= 0:
+            return
+        page_url = str(result.get("url") or "")
+        if not item_id and self._is_tiktok_url(page_url):
+            match = re.search(r"/(?:video|photo)/(\d+)", urlparse(page_url).path)
+            if match:
+                item_id = match.group(1)
+        try:
+            comments = await self._fetch_hot_comments(session, item_id, page_url)
+            if comments:
+                result["hot_comments"] = comments
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(f"[{self.name}] 评论获取失败，仍发送正文与媒体: {type(error).__name__}")
 
     @staticmethod
     async def _terminate_subprocess(process, label: str) -> None:
@@ -668,6 +786,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
             "display_url": self._build_tiktok_display_url(
                 normalized_page_url, unique_id, item_id, is_gallery
             ),
+            "item_id": item_id,
             "user_agent": TIKTOK_USER_AGENT,
             "use_image_proxy": self.use_proxy,
             "use_video_proxy": self.use_proxy,
@@ -871,7 +990,7 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
                 logger.debug(
                     f"[{self.name}] parse: 检测到图片集，共{len(image_url_lists)}张图片"
                 )
-                return {
+                parsed_result = {
                     "url": display_url,
                     "title": title,
                     "author": author,
@@ -886,6 +1005,8 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
                     "video_headers": headers["video_headers"],
                     **proxy_fields,
                 }
+                await self._attach_hot_comments_to_result(session, parsed_result, result.get("item_id", ""))
+                return parsed_result
 
             if not video_url_list:
                 logger.debug(f"[{self.name}] parse: 无法获取视频URL {url}")
@@ -909,4 +1030,5 @@ class TikTokParser(ShortVideoParserMixin, BaseVideoParser):
             logger.debug(
                 f"[{self.name}] parse: 解析完成(tiktok) {url}, title={title[:50]}"
             )
+            await self._attach_hot_comments_to_result(session, parsed_result, result.get("item_id", ""))
             return parsed_result

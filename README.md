@@ -27,7 +27,7 @@
 | --- | --- | --- |
 | B 站 | 视频、图片、动态、番剧、文本、热评 | `b23.tv`、`bilibili.com/video`、`bilibili.com/opus` |
 | 抖音 | 视频、图集、文本 | `v.douyin.com`、`douyin.com/video`、`douyin.com/note` |
-| TikTok | 视频、图集、文本 | `vm.tiktok.com`、`tiktok.com/@.../video` |
+| TikTok | 视频、图集、文本、热评 | `vm.tiktok.com`、`tiktok.com/@.../video` |
 | 快手 | 视频、图片、文本 | `v.kuaishou.com`、`kuaishou.com`、`gifshow.com` |
 | 微博 | 视频、图片、文本、热评 | `weibo.com`、`m.weibo.cn`、`video.weibo.com` |
 | 小红书 | 视频、图片、文本、热评 | `xhslink.com`、`xiaohongshu.com/explore` |
@@ -36,9 +36,9 @@
 | 小黑盒 | 视频、图片、文本；BBS 帖子热评 | `xiaoheihe.cn/app/topic`、`xiaoheihe.cn/app/bbs/link` |
 | Twitter/X | 视频、图片、文本；热评与互动统计需配置 Nitter | `twitter.com/.../status/...`、`x.com/.../status/...` |
 | Pixiv | 插画、漫画多页图片、文本 | `pixiv.net/artworks/...`、`pixiv.net/i/...` |
-| niconico | 视频、封面、标题、作者、简介 | `nicovideo.jp/watch/sm...`、`nico.ms/sm...` |
-| Steam | 游戏商店信息、截图、宣传视频 | `store.steampowered.com/app/...` |
-| 知乎 | 回答、问题、专栏文章、正文图片及可获取的视频 | `zhihu.com/question/.../answer/...`、`zhuanlan.zhihu.com/p/...` |
+| niconico | 视频、封面、标题、作者、简介、弹幕摘选 | `nicovideo.jp/watch/sm...`、`nico.ms/sm...` |
+| Steam | 游戏商店信息、截图、宣传视频、玩家评测 | `store.steampowered.com/app/...` |
+| 知乎 | 回答、问题、专栏文章、图片、视频、评论 | `zhihu.com/question/.../answer/...`、`zhuanlan.zhihu.com/p/...` |
 
 平台页面结构、登录状态、地区限制和风控策略会变化，「支持平台」不代表每条链接在任何网络环境下都一定可访问。
 
@@ -59,6 +59,8 @@ astrbot_plugin_media_parser_nova
 装好即用：各平台默认为「全部发送」，直接在聊天里发一条支持的链接就会解析。
 
 niconico、TikTok、Steam、微博、知乎也可在「解析器与输出模式」中独立关闭。微博、知乎和 TikTok 遇到登录或风控限制时，可在对应平台设置中填写浏览器 Cookie，并按需开启代理。Steam 默认最多发送 6 张截图、1 条宣传视频。
+
+评论设置沿用 B 站的方式：在「消息输出 → 附加内容：热评」把条数设为大于 0，并开启对应平台。需要在卡片里展示时，再开启「热评合并到卡片」；是否发送独立评论文本由「在普通文本中显示热评」控制。Steam 的内容标为“玩家评测”，niconico 标为“弹幕摘选”。知乎、微博评论可能需要 Cookie；获取失败时继续发送原内容。
 
 要让大视频直接以群文件发送：将「下载设置 → 超限视频投递方式」设为「超限直接上传原文件（不压缩）」。超过普通视频发送上限后，QQ 群聊上传群文件，私聊上传私聊文件；这个选项优先于所有压缩设置，仍遵守下载硬上限。需要可用缓存和支持文件上传的 OneBot v11 协议端。niconico 和 Steam 的 HLS 视频需要 ffmpeg。
 

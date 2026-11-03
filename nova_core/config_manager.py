@@ -403,6 +403,10 @@ class HotCommentConfig:
     xiaohongshu: bool = True
     twitter: bool = True
     xiaoheihe: bool = True
+    niconico: bool = True
+    tiktok: bool = True
+    steam: bool = True
+    zhihu: bool = True
     #: Twitter/X 热评的 Nitter 实例地址（逗号分隔可配多个），留空表示不使用。
     twitter_nitter_base_url: str = ""
 
@@ -867,6 +871,18 @@ class ConfigManager:
                     hot_comments.get("xiaoheihe", True),
                     True,
                     "message.hot_comments.xiaoheihe",
+                ),
+                niconico=self._parse_bool(
+                    hot_comments.get("niconico", True), True, "message.hot_comments.niconico"
+                ),
+                tiktok=self._parse_bool(
+                    hot_comments.get("tiktok", True), True, "message.hot_comments.tiktok"
+                ),
+                steam=self._parse_bool(
+                    hot_comments.get("steam", True), True, "message.hot_comments.steam"
+                ),
+                zhihu=self._parse_bool(
+                    hot_comments.get("zhihu", True), True, "message.hot_comments.zhihu"
                 ),
                 twitter_nitter_base_url=str(
                     hot_comments.get("twitter_nitter_base_url", "") or ""
@@ -1528,6 +1544,9 @@ class ConfigManager:
                     use_proxy=self.proxy.tiktok_use_proxy,
                     proxy_url=proxy_addr,
                     cookie=self.tiktok.cookie,
+                    hot_comment_count=self._effective_hot_comment_count(
+                        self.message.hot_comments.tiktok, "tiktok"
+                    ),
                 )
             )
         if self._enable_kuaishou:
@@ -1586,6 +1605,9 @@ class ConfigManager:
                 proxy_url=proxy_addr,
                 cookie=self.niconico.cookie,
                 include_media=include_media,
+                hot_comment_count=self._effective_hot_comment_count(
+                    self.message.hot_comments.niconico, "niconico"
+                ),
             ))
         if self._enable_steam:
             parsers.append(SteamParser(
@@ -1595,6 +1617,9 @@ class ConfigManager:
                 country_code=self.steam.country_code,
                 max_screenshots=self.steam.max_screenshots,
                 max_trailers=self.steam.max_trailers,
+                hot_comment_count=self._effective_hot_comment_count(
+                    self.message.hot_comments.steam, "steam"
+                ),
             ))
         if self._enable_zhihu:
             _, include_media = self.parser_output.output_for_controller("zhihu")
@@ -1603,6 +1628,9 @@ class ConfigManager:
                 use_proxy=self.proxy.zhihu_use_proxy,
                 proxy_url=proxy_addr,
                 include_media=include_media,
+                hot_comment_count=self._effective_hot_comment_count(
+                    self.message.hot_comments.zhihu, "zhihu"
+                ),
             ))
         return parsers
 

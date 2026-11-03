@@ -4,12 +4,14 @@ import asyncio
 import html
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
 
 from ...constants import Config
+from ...logger import logger
 from ...types import MediaMetadata
 from ..utils import trim_url_tail
 from .base import BaseVideoParser
@@ -18,7 +20,9 @@ STEAM_APP_HOSTS = frozenset(
     {"store.steampowered.com", "steamcommunity.com", "www.steamcommunity.com", "s.team"}
 )
 STEAM_API = "https://store.steampowered.com/api/appdetails"
+STEAM_REVIEWS_API = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+REVIEW_TIMEOUT_SECONDS = 12
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
@@ -69,6 +73,7 @@ class SteamParser(BaseVideoParser):
         country_code: str = "CN",
         max_screenshots: int = 6,
         max_trailers: int = 1,
+        hot_comment_count: int = 0,
     ) -> None:
         super().__init__("steam")
         self.use_proxy = bool(use_proxy)
@@ -83,6 +88,7 @@ class SteamParser(BaseVideoParser):
         )
         self.max_screenshots = _bounded_count(max_screenshots, 6, 20)
         self.max_trailers = _bounded_count(max_trailers, 1, 5)
+        self.hot_comment_count = _bounded_count(hot_comment_count, 0, 100)
         self.semaphore = asyncio.Semaphore(Config.PARSER_MAX_CONCURRENT)
 
     @staticmethod
@@ -283,10 +289,127 @@ class SteamParser(BaseVideoParser):
             "proxy_url": self.proxy_url or "",
         }
 
+    @staticmethod
+    def _normalize_reviews(payload: Any, count: int) -> list[dict[str, Any]]:
+        """Keep actual helpful votes; Steam's anonymous API supplies no profile names."""
+        if not isinstance(payload, dict) or count <= 0:
+            return []
+        response = payload.get("response")
+        response = response if isinstance(response, dict) else payload
+        reviews = response.get("reviews")
+        if not isinstance(reviews, list):
+            return []
+        comments: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            message = _text(review.get("review"))
+            if not message:
+                continue
+            author = review.get("author")
+            author = author if isinstance(author, dict) else {}
+            steam_id = str(author.get("steamid") or "").strip()
+            comment_id = str(review.get("recommendationid") or "").strip()
+            identity = comment_id or f"{steam_id}:{message}"
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                timestamp = float(review.get("timestamp_created") or 0)
+                time_text = (
+                    datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S")
+                    if timestamp > 0
+                    else ""
+                )
+            except (TypeError, ValueError, OverflowError, OSError):
+                time_text = ""
+            recommendation = review.get("voted_up")
+            if isinstance(recommendation, bool):
+                message = ("推荐" if recommendation else "不推荐") + "\n" + message
+            comments.append(
+                {
+                    "comment_id": comment_id,
+                    "username": "Steam 玩家",
+                    "uid": steam_id,
+                    "avatar_url": "",
+                    "message": message,
+                    "likes": _bounded_count(review.get("votes_up"), 0, 2**31 - 1),
+                    "likes_label": "有帮助",
+                    "time": time_text,
+                }
+            )
+        comments.sort(key=lambda item: item["likes"], reverse=True)
+        return comments[:count]
+
+    async def _fetch_hot_comments(
+        self, session: aiohttp.ClientSession, app_id: str
+    ) -> list[dict[str, Any]]:
+        if self.hot_comment_count <= 0:
+            return []
+        # The old /appreviews endpoint now redirects to the store home page.
+        # Its official replacement accepts anonymous input_json calls and enum filters.
+        parameters = {
+            "appid": int(app_id),
+            "filter": 0,
+            "languages": ["all"],
+            "day_range": 0,
+            "cursor": "*",
+            "review_type": 0,
+            "purchase_type": 1,
+            "num_per_page": min(100, max(20, self.hot_comment_count)),
+            "display_language": self.language,
+        }
+        async with session.get(
+            STEAM_REVIEWS_API,
+            params={"input_json": json.dumps(parameters, separators=(",", ":"))},
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            proxy=self._get_proxy(),
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=REVIEW_TIMEOUT_SECONDS),
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Steam 玩家评测请求失败（HTTP {response.status}）")
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                received += len(chunk)
+                if received > MAX_RESPONSE_BYTES:
+                    raise RuntimeError("Steam 玩家评测响应超过大小限制")
+                chunks.append(chunk)
+            payload = json.loads(b"".join(chunks))
+        return self._normalize_reviews(payload, self.hot_comment_count)
+
+    async def _attach_hot_comments(
+        self, session: aiohttp.ClientSession, app_id: str, result: MediaMetadata
+    ) -> None:
+        if self.hot_comment_count <= 0:
+            return
+        try:
+            comments = await asyncio.wait_for(
+                self._fetch_hot_comments(session, app_id),
+                timeout=REVIEW_TIMEOUT_SECONDS,
+            )
+            if comments:
+                result["hot_comments"] = comments
+                result["comment_section_title"] = "玩家评测"
+        except (
+            TimeoutError,
+            aiohttp.ClientError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            OSError,
+        ) as exc:
+            # Optional reviews must never hide an otherwise valid game or trailer.
+            logger.debug("Steam 玩家评测暂不可用：%s", type(exc).__name__)
+
     async def parse(self, session: aiohttp.ClientSession, url: str) -> MediaMetadata:
         app_id = self._extract_app_id(url)
         if not app_id:
             raise ValueError("不支持的 Steam 游戏链接")
         async with self.semaphore:
             app = await self._fetch_app(session, app_id)
-        return self._build_metadata(app_id, app)
+            result = self._build_metadata(app_id, app)
+            await self._attach_hot_comments(session, app_id, result)
+        return result

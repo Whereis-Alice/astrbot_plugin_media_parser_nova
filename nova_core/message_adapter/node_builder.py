@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 from astrbot.api.message_components import Image, Plain, Video
 
 from ..downloader.utils import strip_media_prefixes
+from ..comment_display import comment_likes_label, comment_likes_text, comment_section_title
 from ..logger import logger
 from ..message_text import split_message_text
 from ..metadata_visibility import (
@@ -309,22 +310,24 @@ def build_hot_comments_node(
     if not isinstance(hot_comments, list) or not hot_comments:
         return None
 
-    text_parts = [f"热评（{len(hot_comments)}条）："]
+    text_parts = [f"{comment_section_title(metadata)}（{len(hot_comments)}条）："]
     total = len(hot_comments)
     for idx, item in enumerate(hot_comments, start=1):
         if not isinstance(item, dict):
             continue
         username = str(item.get("username", "") or "").strip() or "未知用户"
         uid = str(item.get("uid", "") or "").strip()
-        try:
-            likes = int(item.get("likes", 0) or 0)
-        except (TypeError, ValueError):
-            likes = 0
+        likes = comment_likes_text(item)
+        likes_label = comment_likes_label(item)
         time_text = str(item.get("time", "") or "").strip() or "-"
         message = str(item.get("message", "") or "").strip() or "（无文本内容）"
         user_label = f"{username}(uid:{uid})" if uid else username
         text_parts.append(f"[{idx}] {user_label}")
-        text_parts.append(f"点赞: {likes} | 时间: {time_text}")
+        line = f"{likes_label}: {likes} | 时间: {time_text}"
+        position = str(item.get("position_text") or "").strip()
+        if position:
+            line += f" | {position}"
+        text_parts.append(line)
         text_parts.append(message)
         if idx < total:
             text_parts.append("")

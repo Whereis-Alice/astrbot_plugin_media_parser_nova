@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from nova_core.parser.platform.zhihu import ZhihuParser
 
@@ -313,6 +313,182 @@ class ZhihuParserTests(unittest.TestCase):
 
     def test_cookie_newlines_are_ignored(self):
         self.assertEqual(ZhihuParser(cookie="z_c0=a\nInjected: header").cookie, "")
+
+    @staticmethod
+    def comment(comment_id="1", votes=5):
+        return {
+            "id": comment_id,
+            "type": "comment",
+            "content": "<p>评论 &amp; 正文</p>",
+            "like_count": votes,
+            "created_time": 1700000000,
+            "author": {
+                "id": "alice",
+                "name": "Alice",
+                "avatar_url": "https://pic1.zhimg.com/alice.jpg",
+            },
+        }
+
+    def test_v5_and_legacy_comments_are_normalized_sorted_and_deduplicated(self):
+        legacy = {
+            "id": "2",
+            "content": "<b>旧评论</b>",
+            "vote_count": 8,
+            "created_time": 1700000001,
+            "author": {
+                "role": "normal",
+                "member": {
+                    "id": "bob",
+                    "name": "Bob",
+                    "avatar_url": "https://pic2.zhimg.com/bob.jpg",
+                },
+            },
+        }
+        result = ZhihuParser._normalize_hot_comments(
+            {
+                "data": [
+                    self.comment(),
+                    legacy,
+                    legacy,
+                    None,
+                    {"type": "ad", "content": "广告"},
+                ]
+            },
+            2,
+        )
+        self.assertEqual([item["comment_id"] for item in result], ["2", "1"])
+        self.assertEqual(result[0]["username"], "Bob")
+        self.assertEqual(result[0]["uid"], "bob")
+        self.assertEqual(result[0]["likes"], 8)
+        self.assertEqual(result[0]["avatar_url"], "https://pic2.zhimg.com/bob.jpg")
+        self.assertEqual(result[1]["message"], "评论 & 正文")
+
+    def test_comment_api_targets_each_supported_content_type(self):
+        for kind, bucket in (
+            ("answer", "answers"),
+            ("question", "questions"),
+            ("article", "articles"),
+            ("zvideo", "zvideos"),
+        ):
+            with self.subTest(kind=kind):
+                parser = ZhihuParser(hot_comment_count=2)
+                parser._fetch_json = AsyncMock(return_value={"data": [self.comment()]})
+                result = asyncio.run(parser._fetch_hot_comments(None, kind, "456"))
+                self.assertEqual(len(result), 1)
+                self.assertIn(
+                    f"/comment_v5/{bucket}/456/root_comment?",
+                    parser._fetch_json.call_args.args[1],
+                )
+                self.assertIn("order_by=score", parser._fetch_json.call_args.args[1])
+
+    def test_legacy_comments_are_used_when_v5_endpoint_fails(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(
+            side_effect=[RuntimeError("HTTP 404"), {"data": [self.comment()]}]
+        )
+        result = asyncio.run(parser._fetch_hot_comments(None, "answer", "456"))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(parser._fetch_json.await_count, 2)
+        self.assertIn(
+            "/api/v4/answers/456/root_comments?", parser._fetch_json.call_args.args[1]
+        )
+
+    def test_empty_comment_list_does_not_trigger_a_second_request(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(return_value={"data": []})
+        self.assertEqual(
+            asyncio.run(parser._fetch_hot_comments(None, "answer", "456")), []
+        )
+        self.assertEqual(parser._fetch_json.await_count, 1)
+
+    def test_hot_comments_are_attached_after_successful_main_content(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(
+            side_effect=[self.answer(), {"data": [self.comment()]}]
+        )
+        result = asyncio.run(parser.parse(None, "https://www.zhihu.com/answer/456"))
+        self.assertIn("第一段 & 第二段", result["desc"])
+        self.assertEqual(result["hot_comments"][0]["likes"], 5)
+        self.assertEqual(parser._fetch_json.await_count, 2)
+
+    def test_comment_failure_does_not_block_content(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(
+            side_effect=[self.answer(), RuntimeError("403"), RuntimeError("403")]
+        )
+        result = asyncio.run(parser.parse(None, "https://www.zhihu.com/answer/456"))
+        self.assertEqual(result["title"], "为什么？")
+        self.assertNotIn("hot_comments", result)
+
+    def test_count_zero_never_requests_comments(self):
+        parser = ZhihuParser(hot_comment_count=0)
+        parser._fetch_json = AsyncMock(return_value=self.answer())
+        asyncio.run(parser.parse(None, "https://www.zhihu.com/answer/456"))
+        self.assertEqual(parser._fetch_json.await_count, 1)
+        self.assertEqual(
+            asyncio.run(parser._fetch_hot_comments(None, "answer", "456")), []
+        )
+        self.assertEqual(parser._fetch_json.await_count, 1)
+
+    def test_inaccessible_main_content_does_not_request_comments(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(return_value={"id": "456", "title": "无正文"})
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+        with self.assertRaisesRegex(RuntimeError, "未返回可访问"):
+            asyncio.run(parser.parse(None, "https://www.zhihu.com/answer/456"))
+        parser._fetch_hot_comments.assert_not_awaited()
+
+    def test_comment_cookie_proxy_and_redirect_behavior(self):
+        parser = ZhihuParser(
+            cookie="z_c0=private",
+            use_proxy=True,
+            proxy_url="http://127.0.0.1:7890",
+            hot_comment_count=2,
+        )
+        session = _Session([_Response(json.dumps({"data": [self.comment()]}))])
+        comments = asyncio.run(parser._fetch_hot_comments(session, "answer", "456"))
+        self.assertEqual(len(comments), 1)
+        request = session.calls[0][1]
+        self.assertEqual(request["headers"]["Cookie"], "z_c0=private")
+        self.assertEqual(request["proxy"], "http://127.0.0.1:7890")
+        self.assertFalse(request["allow_redirects"])
+
+    def test_comments_have_a_total_timeout_and_are_cancelled(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(return_value=self.answer())
+        cancelled = []
+
+        async def slow_comments(*_args):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                cancelled.append(True)
+
+        parser._fetch_hot_comments = slow_comments
+        with patch("nova_core.parser.platform.zhihu.COMMENT_TIMEOUT_SECONDS", 0.01):
+            result = asyncio.run(parser.parse(None, "https://www.zhihu.com/answer/456"))
+        self.assertEqual(result["title"], "为什么？")
+        self.assertEqual(cancelled, [True])
+
+    def test_comment_request_cancellation_propagates(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        parser._fetch_json = AsyncMock(
+            side_effect=[self.answer(), asyncio.CancelledError()]
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(parser.parse(None, "https://www.zhihu.com/answer/456"))
+
+    def test_oversized_comment_responses_are_discarded(self):
+        parser = ZhihuParser(hot_comment_count=2)
+        large_comment = self.comment()
+        large_comment["content"] = "x" * 1000
+        body = json.dumps({"data": [large_comment]})
+        session = _Session([_Response(body), _Response(body)])
+        with patch("nova_core.parser.platform.zhihu.MAX_RESPONSE_BYTES", 128):
+            self.assertEqual(
+                asyncio.run(parser._fetch_hot_comments(session, "answer", "456")), []
+            )
+        self.assertEqual(len(session.calls), 2)
 
 
 if __name__ == "__main__":

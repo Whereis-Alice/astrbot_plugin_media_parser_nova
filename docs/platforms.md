@@ -54,13 +54,19 @@ Nitter 抓取成功后就不会再去试 X 公开页（那条路线已经不返�
 
 ### niconico
 
+可选评论功能使用官方 nvComment 接口获取 main/easy 线程的近期弹幕摘选，过滤发布者脚本及重复项，并显示弹幕位置与 Nicoる 互动数。弹幕不是普通评论区；NG 分只用于保留原始数据，不会显示成点赞数。仅文本模式也能获取弹幕。
+
 支持 `www.nicovideo.jp/watch/sm...`、`nm...`、`so...`、数字视频 ID 和 `nico.ms` 视频短链。先请求官方 watch API，再申请 Domand HLS 播放权限；封面、简介与作者可独立展示。公开内容可匿名访问，登录内容可填写 `niconico.cookie`（含 `user_session`），但仍受会员、地区、版权和账号权限限制。媒体下载支持标准 AES-128 HLS，合并需要 ffmpeg；SAMPLE-AES 等 DRM 内容不支持。
 
 ### Steam
 
+可选“热评”开关对应玩家评测，使用官方新版 `api.steampowered.com/IUserReviewsService/GetAppReviews/v1/`，展示评测正文、“有帮助”票数和发布时间，不需要额外 Steam API Key。旧商店 `/appreviews` 接口已迁移，不再依赖它。
+
 支持 `store.steampowered.com/app/<appid>` 游戏商店页，使用官方 `appdetails` API 获取介绍、发行信息、价格、封面、截图与宣传视频。当前 Steam 宣传视频已迁移到 HLS，兼容旧 MP4/WebM 字段。默认最多 6 张截图和 1 条宣传视频，可分别设为 0 关闭。`steam.language` 和 `steam.country_code` 控制语言及地区；下架或在指定地区不可用的游戏会明确提示。
 
 ### 微博、TikTok 和知乎
+
+TikTok 使用官方 `/api/comment/list/` 获取评论，沿用平台 Cookie 和代理；公开样本可匿名访问，其他作品仍可能触发风控。微博既有热评继续支持移动端和桌面接口，但评论的登录要求可能比正文严格。知乎评论使用官方评论接口，匿名访问被限制时需要 Cookie。所有评论都按尽力获取处理，失败不会阻断正文和媒体。
 
 微博支持桌面帖子、`m.weibo.cn/detail/...`、`m.weibo.cn/status/...`、视频页面和 `t.cn` 短链。访客 Cookie 失败不会阻断后续公共接口；无媒体的纯文字帖子也可返回。匿名接口被登录页或风控页替换时会提示填写 `weibo.cookie`。
 
