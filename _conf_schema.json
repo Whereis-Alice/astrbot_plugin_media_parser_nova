@@ -157,6 +157,17 @@
           "仅富媒体"
         ],
         "default": "全部发送"
+      },
+      "tieba": {
+        "description": "贴吧",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅富媒体"
+        ],
+        "default": "全部发送"
       }
     }
   },
@@ -502,6 +513,12 @@
             "description": "知乎评论",
             "type": "bool",
             "hint": "问题、回答、文章或视频评论可能需要已登录Cookie。",
+            "default": true
+          },
+          "tieba": {
+            "description": "贴吧回帖",
+            "type": "bool",
+            "hint": "从首批可见楼层中选择回复并标明楼层，非全帖热榜。条数为 0 或平台设为仅富媒体时不附加回复。",
             "default": true
           }
         }
@@ -1211,6 +1228,12 @@
         "type": "bool",
         "hint": "需要先填写“代理地址”。",
         "default": false
+      },
+      "tieba": {
+        "description": "贴吧解析与媒体下载使用代理",
+        "type": "bool",
+        "hint": "需要先填写“代理地址”。",
+        "default": false
       }
     }
   },
@@ -1343,6 +1366,19 @@
         "type": "int",
         "default": 1,
         "hint": "0–5，0 不发送宣传视频。"
+      }
+    }
+  },
+  "tieba": {
+    "description": "贴吧设置",
+    "type": "object",
+    "hint": "解析贴吧帖子的正文、图片、视频与回帖。公开内容优先匿名访问，访问受限时可配置已登录 Cookie。",
+    "items": {
+      "cookie": {
+        "description": "浏览器 Cookie（可选）",
+        "type": "string",
+        "hint": "只用于贴吧请求；请勿公开分享。留空使用匿名访问。",
+        "default": ""
       }
     }
   }

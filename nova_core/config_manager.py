@@ -16,6 +16,7 @@ from .parser.platform import (
     NiconicoParser,
     PixivParser,
     SteamParser,
+    TiebaParser,
     TikTokParser,
     ToutiaoParser,
     TwitterParser,
@@ -58,6 +59,7 @@ PARSER_OUTPUT_KEYS = (
     "niconico",
     "steam",
     "zhihu",
+    "tieba",
 )
 
 OUTPUT_MODE_DISABLED = "关闭"
@@ -407,6 +409,7 @@ class HotCommentConfig:
     tiktok: bool = True
     steam: bool = True
     zhihu: bool = True
+    tieba: bool = True
     #: Twitter/X 热评的 Nitter 实例地址（逗号分隔可配多个），留空表示不使用。
     twitter_nitter_base_url: str = ""
 
@@ -574,6 +577,7 @@ class ProxyConfig:
     steam_use_proxy: bool = False
     weibo_use_proxy: bool = False
     zhihu_use_proxy: bool = False
+    tieba_use_proxy: bool = False
 
 
 @dataclass
@@ -731,6 +735,7 @@ class ConfigManager:
         self._enable_niconico = self._parser_enabled("niconico")
         self._enable_steam = self._parser_enabled("steam")
         self._enable_zhihu = self._parser_enabled("zhihu")
+        self._enable_tieba = self._parser_enabled("tieba")
 
         # --- message ---
         message_raw = self._as_dict(config.get("message"))
@@ -883,6 +888,9 @@ class ConfigManager:
                 ),
                 zhihu=self._parse_bool(
                     hot_comments.get("zhihu", True), True, "message.hot_comments.zhihu"
+                ),
+                tieba=self._parse_bool(
+                    hot_comments.get("tieba", True), True, "message.hot_comments.tieba"
                 ),
                 twitter_nitter_base_url=str(
                     hot_comments.get("twitter_nitter_base_url", "") or ""
@@ -1375,7 +1383,7 @@ class ConfigManager:
         )
 
         # 平台凭据只由本地配置注入，不落入解析结果和媒体中转地址。
-        for platform_name in ("niconico", "tiktok", "weibo", "zhihu"):
+        for platform_name in ("niconico", "tiktok", "weibo", "zhihu", "tieba"):
             raw = self._as_dict(config.get(platform_name))
             setattr(
                 self, platform_name,
@@ -1443,6 +1451,9 @@ class ConfigManager:
             ),
             zhihu_use_proxy=self._parse_bool(
                 proxy_raw.get("zhihu", False), False, "proxy.zhihu",
+            ),
+            tieba_use_proxy=self._parse_bool(
+                proxy_raw.get("tieba", False), False, "proxy.tieba",
             ),
         )
 
@@ -1630,6 +1641,17 @@ class ConfigManager:
                 include_media=include_media,
                 hot_comment_count=self._effective_hot_comment_count(
                     self.message.hot_comments.zhihu, "zhihu"
+                ),
+            ))
+        if self._enable_tieba:
+            _, include_media = self.parser_output.output_for_controller("tieba")
+            parsers.append(TiebaParser(
+                use_proxy=self.proxy.tieba_use_proxy,
+                proxy_url=proxy_addr,
+                cookie=self.tieba.cookie,
+                include_media=include_media,
+                hot_comment_count=self._effective_hot_comment_count(
+                    self.message.hot_comments.tieba, "tieba"
                 ),
             ))
         return parsers

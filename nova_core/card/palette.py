@@ -114,6 +114,7 @@ PLATFORM_ACCENTS: dict[str, str] = {
     "niconico": "#A8A8A8",
     "steam": "#66C0F4",
     "zhihu": "#0084FF",
+    "tieba": "#3385FF",
     "acfun": "#FD4C5D",
     "nga": "#66C0F4",
     "youtube": "#FF4E45",

@@ -13,6 +13,7 @@ from .pixiv import PixivParser
 from .niconico import NiconicoParser
 from .steam import SteamParser
 from .zhihu import ZhihuParser
+from .tieba import TiebaParser
 from .base import BaseVideoParser
 
 __all__ = [
@@ -30,5 +31,6 @@ __all__ = [
     'NiconicoParser',
     'SteamParser',
     'ZhihuParser',
+    'TiebaParser',
     'BaseVideoParser'
 ]

@@ -20,6 +20,9 @@ class MediaMetadata(TypedDict, total=False):
     timestamp: str
     platform: str
     parser_name: str
+    forum_name: str
+    forum_id: str
+    stats_line: str
     translation_target_language: str
 
     video_urls: List[List[str]]

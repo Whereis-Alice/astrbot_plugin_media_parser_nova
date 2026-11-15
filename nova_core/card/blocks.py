@@ -2339,6 +2339,8 @@ class CommentsBlock(Block):
                 head_text = ctx.model.comment_section_title
                 if head_text == "弹幕摘选":
                     sort_text = "近期弹幕"
+                elif head_text == "楼层回复":
+                    sort_text = "首批回复"
             ctx.text(layer, (x, y), head_text, head_f, ctx.ink_muted)
             sort_f = ctx.font(m.f_caption)
             sw = ctx.ts.width(sort_text, sort_f)

@@ -212,6 +212,11 @@ def build_text_node(
         text_parts.append(f"标题：{metadata['title']}")
     if text_metadata_field_enabled(metadata, "author") and metadata.get("author"):
         text_parts.append(f"作者：{metadata['author']}")
+    if metadata.get("platform") == "tieba" and text_metadata_field_enabled(metadata, "author"):
+        forum = " ".join(str(metadata.get("forum_name") or "").split())[:64]
+        if forum:
+            forum = forum if forum.endswith("吧") else forum + "吧"
+            text_parts.append(f"贴吧：{forum}")
     if text_metadata_field_enabled(metadata, "timestamp") and metadata.get("timestamp"):
         text_parts.append(f"发布时间：{metadata['timestamp']}")
 

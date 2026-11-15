@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from .data import Author, ImageContent, ParseResult, Platform, VideoContent
 from ..comment_display import comment_likes_label, comment_likes_text, comment_section_title
+from ..metadata_visibility import text_metadata_field_enabled
 from .task import PathTask
 
 PLATFORM_DISPLAY_NAMES: Dict[str, str] = {
@@ -26,6 +27,7 @@ PLATFORM_DISPLAY_NAMES: Dict[str, str] = {
     "niconico": "niconico",
     "steam": "Steam",
     "zhihu": "知乎",
+    "tieba": "贴吧",
     "toutiao": "今日头条",
     "xianyu": "闲鱼",
     "xiaoheihe": "小黑盒",
@@ -168,6 +170,11 @@ def build_parse_result(
 
     title = str(metadata.get("title") or "").strip() or None
     text = str(metadata.get("desc") or "").strip() or None
+    if platform_name == "tieba" and text_metadata_field_enabled(metadata, "author"):
+        forum = " ".join(str(metadata.get("forum_name") or "").split())[:64]
+        if forum:
+            forum = forum if forum.endswith("吧") else forum + "吧"
+            text = f"贴吧：{forum}" + (f"\n\n{text}" if text else "")
     url = str(metadata.get("url") or metadata.get("source_url") or "").strip() or None
     timestamp = _parse_timestamp(metadata.get("timestamp"))
 

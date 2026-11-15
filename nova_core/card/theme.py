@@ -470,6 +470,7 @@ PLATFORM_THEMES: dict[str, str] = {
     "xiaohongshu": "bilibili",
     "xiaoheihe": "bilibili",
     "nga": "bilibili",
+    "tieba": "bilibili",
     "toutiao": "bilibili",
     "xianyu": "bilibili",
     "douyin": "bilibili",
