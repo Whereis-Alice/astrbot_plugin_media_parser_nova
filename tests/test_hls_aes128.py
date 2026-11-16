@@ -104,7 +104,7 @@ two.ts
                 with open(path, "rb") as stream:
                     self.assertEqual(stream.read(), expected)
             self.assertEqual(
-                [name for name in os.listdir(directory) if not name.startswith(".")],
+                sorted(name for name in os.listdir(directory) if not name.startswith(".")),
                 ["seg_00000.m4s", "seg_00001.m4s"],
             )
         key_calls = [call for call in calls if call[0] == "https://cdn.example/key"]
