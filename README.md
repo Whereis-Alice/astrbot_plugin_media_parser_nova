@@ -55,6 +55,8 @@ astrbot_plugin_media_parser_nova
 
 依赖 `aiohttp`、`cryptography`、`qrcode[pil]`、`pillow`。Python 3.10 或更高，AstrBot 4.25 或更高。
 
+v1.21.1 起兼容 Pillow 13，具体版本沿用 AstrBot 核心的依赖约束。遇到日志中的 Pillow 版本保护冲突时，更新插件到新版即可。
+
 ## 快速开始
 
 装好即用：各平台默认为「全部发送」，直接在聊天里发一条支持的链接就会解析。

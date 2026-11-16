@@ -17,7 +17,7 @@ desc: |
   - 视频下载硬上限、普通发送预算、独立压缩策略与可选 QQ 群聊/私聊文件投递
   - 超限视频可直接上传原文件，跳过压缩
   - 媒体中转、消息聚合和 ZIP 导出
-version: v1.21.0
+version: v1.21.1
 astrbot_version: ">=4.25.0"
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova
