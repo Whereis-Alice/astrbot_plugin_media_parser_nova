@@ -58,6 +58,7 @@ class LLMFetcherTests(unittest.IsolatedAsyncioTestCase):
         tool = CoreNovaFetchContentTool(fetcher=self.fetcher)
         self.assertIsNone(tool.handler)
         self.assertEqual(tool.parameters["required"], ["url"])
+        self.assertEqual(tool.parameters["properties"]["max_comments"]["default"], 5)
         output = await tool.call(
             SimpleNamespace(context=SimpleNamespace(event=event())),
             url="https://store.steampowered.com/app/1",
@@ -67,6 +68,43 @@ class LLMFetcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["results"][0]["desc"], "游戏正文")
         self.assertNotIn("secret", output)
         self.assertNotIn("password", output)
+
+    async def test_llm_decides_comment_count_and_omission_defaults_to_five(self):
+        original = self.parser.parse
+
+        async def parse(session, url):
+            metadata = await original(session, url)
+            metadata["hot_comments"] = [
+                {"message": f"评论 {index}"} for index in range(20)
+            ]
+            return metadata
+
+        self.parser.parse = parse
+        for args, expected in (
+            ({}, 5),
+            ({"max_comments": 0}, 0),
+            ({"max_comments": 10}, 10),
+            ({"max_comments": 20}, 20),
+            ({"max_comments": 20, "include_comments": False}, 0),
+        ):
+            with self.subTest(args=args):
+                self.cfg.create_parsers.reset_mock()
+                result = json.loads(
+                    await self.fetcher.fetch(
+                        event(),
+                        url="https://store.steampowered.com/app/1",
+                        **args,
+                    )
+                )
+                self.cfg.create_parsers.assert_called_once_with(
+                    for_llm=True,
+                    include_media=True,
+                    hot_comment_count=expected,
+                )
+                self.assertEqual(result["comments_requested"], expected)
+                self.assertEqual(
+                    len(result["results"][0].get("hot_comments", [])), expected
+                )
 
     async def test_permission_checked_before_parsers_and_rate_records(self):
         self.cfg.permission.whitelist_enable = True

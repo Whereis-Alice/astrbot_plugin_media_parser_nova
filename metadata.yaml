@@ -18,7 +18,7 @@ desc: |
   - 超限视频可直接上传原文件，跳过压缩
   - 媒体中转、消息聚合和 ZIP 导出
   - LLM 工具主动抓取正文、评论与媒体地址，由模型按用户需求自由处理
-version: v1.22.0
+version: v1.22.1
 astrbot_version: ">=4.25.0"
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova

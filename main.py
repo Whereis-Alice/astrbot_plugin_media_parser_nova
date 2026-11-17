@@ -51,7 +51,7 @@ class NovaFetchContentTool(CoreNovaFetchContentTool):
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.22.0",
+    "1.22.1",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):

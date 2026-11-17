@@ -90,7 +90,7 @@ class MediaContentFetcher:
         url = kwargs.get("url")
         include_comments = kwargs.get("include_comments", True)
         include_media = kwargs.get("include_media", True)
-        max_comments = kwargs.get("max_comments", options.max_comments)
+        max_comments = kwargs.get("max_comments", 5)
         if (
             set(kwargs) - {"url", "include_comments", "include_media", "max_comments"}
             or not isinstance(url, str)
@@ -108,7 +108,7 @@ class MediaContentFetcher:
             )
         if len(self._tasks) >= options.max_concurrent_calls:
             return self._error("busy", "Nova 内容抓取正在处理其他请求，请稍后重试。")
-        count = min(max_comments, options.max_comments) if include_comments else 0
+        count = max_comments if include_comments else 0
         task = asyncio.create_task(self._fetch(event, url, include_media, count))
         self._tasks.add(task)
         try:

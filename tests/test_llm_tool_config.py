@@ -33,6 +33,8 @@ class LLMToolConfigTests(unittest.TestCase):
             )
         )["llm_tool"]["items"]
         self.assertEqual({key: value["default"] for key, value in schema.items()}, defaults)
+        self.assertNotIn("max_comments", defaults)
+        self.assertNotIn("max_comments", schema)
 
     def test_switch_accepts_explicit_booleans_and_fails_closed(self):
         for value, enabled in ((True, True), ("true", True), (1, True),
@@ -50,7 +52,6 @@ class LLMToolConfigTests(unittest.TestCase):
     def test_limits_clamp_and_invalid_types_fall_back(self):
         bounds = {
             "max_links": (3, 1, 5),
-            "max_comments": (5, 0, 20),
             "max_output_chars": (24000, 4000, 60000),
             "timeout_seconds": (45, 5, 120),
             "max_concurrent_calls": (2, 1, 4),
@@ -74,12 +75,11 @@ class LLMParserFactoryTests(unittest.TestCase):
                     cfg = ConfigManager(platform_config(
                         platform, mode,
                         message={"hot_comments": {"count": 0}},
-                        llm_tool={"max_comments": 7},
                     ))
                     chat_parser = cfg.create_parsers()[0]
                     tool_parser = cfg.create_parsers(for_llm=True)[0]
                     self.assertEqual(chat_parser.hot_comment_count, 0)
-                    self.assertEqual(tool_parser.hot_comment_count, 7)
+                    self.assertEqual(tool_parser.hot_comment_count, 5)
                     self.assertIsNot(tool_parser, chat_parser)
                     self.assertEqual(chat_parser.hot_comment_count, 0)
 
@@ -92,21 +92,36 @@ class LLMParserFactoryTests(unittest.TestCase):
         self.assertEqual(cfg.create_parsers(for_llm=True), [])
         self.assertEqual([parser.name for parser in cfg.create_parsers()], ["steam"])
 
-    def test_platform_comment_switches_and_tool_comment_ceiling(self):
+    def test_platform_comment_switches_and_tool_comment_range(self):
         for platform in COMMENT_PLATFORMS:
             with self.subTest(platform=platform):
                 cfg = ConfigManager(platform_config(
                     platform, message={"hot_comments": {platform: False}}
                 ))
                 self.assertEqual(cfg.create_parsers(for_llm=True)[0].hot_comment_count, 0)
-        cfg = ConfigManager(platform_config("steam", llm_tool={"max_comments": 4}))
-        for requested, expected in ((None, 4), (2, 2), (99, 4), (-3, 0),
-                                    (0, 0), ("3", 3), (True, 4), ([], 4)):
+        cfg = ConfigManager(platform_config("steam"))
+        for requested, expected in ((None, 5), (2, 2), (10, 10), (20, 20),
+                                    (99, 20), (-3, 0), (0, 0), ("3", 3),
+                                    (True, 5), ([], 5), ({}, 5), (1.5, 5),
+                                    (float("inf"), 5), ("invalid", 5)):
             with self.subTest(requested=requested):
                 parser = cfg.create_parsers(for_llm=True, hot_comment_count=requested)[0]
                 self.assertEqual(parser.hot_comment_count, expected)
-        cfg = ConfigManager(platform_config("steam", llm_tool={"max_comments": 0}))
-        self.assertEqual(cfg.create_parsers(for_llm=True, hot_comment_count=5)[0].hot_comment_count, 0)
+
+    def test_legacy_comment_ceiling_is_ignored(self):
+        for platform in COMMENT_PLATFORMS:
+            for legacy_limit in (0, 4, 5):
+                cfg = ConfigManager(platform_config(
+                    platform, llm_tool={"max_comments": legacy_limit}
+                ))
+                self.assertFalse(hasattr(cfg.llm_tool, "max_comments"))
+                for requested, expected in ((None, 5), (10, 10), (20, 20)):
+                    with self.subTest(platform=platform, legacy_limit=legacy_limit,
+                                      requested=requested):
+                        parser = cfg.create_parsers(
+                            for_llm=True, hot_comment_count=requested
+                        )[0]
+                        self.assertEqual(parser.hot_comment_count, expected)
 
     def test_invalid_platform_comment_switches_fail_closed(self):
         for platform in COMMENT_PLATFORMS:

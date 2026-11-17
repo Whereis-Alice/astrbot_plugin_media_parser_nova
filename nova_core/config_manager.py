@@ -625,7 +625,6 @@ class LLMToolConfig:
 
     enabled: bool = True
     max_links: int = 3
-    max_comments: int = 5
     max_output_chars: int = 24000
     timeout_seconds: int = 45
     max_concurrent_calls: int = 2
@@ -738,9 +737,6 @@ class ConfigManager:
             ),
             max_links=self._parse_llm_tool_limit(
                 llm_tool_raw.get("max_links", 3), 3, 1, 5
-            ),
-            max_comments=self._parse_llm_tool_limit(
-                llm_tool_raw.get("max_comments", 5), 5, 0, 20
             ),
             max_output_chars=self._parse_llm_tool_limit(
                 llm_tool_raw.get("max_output_chars", 24000), 24000, 4000, 60000
@@ -1562,15 +1558,12 @@ class ConfigManager:
         include_media: bool = True,
         hot_comment_count: Optional[int] = None,
     ) -> List:
-        """创建独立解析器；工具抓取与聊天展示使用各自的评论限额。"""
+        """创建独立解析器；工具评论数量由参数决定，省略时读取 5 条。"""
         parsers = []
         if for_llm and not self.llm_tool.enabled:
             return parsers
         tool_comment_count = self._parse_llm_tool_limit(
-            self.llm_tool.max_comments if hot_comment_count is None else hot_comment_count,
-            self.llm_tool.max_comments,
-            0,
-            self.llm_tool.max_comments,
+            hot_comment_count, 5, 0, 20
         )
 
         def effective_comment_count(enabled: bool, controller: str) -> int:
