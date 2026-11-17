@@ -634,7 +634,10 @@ class TwitterParser(BaseVideoParser):
     def _log_nitter_hint(self) -> None:
         """未配置 Nitter 时，按冷却期提示一次可行方案。"""
         now = time.monotonic()
-        if now - TwitterParser._nitter_hint_at < _NITTER_HINT_INTERVAL:
+        if (
+            TwitterParser._nitter_hint_at > 0
+            and now - TwitterParser._nitter_hint_at < _NITTER_HINT_INTERVAL
+        ):
             return
         TwitterParser._nitter_hint_at = now
         logger.info(

@@ -201,6 +201,48 @@
       }
     }
   },
+  "llm_tool": {
+    "description": "LLM 内容抓取工具",
+    "type": "object",
+    "hint": "允许模型读取链接正文、作者、评论与媒体地址。遵守平台关闭、用户权限、解析限流、Cookie 与代理设置；聊天展示模式不会裁剪工具内容。",
+    "items": {
+      "enabled": {
+        "description": "启用内容抓取工具",
+        "type": "bool",
+        "default": true
+      },
+      "max_links": {
+        "description": "单次最多解析链接数",
+        "type": "int",
+        "hint": "范围 1–5，默认 3。",
+        "default": 3
+      },
+      "max_comments": {
+        "description": "单链接最多读取评论数",
+        "type": "int",
+        "hint": "范围 0–20；0 表示不读取。独立于聊天热评数量，仍遵守各平台热评开关。",
+        "default": 5
+      },
+      "max_output_chars": {
+        "description": "单次返回字符上限",
+        "type": "int",
+        "hint": "范围 4000–60000，默认 24000；超出时返回截断标记。",
+        "default": 24000
+      },
+      "timeout_seconds": {
+        "description": "单链接抓取超时秒数",
+        "type": "int",
+        "hint": "范围 5–120，默认 45；还受 AstrBot 工具调用总超时限制。",
+        "default": 45
+      },
+      "max_concurrent_calls": {
+        "description": "最多同时执行工具调用数",
+        "type": "int",
+        "hint": "范围 1–4，默认 2。",
+        "default": 2
+      }
+    }
+  },
   "parse_rate_limit": {
     "description": "解析频率限制",
     "type": "object",

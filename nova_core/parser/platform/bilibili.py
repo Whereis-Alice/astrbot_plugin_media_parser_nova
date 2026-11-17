@@ -233,6 +233,7 @@ class BilibiliParser(BaseVideoParser):
         credential_path: str = "",
         max_quality: int = 0,
         hot_comment_count: int = 0,
+        auth_runtime: Optional[BilibiliAuthRuntime] = None,
     ):
         """初始化B站解析器"""
         super().__init__("bilibili")
@@ -247,7 +248,7 @@ class BilibiliParser(BaseVideoParser):
         except (TypeError, ValueError):
             self.hot_comment_count = 0
         self.admin_assist_enabled = bool(admin_assist_enabled)
-        self.auth_runtime = BilibiliAuthRuntime(
+        self.auth_runtime = auth_runtime if auth_runtime is not None else BilibiliAuthRuntime(
             enabled=self.cookie_runtime_enabled,
             configured_cookie=configured_cookie,
             credential_path=credential_path,

@@ -620,6 +620,18 @@ class MediaRelayConfig:
 
 
 @dataclass
+class LLMToolConfig:
+    """内容抓取工具的独立开关与资源限额。"""
+
+    enabled: bool = True
+    max_links: int = 3
+    max_comments: int = 5
+    max_output_chars: int = 24000
+    timeout_seconds: int = 45
+    max_concurrent_calls: int = 2
+
+
+@dataclass
 class TranslationConfig:
     enabled: bool = False
     content_scope: str = "正文和标题"
@@ -656,12 +668,14 @@ class ConfigManager:
 
     def __init__(self, config: dict):
         self.bilibili_parser = None
+        self._bilibili_auth_runtime = None
         if not isinstance(config, dict):
             logger.warning("插件根配置不是对象，已安全关闭解析并拒绝所有消息")
             config = {
                 "trigger": None,
                 "parsers": None,
                 "permissions": None,
+                "llm_tool": None,
             }
         self._migrate_message_config(config)
         self._migrate_translation_config(config)
@@ -709,6 +723,35 @@ class ConfigManager:
                 "自动解析已关闭且未配置任何触发关键词，"
                 "回复触发也已禁用，解析功能将完全不可用"
             )
+
+        # --- LLM content tool ---
+        if "llm_tool" not in config:
+            llm_tool_raw = {}
+        elif isinstance(config.get("llm_tool"), dict):
+            llm_tool_raw = config["llm_tool"]
+        else:
+            logger.warning("llm_tool 配置存在但不是对象，已安全关闭内容抓取工具")
+            llm_tool_raw = {"enabled": False}
+        self.llm_tool = LLMToolConfig(
+            enabled=self._parse_bool(
+                llm_tool_raw.get("enabled", True), False, "llm_tool.enabled"
+            ),
+            max_links=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_links", 3), 3, 1, 5
+            ),
+            max_comments=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_comments", 5), 5, 0, 20
+            ),
+            max_output_chars=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_output_chars", 24000), 24000, 4000, 60000
+            ),
+            timeout_seconds=self._parse_llm_tool_limit(
+                llm_tool_raw.get("timeout_seconds", 45), 45, 5, 120
+            ),
+            max_concurrent_calls=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_concurrent_calls", 2), 2, 1, 4
+            ),
+        )
 
         # --- parsers/output modes ---
         if "parsers" not in config:
@@ -854,43 +897,43 @@ class ConfigManager:
                 ),
                 bilibili=self._parse_bool(
                     hot_comments.get("bilibili", True),
-                    True,
+                    False,
                     "message.hot_comments.bilibili",
                 ),
                 weibo=self._parse_bool(
                     hot_comments.get("weibo", True),
-                    True,
+                    False,
                     "message.hot_comments.weibo",
                 ),
                 xiaohongshu=self._parse_bool(
                     hot_comments.get("xiaohongshu", True),
-                    True,
+                    False,
                     "message.hot_comments.xiaohongshu",
                 ),
                 twitter=self._parse_bool(
                     hot_comments.get("twitter", True),
-                    True,
+                    False,
                     "message.hot_comments.twitter",
                 ),
                 xiaoheihe=self._parse_bool(
                     hot_comments.get("xiaoheihe", True),
-                    True,
+                    False,
                     "message.hot_comments.xiaoheihe",
                 ),
                 niconico=self._parse_bool(
-                    hot_comments.get("niconico", True), True, "message.hot_comments.niconico"
+                    hot_comments.get("niconico", True), False, "message.hot_comments.niconico"
                 ),
                 tiktok=self._parse_bool(
-                    hot_comments.get("tiktok", True), True, "message.hot_comments.tiktok"
+                    hot_comments.get("tiktok", True), False, "message.hot_comments.tiktok"
                 ),
                 steam=self._parse_bool(
-                    hot_comments.get("steam", True), True, "message.hot_comments.steam"
+                    hot_comments.get("steam", True), False, "message.hot_comments.steam"
                 ),
                 zhihu=self._parse_bool(
-                    hot_comments.get("zhihu", True), True, "message.hot_comments.zhihu"
+                    hot_comments.get("zhihu", True), False, "message.hot_comments.zhihu"
                 ),
                 tieba=self._parse_bool(
-                    hot_comments.get("tieba", True), True, "message.hot_comments.tieba"
+                    hot_comments.get("tieba", True), False, "message.hot_comments.tieba"
                 ),
                 twitter_nitter_base_url=str(
                     hot_comments.get("twitter_nitter_base_url", "") or ""
@@ -1512,41 +1555,69 @@ class ConfigManager:
             return 0
         return self.message.hot_comments.count
 
-    def create_parsers(self) -> List:
-        """根据配置创建并返回解析器列表。"""
+    def create_parsers(
+        self,
+        *,
+        for_llm: bool = False,
+        include_media: bool = True,
+        hot_comment_count: Optional[int] = None,
+    ) -> List:
+        """创建独立解析器；工具抓取与聊天展示使用各自的评论限额。"""
         parsers = []
-        bili_hc = self._effective_hot_comment_count(
+        if for_llm and not self.llm_tool.enabled:
+            return parsers
+        tool_comment_count = self._parse_llm_tool_limit(
+            self.llm_tool.max_comments if hot_comment_count is None else hot_comment_count,
+            self.llm_tool.max_comments,
+            0,
+            self.llm_tool.max_comments,
+        )
+
+        def effective_comment_count(enabled: bool, controller: str) -> int:
+            if for_llm:
+                return tool_comment_count if enabled else 0
+            return self._effective_hot_comment_count(enabled, controller)
+
+        bili_hc = effective_comment_count(
             self.message.hot_comments.bilibili,
             "bilibili",
         )
-        weibo_hc = self._effective_hot_comment_count(
+        weibo_hc = effective_comment_count(
             self.message.hot_comments.weibo,
             "weibo",
         )
-        xhs_hc = self._effective_hot_comment_count(
+        xhs_hc = effective_comment_count(
             self.message.hot_comments.xiaohongshu,
             "xiaohongshu",
         )
-        twitter_hc = self._effective_hot_comment_count(
+        twitter_hc = effective_comment_count(
             self.message.hot_comments.twitter,
             "twitter",
         )
-        xiaoheihe_hc = self._effective_hot_comment_count(
+        xiaoheihe_hc = effective_comment_count(
             self.message.hot_comments.xiaoheihe,
             "xiaoheihe",
         )
         proxy_addr = self.proxy.address or None
 
         if self._enable_bilibili:
-            self.bilibili_parser = BilibiliParser(
+            if self.bilibili_parser is not None:
+                self._bilibili_auth_runtime = self.bilibili_parser.get_auth_runtime()
+            bilibili_parser = BilibiliParser(
                 cookie_runtime_enabled=self.bilibili.cookie_runtime_enabled,
                 configured_cookie=self.bilibili.cookie,
                 max_quality=self.bilibili.max_quality,
-                admin_assist_enabled=self.bilibili.enable_admin_assist,
+                admin_assist_enabled=(
+                    self.bilibili.enable_admin_assist and not for_llm
+                ),
                 credential_path=self.bilibili.cookie_runtime_file,
                 hot_comment_count=bili_hc,
+                auth_runtime=self._bilibili_auth_runtime,
             )
-            parsers.append(self.bilibili_parser)
+            self._bilibili_auth_runtime = bilibili_parser.get_auth_runtime()
+            if not for_llm:
+                self.bilibili_parser = bilibili_parser
+            parsers.append(bilibili_parser)
         if self._enable_douyin:
             parsers.append(DouyinParser())
         if self._enable_tiktok:
@@ -1555,7 +1626,7 @@ class ConfigManager:
                     use_proxy=self.proxy.tiktok_use_proxy,
                     proxy_url=proxy_addr,
                     cookie=self.tiktok.cookie,
-                    hot_comment_count=self._effective_hot_comment_count(
+                    hot_comment_count=effective_comment_count(
                         self.message.hot_comments.tiktok, "tiktok"
                     ),
                 )
@@ -1577,7 +1648,11 @@ class ConfigManager:
             _, toutiao_rich_enabled = self.parser_output.output_for_controller(
                 "toutiao"
             )
-            if toutiao_rich_enabled and self.download.cache_dir_available:
+            if (
+                not for_llm
+                and toutiao_rich_enabled
+                and self.download.cache_dir_available
+            ):
                 parsers.append(ToutiaoParser())
             else:
                 parsers.append(ToutiaoParser(article_image_refreshes=1))
@@ -1610,13 +1685,13 @@ class ConfigManager:
                 )
             )
         if self._enable_niconico:
-            _, include_media = self.parser_output.output_for_controller("niconico")
+            _, chat_include_media = self.parser_output.output_for_controller("niconico")
             parsers.append(NiconicoParser(
                 use_proxy=self.proxy.niconico_use_proxy,
                 proxy_url=proxy_addr,
                 cookie=self.niconico.cookie,
-                include_media=include_media,
-                hot_comment_count=self._effective_hot_comment_count(
+                include_media=include_media if for_llm else chat_include_media,
+                hot_comment_count=effective_comment_count(
                     self.message.hot_comments.niconico, "niconico"
                 ),
             ))
@@ -1628,29 +1703,29 @@ class ConfigManager:
                 country_code=self.steam.country_code,
                 max_screenshots=self.steam.max_screenshots,
                 max_trailers=self.steam.max_trailers,
-                hot_comment_count=self._effective_hot_comment_count(
+                hot_comment_count=effective_comment_count(
                     self.message.hot_comments.steam, "steam"
                 ),
             ))
         if self._enable_zhihu:
-            _, include_media = self.parser_output.output_for_controller("zhihu")
+            _, chat_include_media = self.parser_output.output_for_controller("zhihu")
             parsers.append(ZhihuParser(
                 cookie=self.zhihu.cookie,
                 use_proxy=self.proxy.zhihu_use_proxy,
                 proxy_url=proxy_addr,
-                include_media=include_media,
-                hot_comment_count=self._effective_hot_comment_count(
+                include_media=include_media if for_llm else chat_include_media,
+                hot_comment_count=effective_comment_count(
                     self.message.hot_comments.zhihu, "zhihu"
                 ),
             ))
         if self._enable_tieba:
-            _, include_media = self.parser_output.output_for_controller("tieba")
+            _, chat_include_media = self.parser_output.output_for_controller("tieba")
             parsers.append(TiebaParser(
                 use_proxy=self.proxy.tieba_use_proxy,
                 proxy_url=proxy_addr,
                 cookie=self.tieba.cookie,
-                include_media=include_media,
-                hot_comment_count=self._effective_hot_comment_count(
+                include_media=include_media if for_llm else chat_include_media,
+                hot_comment_count=effective_comment_count(
                     self.message.hot_comments.tieba, "tieba"
                 ),
             ))
@@ -1788,6 +1863,17 @@ class ConfigManager:
         try:
             parsed = int(value)
         except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, parsed))
+
+    @staticmethod
+    def _parse_llm_tool_limit(value, default: int, minimum: int, maximum: int) -> int:
+        """工具限额只接受整数或整数字符串，其他类型安全回落。"""
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return default
+        try:
+            parsed = int(value)
+        except (OverflowError, TypeError, ValueError):
             return default
         return max(minimum, min(maximum, parsed))
 

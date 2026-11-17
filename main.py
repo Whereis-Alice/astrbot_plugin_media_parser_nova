@@ -16,6 +16,8 @@ from .nova_core.constants import Config
 from .nova_core.downloader import DownloadManager, create_public_only_connector
 from .nova_core.interaction.platform.bilibili import BilibiliAdminCookieAssistManager
 from .nova_core.logger import logger
+from .nova_core.llm_fetcher import MediaContentFetcher
+from .nova_core.llm_tool import CoreNovaFetchContentTool
 from .nova_core.message_adapter.archive_builder import (
     ArchiveSizeLimitError,
     build_zip_archive,
@@ -41,11 +43,15 @@ from .nova_core.storage import (
 from .nova_core.translation import MetadataTranslator, build_card_metadata_list
 
 
+class NovaFetchContentTool(CoreNovaFetchContentTool):
+    """Keep the tool owner in the plugin entry module for reload compatibility."""
+
+
 @register(
     "astrbot_plugin_media_parser_nova",
     "Whereis-Alice",
     "Nova 流媒体解析 - 多平台媒体、卡片、翻译与热评解析",
-    "1.21.1",
+    "1.22.0",
 )
 class MediaParserNovaPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -123,11 +129,16 @@ class MediaParserNovaPlugin(Star):
             request_cooldown_minutes=cfg.bilibili.admin_request_cooldown_minutes,
             command=cfg.bilibili.admin_cookie_update_command,
         )
+        self.llm_content_fetcher = MediaContentFetcher(cfg, self.parse_record_manager)
+        if cfg.llm_tool.enabled:
+            self.context.add_llm_tools(NovaFetchContentTool(fetcher=self.llm_content_fetcher))
+
     async def initialize(self):
         """事件循环就绪后再启动后台任务（__init__ 阶段无运行中的事件循环）。"""
         self._start_expired_cache_cleanup()
 
     async def terminate(self):
+        await self.llm_content_fetcher.aclose()
         await self._shutdown_expired_cache_cleanup()
         await self._shutdown_delayed_cleanups()
         await self.admin_cookie_assist.shutdown()

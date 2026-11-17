@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 
@@ -491,11 +491,23 @@ class TwitterNitterExtrasTests(unittest.TestCase):
         parser = TwitterParser(hot_comment_count=2)
         parser._fetch_hot_comments = AsyncMock(return_value=[])
 
-        with patch.object(twitter_module.logger, "info") as info:
+        with patch.object(twitter_module.logger, "info") as info, patch.object(
+            twitter_module, "time", Mock(monotonic=Mock(side_effect=[30.0, 31.0]))
+        ):
             asyncio.run(parser._collect_thread_extras(object(), "1"))
             asyncio.run(parser._collect_thread_extras(object(), "2"))
 
         self.assertEqual(info.call_count, 1)
+
+    def test_nitter_hint_returns_after_cooldown(self):
+        parser = TwitterParser(hot_comment_count=2)
+        parser._fetch_hot_comments = AsyncMock(return_value=[])
+        with patch.object(twitter_module.logger, "info") as info, patch.object(
+            twitter_module, "time", Mock(monotonic=Mock(side_effect=[30.0, 31.0, 3631.0]))
+        ):
+            for tweet_id in ("1", "2", "3"):
+                asyncio.run(parser._collect_thread_extras(object(), tweet_id))
+        self.assertEqual(info.call_count, 2)
 
     def test_disabled_hot_comments_still_fetch_nitter_stats(self):
         parser = TwitterParser(
